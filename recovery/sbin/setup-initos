@@ -69,33 +69,22 @@ squash_linux() {
   cp /boot/System.map-* ${DIST}/boot/
 }
 
-# Use the Alpine ISO image as a base - instead of downloading or building
-# firmware or modules.
+# Very slow, installs a lot of firmware
 squash_linux_alpine() {
-  if [ -f ${DIST}/boot/modloop-lts ]; then
-    echo "Detecting existing squashed modules - using Alpine dist or other dist"
-
-    KERNEL_VERSION=$(ls ${DIST}/boot/config* | sed -e 's,/boot/config-,,')
-    if [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ]; then
-      unsquashfs -f -d ${WORK} ${DIST}/boot/modloop-lts
-      echo "Expanding modules $(ls /lib/modules/${KERNEL_VERSION})"
-      chmod -R 755 /lib/modules/
-    fi
-
-    return
-  fi
-
-  # Create the modloop-tls
   apk add linux-lts
+  # /boot on the container will have the files - copy them to the dist dir, in same
+  # layout as the alpine
+  # /lib/modules, /lib/firmware are mounted to the work dir when running in container (cached)
 
-  KERNEL_VERSION=$(ls ${DIST}/boot/config* | sed -e 's,/boot/config-,,')
+  KERNEL_VERSION=$(ls /boot/config* | sed -e 's,/boot/config-,,')
 
-  rm -f ${DIST}/boot/modloop-lts
-  mksquashfs /lib/firmware /lib/modules/${KERNEL_VERSION} ${DIST}/boot/modloop-lts
+  rm -f $DIST/boot-edge/modloop-lts
+  mkdir -p $DIST/boot-edge
+  mksquashfs /lib/firmware /lib/modules/${KERNEL_VERSION} $DIST/boot-edge/modloop-lts
 
-  cp /boot/vmlinuz-lts ${DIST}/boot/vmlinuz-lts
-  cp /boot/config-* ${DIST}/boot/
-  cp /boot/System.map-* ${DIST}/boot/
+  cp /boot/vmlinuz-lts ${DIST}/boot-edge/vmlinuz-lts
+  cp /boot/config-* ${DIST}/boot-edge/
+  cp /boot/System.map-* ${DIST}/boot-edge/
 }
 
 # Generate an unsigned efi image, based on alpine with a custom init script.
@@ -114,12 +103,12 @@ squash_linux_alpine() {
 # The '@firmware' and '@modules' subvolumes must also be created
 # if using separate volumes - for now they're in @recovery rootfs.
 efi() {
-  mkdir -p ${DIST} ${WORK}/boot
+  mkdir -p ${DIST}
 
   # Expects that the modloop is already created, and the cache under ${WORK}/modules may
   # exist.
 
-  local cfgf=$(ls ${DIST}/boot/config-*)
+  local cfgf=$(ls ${DIST}/boot-edge/config-*)
 
   if [ -z ${cfgf} ] ; then
     echo "Missing kernel config" &&  return
@@ -128,7 +117,7 @@ efi() {
 
   KERNEL_VERSION=${cfg#config-}
 
-  KERNEL=${DIST}/boot/vmlinuz-lts
+  KERNEL=${DIST}/boot-edge/vmlinuz-lts
 
   [ -z ${KERNEL_VERSION} ] && echo "Missing kernel config" && return
   [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
@@ -148,14 +137,13 @@ efi() {
 
   mkinitfs  -i $SRCDIR/initramfs/init -o ${img} $KERNEL_VERSION
 
-  echo "Built initramfs ${img} for ${KERNEL_VERSION} $(ls -l ${img})"
+  echo "Built initramfs ${img} for ${KERNEL_VERSION}"
 
   echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /tmp/cmdline
   efi-mkuki \
     -c /tmp/cmdline \
     -o ${DIST}/EFI/BOOT/InitOS-${KERNEL_VERSION}.EFI \
       ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}
-
 
   # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
   if [ -f /etc/uefi-keys/db.crt ]; then
@@ -167,9 +155,11 @@ efi() {
 #  # for virt - different model, kernel separate, modules in qcow, no initrd.
 }
 
+# Use the Alpine ISO image as a base - instead of downloading or building
+# firmware or modules.
 # efi_patch will use an apline ISO, and patch the initrd with the custom init script.
 # Alpine is expected to be in ${WORK}/dist/boot (dist is the content of the EFI/iso disk)
-efi_patch() {
+efi_alpine_installer() {
   set -e
   mkdir -p ${DIST} ${WORK}/boot
 
@@ -179,8 +169,14 @@ efi_patch() {
   local cfgf=$(ls ${DIST}/boot/config-*)
 
   if [ -z ${cfgf} ] ; then
-    echo "Missing kernel config" &&  return
+    if [ ! -f ${WORK}/alpine.iso ]; then
+      curl -Lo ${WORK}/alpine.iso https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso
+    fi
+    cd ${WORK}/dist
+    bsdtar xf ${WORK}/alpine.iso
+    cfgf=$(ls ${DIST}/boot/config-*)
   fi
+
   local cfg=$(basename $cfgf)
 
   KERNEL_VERSION=${cfg#config-}
@@ -189,16 +185,22 @@ efi_patch() {
 
   [ -z ${KERNEL_VERSION} ] && echo "Missing kernel config" && return
   [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
+
+  if [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ]; then
+      unsquashfs -f -d ${WORK} ${DIST}/boot/modloop-lts
+      echo "Expanding modules $(ls /lib/modules/${KERNEL_VERSION})"
+      chmod -R 755 /lib/modules/
+  fi
   [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules - run squash_linux first" && return
 
   cp /ws/initos/initramfs/init /init
   echo "MODE=dev" > /etc/initos.conf
   (find /init /etc/initos.conf | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${WORK}/initos-xtra.cpio.gz
 
-  echo "Built initramfs ${img} for ${KERNEL_VERSION} $(ls -l ${img})"
-
+  echo "Built initramfs ${img} for ${KERNEL_VERSION}"
 
   echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed modules=loop,squashfs,sd-mod,usb-storage" > /tmp/cmdline
+
   efi-mkuki \
     -c /tmp/cmdline \
     -o ${DIST}/EFI/BOOT/Alpine-${KERNEL_VERSION}.EFI \

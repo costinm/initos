@@ -156,6 +156,29 @@ rbpush() {
   ssh $host umount /boot/efi
 }
 
+mkdisk() {
+  qemu-img create -f raw ${WORK}/disk.img 10G
+  dev=$(losetup -f ${WORK}/disk.img --show)
+  parted $dev mklabel gpt
+
+
+}
+test_vm() {
+  if [ ! -f ${WORK}/cloud-hypervisor-static ]; then
+    wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/cloud-hypervisor-static -O ${WORK}/cloud-hypervisor-static
+    chmod +x ${WORK}/cloud-hypervisor-static
+  fi
+
+  # Alpine kernel includes no filesystem
+
+  ${WORK}/cloud-hypervisor-static --kernel ${WORK}/vmlinuz-virt --initramfs ${WORK}/initramfs-virt \
+    --serial tty --console off --cmdline "console=ttyS0" \
+    --disk path=${WORK}/disk.img \
+    --net tap=br-lan,ip=192.168.1.23,mask=255.255.128.0
+
+    #--fs tag=work,${WORK}
+
+}
 
 
 $*

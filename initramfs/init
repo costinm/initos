@@ -453,13 +453,13 @@ if [ "$$" == "1" ]; then
   # Running as PID 1 - initramfs
   initramfs_init
 else
-  if [ -e /sbin/init ]; then
+  #if [ -e /sbin/init ]; then
     # Already running - not initramfs, just exec the function.
-    $*
-    return
-  fi
+  $*
+  #  return
+  #fi
 
-  initramfs_init
+  #initramfs_init
 
 fi
 
