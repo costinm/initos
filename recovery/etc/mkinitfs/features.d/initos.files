@@ -1,2 +1,2 @@
-/initos/*
-/etc/initos/*
+/sbin/setup-initios
+/sbin/initos-*

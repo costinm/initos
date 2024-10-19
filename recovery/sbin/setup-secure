@@ -1,0 +1,199 @@
+#!/bin/sh
+
+# Install script for Initos. It assumes we run in a recovery image or an alpine rootfs
+# with all the tools needed.
+
+# Unlike ignition (which runs in Dracut initramfs), this script runs on a full alpine OS
+# with networking and the usual tools. It is not designed to wipe the disk or be declarative -
+# just to configure the minimum required for the machine to boot with the signed UKI image
+# and have the recovery image available.
+
+# It does have ability to create an EFI, LUKS and btrfs filesystem on an empty disk, but
+# will require explicit user action to do so on a non-empty disk. If EFI/LUKS and btrfs
+# are present - it will add itself to EFI and to a btrfs subvolume.
+
+# It can also download an OCI rootfs and save it to a subvolume, and use it on next
+# boot.
+
+# Each function should do a simple operation and be kept very simple and easy to be
+# modified to fit specific needs - without having to add complex config and logic to
+# hide what is actually happening.
+
+# Where do we pull images from
+REPO=${REPO:-git.h.webinf.info/costin}
+
+# Will wipe a disk a create the partitions needed for initos.
+# This should be called explicitly by the user - it will normally not be done automatically.
+# In practice we need ~100M on the EFI, and some btrfs volume.
+#
+wipe_disk() {
+  disk_dev=$1
+  suffix=$2
+
+  # use 100% to fill the disk. This is total, EFI and root.
+  # It is possible to later use the rest of the disk for LUKS, LVM or other work partitions.
+  size=${2:-5G}
+
+  parted --script --machine -- "${disk_dev}" mklabel gpt
+  #parted --script --machine -- "${DISK}" unit s print
+
+
+  parted "$disk_dev" mkpart ESP fat32 1 1024
+  parted "$disk_dev" set 1 boot on
+
+  parted "$disk_dev" mkpart primary ext4 1024 4096
+  parted "$disk_dev" name 2 "recovery"
+
+  parted "$disk_dev" mkpart primary ext4 4096 4596
+  parted "$disk_dev" name 3 "recovery_verity"
+
+  # Create the Linux partition
+  parted "$disk_dev" mkpart primary ext4 4596 8GiB
+  parted "$disk_dev" name 4 "LUKS"
+
+  partprobe $disk_dev
+
+  mkfs.vfat ${disk_dev}${suffix}1 -n BOOT
+}
+
+mkcrpyt() {
+  local disk_dev=$1
+
+  export PASSPHRASE=$(openssl rand -base64 32)
+#  echo -n "$PASSPHRASE" | openssl pkeyutl -encrypt \
+#       -pubin -inkey $PUBLIC_KEY -pkeyopt rsa_padding_mode:oaep \
+#       -pkeyopt rsa_oaep_md:sha256 -out $ENCRYPTED_PASSPHRASE_FILE
+  echo -n "$PASSPHRASE" > /run/passphrase
+
+  # Linux LUKS partition type is 8309
+  # -v -c aes-xts-plain64 -s 512 --hash sha512 --pbkdf pbkdf2 \
+  #   --iter-time 1000 --use-random
+  echo -n "$PASSPHRASE" | cryptsetup luksFormat --type luks2 ${disk_dev} -
+
+  echo -n "$PASSPHRASE" | cryptsetup luksOpen ${disk_dev} c -
+  # To add an escrow key
+  #   echo -n "$PASSPHRASE" |
+  # cryptsetup luksAddKey $DEVICE <(echo -n "$PASSPHRASE_NEW")
+
+  mkfs.btrfs /dev/mapper/c
+  btrfs filesystem label /dev/mapper/c "ROOT"
+
+
+
+  # TODO: encrypt the PASSPRASE with the root public key, save it to USB for recovery.
+  # TODO: if tpm present, save it to TPM
+}
+
+
+recover_key() {
+  local ENCRYPTED_PASSPHRASE_FILE=$1
+  PRIVATE_KEY=$HOME/.ssh/id_ecdsa
+
+  PASSPHRASE=$(openssl pkeyutl -decrypt \
+     -inkey $PRIVATE_KEY -in $ENCRYPTED_PASSPHRASE_FILE \
+     -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256)
+
+  # TODO: auto yes
+  # TODO: gen key, save key
+}
+
+efidump() {
+  mount  -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+}
+
+gen_pass() {
+   cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14; echo
+}
+
+## Save the LUKS password to TPM
+save_tpm() {
+    # Key will be disabled if ...
+    tpm2_createpolicy --policy-pcr -l sha256:0,1,2,3 -L policy.digest
+
+    # -C hierarch - e for endorsement, default is owner, also platform
+    # -g sha256 - default
+    # -G defaults to rsa2048:null:aes128cfb
+    # -c file - where to store the 'context' (info about key)
+    tpm2_createprimary -C p -c primary.ctx --format=pem --output=primary_pub.pem
+    # displays info -
+    tpm2_print -t TPMS_CONTEXT primary.ctx
+    ### Handle: 0x80000000, sequence: 6, 10, etc - size 1914
+
+    tpm2_evictcontrol -c primary.ctx -o primary.tr -C p
+    tpm2 print -t ESYS_TR primary.tr
+    # Handle: 0x81800001
+
+    # '-C p' worked on some where '-C e' didn't
+
+    # not setting -L makes the key accessible in all cases
+
+    # -i - -- stdin, max 128 bytes
+    # -u and -r seem to be used to allow the object to be moved to another TPM
+    # -C context (parent object) - not sure how to list
+    # -r and -u - where to store the output
+    echo ${PASSPHRASE} | tpm2_create -u key.pub -r key.priv \
+        -C primary.ctx -L policy.digest -i -
+    # -C 0x81000000 also works as -C - from handles-persistent
+    # -c key.ctx -> also load in the same step, but ChromeOS TPM doesn't support it
+    # without -i creates an RSA public key
+
+    tpm2_evictcontrol -C p -c 0x81800001
+    # -c - the out file for the context for the key
+    # tpm2_create generates the 'export' files.
+    tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx -n key.name
+
+    # -C p - platform (only one working on my chromebook)
+    # -c ctx - the key handle or ctx file
+    #
+    tpm2_evictcontrol -C p -c key.ctx
+    # To delete -C p -c ID
+
+     # -> returns a persistent handle (0x81800000) for 'p'
+
+    # Show the list of handles
+    tpm2_getcap handles-persistent
+
+}
+
+bootefi() {
+  local dev=${1:-/dev/sda}
+
+   mount -t efivarfs none /sys/firmware/efi/efivars
+
+  efibootmgr --disk $dev --part 1 --create --label 'Initos' --load /EFI/boot/InitOS.efi --verbose
+
+}
+
+efibackup() {
+  mkdir -p /etc/uefi-keys/vendor
+  cd /etc/uefi-keys/vendor
+  for i in PK KEK db dbx; do efi-readvar -v $i -o $i.esl; done
+
+  # Installing keys:
+  # db.auth,  KEK.auth and PK.auth added to bios from USB disk
+
+  # Alternative:
+  # apk update
+  # apk add sbctl
+  # sbctl create-keys
+  # sbctl sign /boot/efi/Alpine/linux-lts.efi
+  # sbctl enroll-keys -m
+}
+
+
+prepare_usb() {
+  local disk_dev=${1:-/dev/sda}
+
+  wipe_disk $disk_dev
+
+  mount ${disk_dev}3 /mnt/usb/root
+  mount ${disk_dev}1 /mnt/usb/efi
+
+  cd /mnt/usb/root
+  btrfs subvolume create recovery
+}
+
+
+
+$*

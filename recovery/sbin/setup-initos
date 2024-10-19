@@ -17,12 +17,7 @@ set -e
 # Work dir for temp files/cache.
 # Can be a btrfs subvolume, or a tmpfs. I have a btrfs mounted on/x/, and use vol
 # for 'volumes'.
-WORK=/work/initos
-
-# Dist dir - where the artifacts that need to be copied to the USB are stored.
-# In a container it can be $WORK/dist - when running on the host we save files directly
-# on the EFI.
-DIST=${DIST:-$WORK/dist}
+WORK=${WORK:-/x/initos}
 
 # For running the steps that need a container, use this shared dir and source dir.
 # Should be mounted in docker, will be created on the USB/recovery.
@@ -31,60 +26,50 @@ SRCDIR=${SRCDIR:-/ws/initos}
 ## All functions after this line are run inside a container, chroot or host running
 # 'recovery' or alpine installer or distro.
 
-
-# Squash_linux will get the linux and firmware, create squashfs files and copies of
-# the files needed for EFI.
+# Downloads the linux (alpine).
 #
-# Will use the same layout as an alpine ISO.
+# Very slow, installs a lot of firmware.
+# The kernel will be packed into the UKI by a separate step.
 #
-# See the Dockerfile.debian for an example of creating a debian-based kernel.
-# This is using alpine kernel corresponding to the base.
-squash_linux() {
-  # Set shell to exit on error
-  set -e
-
-  if [ -f ${DIST}/boot/modloop-lts ]; then
-    echo "Detecting existing squashed modules - using Alpine dist or other dist"
-
-    KERNEL_VERSION=$(ls ${DIST}/boot/config* | sed -e 's,/boot/config-,,')
-    if [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ]; then
-      unsquashfs -f -d ${WORK} ${DIST}/boot/modloop-lts
-      echo "Expanding modules $(ls /lib/modules/${KERNEL_VERSION})"
-      chmod -R 755 /lib/modules/
-    fi
-
-    return
-  fi
-
-  # Create the modloop-tls
+# Expects /lib/firmware, /lib/modules and /boot to be mounted to either a work dir
+# or /x/initos subvolumes
+#
+# The /boot dir on the container or real hosts will not have any of the files - they
+# are used to build the UKI in the EFI partition and modules/firmware go to different
+# subvolumes.
+linux_alpine() {
+  apk add intel-ucode amd-ucode
   apk add linux-lts
 
-  KERNEL_VERSION=$(ls ${DIST}/boot/config* | sed -e 's,/boot/config-,,')
+  KERNEL_VERSION=$(cat /usr/share/kernel/lts/kernel.release)
 
-  rm -f ${DIST}/boot/modloop-lts
-  mksquashfs /lib/firmware /lib/modules/${KERNEL_VERSION} ${DIST}/boot/modloop-lts
+  # This is the version that will be used in the UKI (can be changed)
+  echo $KERNEL_VERSION > /boot/version
 
-  cp /boot/vmlinuz-lts ${DIST}/boot/vmlinuz-lts
-  cp /boot/config-* ${DIST}/boot/
-  cp /boot/System.map-* ${DIST}/boot/
+  mv /boot/vmlinuz-lts /boot/vmlinuz-${KERNEL_VERSION}
 }
 
-# Very slow, installs a lot of firmware
-squash_linux_alpine() {
-  apk add linux-lts
-  # /boot on the container will have the files - copy them to the dist dir, in same
-  # layout as the alpine
-  # /lib/modules, /lib/firmware are mounted to the work dir when running in container (cached)
+# vlinux_alpine gets the virtual kernel, creates a squash with the modules.
+vlinux_alpine() {
+  # Also get virt since we are here...
+  apk add linux-virt
+  VKERNEL_VERSION=$(cat /usr/share/kernel/virt/kernel.release)
+  echo $VKERNEL_VERSION > /boot/version-virt
+  mv /boot/vmlinuz-virt /boot/vmlinuz-${VKERNEL_VERSION}
+  ln -s /boot/vmlinuz-${VKERNEL_VERSION}  /boot/vmlinuz-virt
 
-  KERNEL_VERSION=$(ls /boot/config* | sed -e 's,/boot/config-,,')
+  mkdir -p ${WORK}/virt
+  vinit $VKERNEL_VERSION
+  if [ ! -f $WORK/virt/modloop-${VKERNEL_VERSION}.sqfs ]; then
+    mksquashfs /lib/modules/${VKERNEL_VERSION} $WORK/virt/modloop-${VKERNEL_VERSION}.sqfs
+  fi
+}
 
-  rm -f $DIST/boot-edge/modloop-lts
-  mkdir -p $DIST/boot-edge
-  mksquashfs /lib/firmware /lib/modules/${KERNEL_VERSION} $DIST/boot-edge/modloop-lts
+# vinit updates the initramfs for the virt kernel, in case init script is changed.
+vinit() {
+  VKERNEL_VERSION=$(cat /boot/version-virt)
 
-  cp /boot/vmlinuz-lts ${DIST}/boot-edge/vmlinuz-lts
-  cp /boot/config-* ${DIST}/boot-edge/
-  cp /boot/System.map-* ${DIST}/boot-edge/
+  mkinitfs  -i $SRCDIR/recovery/init -F "base btrfs squashfs virtio eudev initos" -o ${WORK}/virt/initramfs-$VKERNEL_VERSION $VKERNEL_VERSION
 }
 
 # Generate an unsigned efi image, based on alpine with a custom init script.
@@ -103,25 +88,17 @@ squash_linux_alpine() {
 # The '@firmware' and '@modules' subvolumes must also be created
 # if using separate volumes - for now they're in @recovery rootfs.
 efi() {
-  mkdir -p ${DIST}
 
   # Expects that the modloop is already created, and the cache under ${WORK}/modules may
   # exist.
 
-  local cfgf=$(ls ${DIST}/boot-edge/config-*)
-
-  if [ -z ${cfgf} ] ; then
-    echo "Missing kernel config" &&  return
-  fi
-  local cfg=$(basename $cfgf)
-
-  KERNEL_VERSION=${cfg#config-}
-
-  KERNEL=${DIST}/boot-edge/vmlinuz-lts
-
+  KERNEL_VERSION=$(cat /boot/version)
   [ -z ${KERNEL_VERSION} ] && echo "Missing kernel config" && return
+
+  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
   [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
-  [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules - run squash_linux first" && return
+
+  [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules" && return
 
   # Uses mkinitfs.conf added from file in the docker image.
   # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
@@ -131,109 +108,109 @@ efi() {
   # -i - what init file to use - replace default with our script.
   #rm -rf ${WORK}/initrd
   # -k -t ${WORK}/initrd
-  local img=${WORK}/initramfs
+  local img=/boot/initrd-initos.img-${KERNEL_VERSION}
 
-  cat /etc/mkinitfs/mkinitfs.conf
+  echo "features=\"ata base btrfs keymap mmc nvme scsi usb cryptsetup squashfs tpm2 clevis initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
+  cp /etc/passwd /usr/share/mkinitfs/passwd
+  cp /etc/group /usr/share/mkinitfs/group
 
-  mkinitfs  -i $SRCDIR/initramfs/init -o ${img} $KERNEL_VERSION
+  mkinitfs  -i $SRCDIR/recovery/init -o ${img}  $KERNEL_VERSION
 
   echo "Built initramfs ${img} for ${KERNEL_VERSION}"
 
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /tmp/cmdline
+  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /boot/cmdline
+
+  mkdir -p /boot/efi/EFI/BOOT
   efi-mkuki \
-    -c /tmp/cmdline \
-    -o ${DIST}/EFI/BOOT/InitOS-${KERNEL_VERSION}.EFI \
+    -c /boot/cmdline \
+    -o /boot/efi/EFI/BOOT/BOOTX64.EFI \
       ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}
 
-  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
-  if [ -f /etc/uefi-keys/db.crt ]; then
-    sign ${KERNEL_VERSION}
-    echo "Signed EFI"
-    rm ${DIST}/EFI/BOOT/InitOS-${KERNEL_VERSION}.EFI
-  fi
+  echo ${KERNEL_VERSION} > /boot/efi/version
 
-#  # for virt - different model, kernel separate, modules in qcow, no initrd.
+  # InitOS-${KERNEL_VERSION}.EFI
 }
 
-# Use the Alpine ISO image as a base - instead of downloading or building
-# firmware or modules.
-# efi_patch will use an apline ISO, and patch the initrd with the custom init script.
-# Alpine is expected to be in ${WORK}/dist/boot (dist is the content of the EFI/iso disk)
-efi_alpine_installer() {
-  set -e
-  mkdir -p ${DIST} ${WORK}/boot
+# Incremental efi build - only replaces init
+efi2() {
+  KERNEL_VERSION=$(cat /boot/version)
+  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
+  local img=/boot/initrd-initos.img-${KERNEL_VERSION}
+  cp $SRCDIR/recovery/init /init
+ (find /init | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-xtra.cpio.gz
+ (find /boot/efi/hash* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
 
-  # Expects that the modloop is already created, and the cache under ${WORK}/modules may
-  # exist.
+  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /boot/cmdline
 
-  local cfgf=$(ls ${DIST}/boot/config-*)
+  mkdir -p /boot/efi/EFI/BOOT
+  efi-mkuki \
+    -c /boot/cmdline \
+    -o /boot/efi/EFI/BOOT/BOOTX64.EFI \
+      ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img} /boot/initos-hashes.cpio.gz /boot/initos-xtra.cpio.gz
 
-  if [ -z ${cfgf} ] ; then
-    if [ ! -f ${WORK}/alpine.iso ]; then
-      curl -Lo ${WORK}/alpine.iso https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso
-    fi
-    cd ${WORK}/dist
-    bsdtar xf ${WORK}/alpine.iso
-    cfgf=$(ls ${DIST}/boot/config-*)
+}
+
+
+sqfs() {
+  firmware_sqfs
+  mods_sqfs $(cat /boot/version)
+}
+
+firmware_sqfs() {
+  cd /x/initos/firmware
+  rm -f /boot/efi/firmware.sqfs
+  mksquashfs . /boot/efi/firmware.sqfs
+}
+mods_sqfs() {
+  local ver=$1
+  cd /x/initos/modules/${ver}
+  rm -f /boot/efi/modules-${ver}.sqfs
+  mksquashfs . /boot/efi/modules-${ver}.sqfs
+}
+
+# sign creates a signed UKI.
+# The initramfs is different - the additional file will disable shell and trigger verification.
+sign() {
+  local KERNEL_VERSION=$(cat /boot/version)
+
+  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
+  if [ ! -f /etc/uefi-keys/db.crt ]; then
+    sign_init
   fi
+  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
 
-  local cfg=$(basename $cfgf)
+  veritysetup format --root-hash-file=/boot/efi/hash.recovery /boot/efi/recovery.sqfs /boot/efi/recovery.sqfs.verity
+  veritysetup format --root-hash-file=/boot/efi/hash.firmware /boot/efi/firmware.sqfs /boot/efi/firmware.sqfs.verity
+  veritysetup format --root-hash-file=/boot/efi/hash.modules /boot/efi/modules-${KERNEL_VERSION}.sqfs /boot/efi/modules-${KERNEL_VERSION}.sqfs.verity
 
-  KERNEL_VERSION=${cfg#config-}
+  echo "Built secure initramfs ${KERNEL_VERSION}"
 
-  KERNEL=${DIST}/boot/vmlinuz-lts
+  (find /boot/efi/hash* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
 
-  [ -z ${KERNEL_VERSION} ] && echo "Missing kernel config" && return
-  [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
-
-  if [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ]; then
-      unsquashfs -f -d ${WORK} ${DIST}/boot/modloop-lts
-      echo "Expanding modules $(ls /lib/modules/${KERNEL_VERSION})"
-      chmod -R 755 /lib/modules/
-  fi
-  [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules - run squash_linux first" && return
-
-  cp /ws/initos/initramfs/init /init
-  echo "MODE=dev" > /etc/initos.conf
-  (find /init /etc/initos.conf | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${WORK}/initos-xtra.cpio.gz
-
-  echo "Built initramfs ${img} for ${KERNEL_VERSION}"
-
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed modules=loop,squashfs,sd-mod,usb-storage" > /tmp/cmdline
+  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 initos.secure" > /boot/cmdline.secure
 
   efi-mkuki \
-    -c /tmp/cmdline \
-    -o ${DIST}/EFI/BOOT/Alpine-${KERNEL_VERSION}.EFI \
-      ${KERNEL}  ${DIST}/boot/initramfs-lts ${WORK}/initos-xtra.cpio.gz
-}
+    -c /boot/cmdline.secure \
+    -o /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI \
+      ${KERNEL} \
+       /boot/intel-ucode.img /boot/amd-ucode.img /boot/initos-hashes.cpio.gz \
+       /boot/initrd-initos.img-${KERNEL_VERSION}
 
-sign() {
-  local KERNEL_VERSION=${1}
+   #    ${WORK}/initos-secure.cpio.gz
 
   sbsign --cert /etc/uefi-keys/db.crt --key /etc/uefi-keys/db.key \
-    --output ${DIST}/EFI/BOOT/InitOS-${KERNEL_VERSION}-signed.EFI \
-    ${DIST}/EFI/BOOT/InitOS-${KERNEL_VERSION}.EFI
+    --output /boot/efi/EFI/BOOT/InitOS-${KERNEL_VERSION}-signed.EFI \
+    /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
 
-  cp /etc/uefi-keys/*.auth ${DIST}/EFI
-  chmod 777 ${DIST}/EFI/*.auth
+  rm /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
 
+  cp /etc/uefi-keys/*.auth /boot/efi/EFI
+
+  chmod 777 /boot/efi/EFI/*.auth
+
+  rm /.dockerenv
   # TODO: also sign the squash and modules
 }
-
-# Recovery is roughly the same with an install of alpine, with ssh and tools installed,
-# and the overlay added.
-# Should not contain any user specific data or public keys.
-# When building the signed EFI and init - the user keys and public settings may be added.
-# Any private data needs to be in the LUKS partition.
-squash_recovery() {
-  # -one-file-system also works on the host - but not so well in a container.
-  cd /
-  rm -f ${DIST}/recovery.sqfs
-  mksquashfs  . ${DIST}/recovery.sqfs \
-    -regex -e "x/.*" -e "lib/modules/.*" -e "lib/firmware/.*" -e "boot/.*" \
-     -e "proc/.*" -e "sys/.*" -e "run/.*"
-}
-
 
 # Generate the key pairs for signing the kernel and the disk image.
 # This is done before install - as a separate step/process - the rest can be automated easily,
@@ -245,23 +222,6 @@ sign_init() {
   efi-mkkeys -s h.webinf.info
 }
 
-# Sign a disk image using the public key. The public key is also used to sign
-# the kernel, and is included in the init image.
-sign_image() {
-  local img=$1
-
-  local hash_file="${img}.sha256"
-  local sig_file="${img}.sig"
-  local private_key="/var/run/secrets/signing.key"
-
-  # Calculate the SHA256 hash of the image
-  sha256sum "$img" | awk '{print $1}' > "$hash_file"
-
-  # Sign the hash using the private key
-  openssl dgst -sha256 -sign "$private_key" -out "$sig_file" "$hash_file"
-
-  echo "Image signed successfully. Signature saved to $sig_file"
-}
 
 ### Alpine specific packages for the recovery image.
 # Not using "--no-cache" - and installing one by one.
@@ -269,52 +229,113 @@ sign_image() {
 # /etc/apk/cache will cache the actual files
 
 install_recovery() {
-  mkdir -p /initos
-  cp -a ${SRCDIR}/bin/* /usr/bin/
-  cp -a ${SRCDIR}/etc/* /etc/
+  cp -a ${SRCDIR}/recovery/sbin/* /sbin/
+  cp -a -f ${SRCDIR}/recovery/etc/* /etc/
+  cp -a ${SRCDIR}/recovery/home /
+  cp -a ${SRCDIR}/recovery/root /
+  chown -R root /root
+  cp -a ${SRCDIR}/recovery/init /
 
   alpine_add_common
   alpine_add_base
   alpine_add_recovery
+
+  apk add openrc-init
+
+  (cd /etc/init.d && ln -s agetty agetty.tty1)
+  (cd /etc/init.d && ln -s agetty agetty.tty2)
+  (cd /etc/init.d && ln -s agetty agetty.ttyS0)
+  (cd /etc/init.d && ln -s agetty agetty.hvc0)
+  rc-update add agetty.tty1 boot
+  rc-update add agetty.tty2 default
+  rc-update add agetty.ttyS0 boot
+  rc-update add agetty.hvc0 boot
+
+  rc-update add devfs sysinit
+  rc-update add dmesg sysinit
+
+  # Those 3 can be used instead of udev
+  # This is the busybox mdev
+  # apk add busybox-mdev-openrc
+  # busybox-mdev busybox-mdev-openrc
+  #apk add mdev-conf
+  #rc-update add hwdrivers sysinit
+  #rc-update add mdev sysinit
+
+  # apk add --quiet mdevd mdevd-openrc
+  #rc-update add hwdrivers sysinit
+  #rc-update add mdevd-init sysinit
+  #rc-update add mdevd sysinit
+
+  # modloop will load after dev-mount, read KOPT_modoop and KOPT_modloop_verify
+  # checks using openssl using public key under /etc/apk/keys/*.pub
+  # Modules are loaded as overlay (so more can be added)
+  #rc-update del modloop sysinit
+  rc-update add udev sysinit
+  rc-update add udev-trigger sysinit
+  rc-update add udev sysinit
+  rc-update add udev-settle sysinit
+  rc-update add udev-trigger sysinit
+  rc-update add cgroups sysinit
+
+  #  rc-update add connman boot
+  rc-update add acpid boot
+  rc-update add hwclock boot
+  rc-update add syslog boot
+  rc-update add ntpd boot
+  rc-update add wpa_supplicant boot
+  rc-update add modules boot
+  rc-update add sysctl boot
+  rc-update add hostname boot
+  rc-update add bootmisc boot
+  rc-update add syslog boot
+  rc-update add hwclock boot
+  rc-update add networking boot
+
+  rc-update add dropbear default
+  rc-update add udev-postmount default
+
+
+  rc-update add mount-ro shutdown
+  rc-update add killprocs shutdown
+  rc-update add savecache shutdown
+
+  rc-update --update
+  # Temp - debug only
+  # TODO: in initrd, patch /etc/shadow to remove password instead
+  # would be useful with all cloud images...
+  passwd -d root
+
 }
 
 alpine_add_common() {
+    echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
     apk -U --no-progress update
 
-    apk add alpine-base alpine-conf
-    apk add openrc
+    apk list -I
 
-    apk add busybox-mdev busybox-mdev-openrc busybox-suid busybox-binsh
+    #apk add alpine-base # Installs openrc
+    apk add ifupdown-ng libcap2  openrc  alpine-conf  alpine-release  busybox-openrc  busybox-suid
+
+    apk add eudev eudev-hwids udev-init-scripts udev-init-scripts-openrc
+    apk del busybox-mdev-openrc mdev-conf || true
+    #setup-devd udev
+
+    # Will add busybox-mdev as baseline
+    apk add openrc
+    apk add alpine-conf
+    apk add   busybox-suid busybox-binsh
     apk add iw ifupdown-ng ifupdown-ng-wifi
     apk add ca-certificates-bundle
-    apk add mdev-conf
     # Using it for few things - minisign can probably be used instead.
     # 765k bin + 5M lib
     apk add openssl
-    apk add ssl_client wpa_supplicant wpa_supplicant-openrc
-
-    rc-update add devfs sysinit
-    rc-update add dmesg sysinit
-    rc-update add mdev sysinit
-    rc-update add hwdrivers sysinit
-    rc-update add modloop sysinit
-
-    rc-update add modules boot
-    rc-update add sysctl boot
-    rc-update add hostname boot
-    rc-update add bootmisc boot
-    rc-update add syslog boot
-    rc-update add hwclock boot
-
-    rc-update add mount-ro shutdown
-    rc-update add killprocs shutdown
-    rc-update add savecache shutdown
+    apk add ssl_client
 
 }
 
 # If starting with an alpine distro, add the packages we need.
 alpine_add_recovery() {
-  apk update
 
   apk add rsync
   
@@ -336,6 +357,10 @@ alpine_add_recovery() {
 
   apk add cryptsetup uuidgen
 
+  apk add clevis
+
+  apk add bridge
+
   # 400k
   apk add minisign
 
@@ -346,7 +371,7 @@ alpine_add_recovery() {
 
   # 104 packages, 1.1G under lib/firmware
   # /lib/modules, /boot/vmlinuz-lts (plus config, system map)
-  apk add gummiboot intel-ucode amd-ucode
+  apk add gummiboot
 
   apk add efibootmgr
 
@@ -369,9 +394,9 @@ alpine_add_recovery() {
 
   apk add wpa_supplicant wpa_supplicant-openrc
 
+
   # from karios - not sure we need it
-  apk add eudev eudev-hwids \
-    findutils findmnt \
+  apk add  findutils findmnt \
     htop haveged \
     iproute2 \
     irqbalance \
@@ -382,15 +407,23 @@ alpine_add_recovery() {
     smartmontools \
     sudo strace util-linux bridge 
 
+  apk add cloud-hypervisor virtiofsd
+
+  # similar to ujail and others - no server.
+  # nsjail can listen on a port and start container on connection
+  # supports macvlan
+  # can act as an init (restart on exit)
+  apk add nsjail
+
+  # init with a single process. Can reap even if not running as PID1.
+  apk add tini
+
   #apk add secureboot-hook
 
   # Others that may be useful but not required:
 
-  # apk add kmod lddtree mdev-conf kmod-libs
+  # apk add kmod lddtree kmod-libs
   #  apk add iproute2 tcpdump procps
-
-  # Instead of busybox mdevd
-  #apk add mdevd mdevd-openrc
 
   # For OCI interaction
   #apk add crane
@@ -401,39 +434,11 @@ alpine_add_recovery() {
 
   # apk add lvm2
 
-
-  rc-update add networking default
-  rc-update add dropbear default
-
-  #  rc-update add connman boot
-  rc-update add acpid boot
-
-  rc-update add hwclock boot
-  rc-update add syslog boot
-  # From eudev package
-  rc-update add udev sysinit
-  rc-update add udev-trigger sysinit
-
-  rc-update add cgroups sysinit
-  rc-update add ntpd boot
-
-  rc-update add wpa-supplicant boot
-  rc-update add dropbear default
-  rc-update add udev sysinit
-  rc-update add udev-settle sysinit
-  rc-update add udev-trigger sysinit
-
-  # Temp - debug only
-  # TODO: in initrd, patch /etc/shadow to remove password instead
-  # would be useful with all cloud images...
-  passwd -d root
-
 }
 
 # Base users, groups, packages.
 alpine_add_base() {
   [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
-  echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
 
 
   mkdir -p /boot/efi
@@ -443,13 +448,25 @@ alpine_add_base() {
   mkdir -p /mnt/usb
 
   addgroup -g 1000 build
-  addgroup -g 999 admin
+  addgroup -g 1001 admin
+  #addgroup -g 1002 tss
 
-  adduser -G build -g "Builder" build -u 1000 -D -s /bin/bash -h /x/build
-  adduser -G admin -g "Admin" admin -u 999 -D -s /bin/bash -h /x/build
+  adduser -G build -g "Builder" build -u 1000 -D -s /bin/sh -h /home/build
+  adduser -G admin -g "Admin" admin -u 1001 -D -s /bin/sh -h /home/admin
+  #adduser -G tss -g "Builder" tss -u 1002
+
+  # Add the user to the sudoers group
+  addgroup admin wheel
+  addgroup build users # otherwise swayunlock fails, /etc/shaddow permissions
+  addgroup build video
+  addgroup build audio
+
+
 
   # Disable IPv6 for now - seems to be broken in some cases. Can be enabled in rootfs.
   echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.conf
+
+  chown root /root
 
 # -H: don't create home
 # -D: no pass
@@ -461,6 +478,31 @@ alpine_add_base() {
 
 }
 
+ui() {
+  apk add firefox-esr
+  #  apk add mesa-dri-gallium
+  setup-desktop sway
+  apk add kitty
+  apk add rofi-wayland rofi-pass rofi-top
+  apk add chromium
+
+  apk add seatd
+
+
+  #apk add i3wm dbus-x11
+  #apk add tint2 rofi alttab i3status
+
+  #apk add xorg-server
+  #apk add xinit
+
+#  apk add xset
+#  apk add xrandr
+#  apk add xmodmap
+#  apk add xinput
+#  apk add xhost
+#  apk add xkill
+}
+
 alpine_clear() {
   rm /var/lib/dbus/machine-id || true
   rm /etc/hostname || true
@@ -469,8 +511,6 @@ alpine_clear() {
 
 alpine_add_extra() {
   apk add bash bash-completion 
-
-  apk add bridge
 }
 
 $*

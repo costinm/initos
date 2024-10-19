@@ -1,0 +1,672 @@
+#!/bin/sh
+
+# Based on Alpine mkinitrd, but with different init script:
+# - various checks to detect an BTRFS rootfs in 'insecure' mode, fallback to recovery subvol or sqfs
+# - removed all networking or alpine-specific init - only job is to load a rootfs
+#
+# This allows using the simpler initrd, with a number of small specialized functions.
+# It is also usable for VM - when the kernel lacks some drivers (btrfs, etc), to allow kernel+fixed initrd without
+# using EFI + Grub + Dracut/systemd
+
+# A separate script is used for 'secure' mode:
+# - look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
+# - fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
+
+
+# ebegin will record the start of a command in /dev/kmsg and console
+ebegin() {
+	last_emsg="$*"
+	echo "$last_emsg..." > /dev/kmsg
+	echo -n " * $last_emsg: "
+}
+
+# eend will record the status of the previous command.
+# Unlike alpline - doesn't drop to shell (secure mode can't allow root shell)
+eend() {
+	if [ "$1" = 0 ] || [ $# -lt 1 ] ; then
+		echo "$last_emsg: ok." > /dev/kmsg
+	else
+		shift
+		echo "$last_emsg: failed. $*" > /dev/kmsg
+		echo "failed. $*"
+
+    # save all info to EFI partition if possible.
+    edump "failed: $*"
+
+    # Not running an emergency shell - insecure. 
+    sleep 10
+	fi
+}
+
+# dump info to the EFI partition (which exists if we managed to get the
+#  kernel running). One goal is to support machines without display/keyboard, 
+# install state will be saved on the USB disk.
+edump() {
+  local msg="$*"
+  if [ ! -d /boot/efi ]; then
+    return
+  fi
+
+  export LOG_DIR=$(mktemp -d -p /boot/efi )
+
+  echo $msg > ${LOG_DIR}/msg
+
+  echo "$ORIG_BLKID" > ${LOG_DIR}/blkid_before_mods
+  echo "$ORIG_FS" > ${LOG_DIR}/filesystems_before_mods
+  echo "$ORIG_DEVICES" > ${LOG_DIR}/devices_before_mods
+
+  blkid > ${LOG_DIR}/blkid
+  cat /proc/filesystems > ${LOG_DIR}/filesystems
+  cat /proc/devices > ${LOG_DIR}/devices
+
+  mount > ${LOG_DIR}/initrafms.mounts
+  lsmod > ${LOG_DIR}/lsmod.log
+
+  dmesg > ${LOG_DIR}/dmesg.log
+
+}
+
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+
+## First step - expand busybox and mount the basic filesystems
+initramfs_1st() {
+
+  # No kernel options processed - we build intitramfs and cmdline in the same efi.
+  # May read an initrc file if needed - but the goal is to keep it precise and simple.
+  # Initramfs does not include the links (for some reason?)
+  /bin/busybox mkdir -p /usr/bin \
+    /usr/sbin \
+    /proc \
+    /sys \
+    /dev \
+    /sysroot \
+    /media/cdrom \
+    /media/usb \
+    /tmp \
+    /etc \
+    /run/cryptsetup
+
+  # Spread out busybox symlinks and make them available without full path
+  # This appears slightly faster than having the initramfs include all symlinks ?
+  /bin/busybox --install -s
+
+  # Make sure /dev/null is a device node. If /dev/null does not exist yet, the command
+  # mounting the devtmpfs will create it implicitly as an file with the "2>" redirection.
+  # The -c check is required to deal with initramfs with pre-seeded device nodes without
+  # error message.
+  [ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
+
+  mount_proc
+}
+
+# mount proc, sys, etc
+mount_proc() {
+  if [ -e /proc/cmdline ]; then
+    return
+  fi
+
+  mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
+
+  mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null \
+    || mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev
+
+  # Make sure /dev/kmsg is a device node. Writing to /dev/kmsg allows the use of the
+  # earlyprintk kernel option to monitor early init progress. As above, the -c check
+  # prevents an error if the device node has already been seeded.
+  [ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
+
+  mount -t proc -o noexec,nosuid,nodev proc /proc
+
+  # pty device nodes (later system will need it)
+  [ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
+  [ -d /dev/pts ] || mkdir -m 755 /dev/pts
+
+  mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+
+  # shared memory area (later system will need it)
+  mkdir -p /dev/shm
+  mkdir -p /run
+
+  mount -t tmpfs tmpfs /run
+
+  # Module not present
+  #mount  -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+  mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+}
+
+# support for eudev. see /etc/init.d/udev*
+# At the end we need to call
+# udevadm control --exit
+# Requires udevd to be added to initramfs.
+# Alternative: alpine nlplug-findfs
+udev_start()
+{
+  if [ -f /sbin/udevd ]; then
+    if [ -e /proc/sys/kernel/hotplug ]; then
+      echo "" >/proc/sys/kernel/hotplug
+    fi
+    [ -d /etc/udev/rules.d ] || mkdir -p /etc/udev/rules.d
+
+    udevd -d
+
+    udevadm hwdb --update
+
+    # Populating /dev with existing devices through uevents
+    udevadm trigger --type=subsystems --action=add
+    udevadm trigger --type=devices --action=add
+    echo Udevadm  $?
+	fi
+}
+
+
+# retry function. Not used right now, will be used for LVM open
+retry() {
+  retries=$1
+  shift
+
+  count=0
+  until "$@"; do
+    exit=$?
+    wait=$((count + 1))
+    count=$((count + 1))
+    if [ "$count" -lt "$retries" ]; then
+      echo "Retry $count/$retries exited $exit, retrying in $wait seconds..."
+      sleep $wait
+    else
+      echo "Retry $count/$retries exited $exit, no more retries left."
+      return $exit
+    fi
+  done
+}
+
+# Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
+# if we may skip that if the core modules are enough.
+initramfs_mods() {
+  if [ -n "$KOPT_virt" ]; then
+    # Not loaded in alpine virt kernel - it will allow identifying the disk
+    modprobe squashfs
+    modprobe virtio_blk
+    modprobe virtio_iommu
+    modprobe virtio_net
+    return
+  fi
+
+  # For loading recovery from USB disk
+  modprobe usbcore
+  modprobe ehci-hcd
+  modprobe ohci-hcd
+  modprobe xhci-hcd
+  modprobe usb-storage
+  modprobe scsi_mod
+  modprobe sd_mod
+
+  # for loading recovery
+  modprobe squashfs
+
+  modprobe tpm_tis_i2c_cr50
+  modprobe tpm_tis_spi
+
+  # btrfs, vfat are are normally present - but may be loaded if missing
+}
+
+find_and_mount_boot() {
+  if [ -d /boot/efi/EFI ]; then
+    return 0
+  fi
+  bootd=$(findfs LABEL=USB_BOOT)
+  if [ -z "$bootd" ]; then
+    bootd=$(findfs LABEL=BOOT)
+  fi
+  if [ -n "$bootd" ]; then
+    mkdir -p /boot/efi
+    mount -t vfat $bootd /boot/efi
+    mount_boot /boot/efi
+  fi
+}
+
+mount_boot() {
+  local dir=${1:-/boot/efi}
+  # It would be tempting to add persistent overlay here and make the root
+  # modifiable - but that breaks the security model, we can't verify the overlay.
+  # For any configs, certs, etc - we can add them to the UKI or rebuild.
+
+  # From alpine original script
+  mkdir -p /initos/recovery
+
+  msqfs $dir recovery /initos/recovery
+
+  if [ -f ${dir}/firmware.sqfs ]; then
+    mkdir -p /lib/firmware
+    msqfs $dir firmware /lib/firmware
+  fi
+  ver=$(uname -r)
+  if [ -f ${dir}/modules-${ver}.sqfs ]; then
+    mkdir -p /lib/modules/${ver}
+    msqfs $dir modules-${ver} /lib/modules/${ver}
+  fi
+
+  # TODO: only in insecure mode - for secure it should be signed.
+  if [ -f ${dir}/initos.env ]; then
+    . ${dir}/initos.env
+  fi
+  udevadm trigger
+}
+
+# Scan /sys for 'modalias', sort and load the modules.
+# This should load TPM if it is available
+hwdrivers() {
+  find /sys -name modalias -type f -print0 | xargs -0 sort -u | xargs modprobe -b -a
+}
+
+
+# Logic to find an mount the root device.
+#
+# To properly mount we also need to find the modules/firmware, and will also mount
+# the recovery image which can be used as a container/chroot.
+#
+# - in 'dev' mode - wait for a key for 6 seconds.
+#    - 'r' will use the recovery image on USB (by label)
+#    - 'a' will use the recovery image on USB (by label), open a shell
+#    - 'c' will mount the LUKS with user-input
+#    - default - will try to mount LUKS with TPM2, fallback to recovery
+# - in 'secure' mode - will attempt to boot LUKS with TPM2, fallback to recovery
+# - recovery and boot partitions are mounted
+# -
+find_and_mount_root() {
+  mkdir -p /sysroot
+
+  if [ -f /sysroot/sbin/init ]; then
+    return
+  fi
+
+  # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
+  #  (opinionated partitioning, 1 is EFI)
+  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  if [ -n "$cryptd" ]; then
+    echo "Found LUKS device: ${cryptd}"
+    unlock_tpm $cryptd
+    if [ $? -eq 0 ]; then
+      mount_btfs /dev/mapper/c
+      if [ $? -eq 0 ]; then
+          return
+      fi
+    fi
+    busybox ash
+
+    # If 'c' - force manual unlock, otherwise go to recovery and wait for ssh to
+    # unlock
+    if [ "$MODE" = "c" ]; then
+      # Will unmount and expect a btrfs disk
+      unlock_c $cryptd
+      if [ $? -eq 0 ]; then
+        return
+      fi
+    fi
+  fi
+
+
+  # No USB recovery found, couldn't mount LUKS using TPM or unattended - boot from the recovery image
+  # in the boot partition.
+  if [ -f "/boot/efi/recovery.sqfs" ]; then
+    # Should be already on /media/root-ro
+    mount_recovery /boot/efi
+    if [ $? -eq 0 ]; then
+      return
+    fi
+  fi
+}
+
+# Mount a SQFS file as a dm-verity device (if signatures found on the
+# initrd /boot dir, in secure mode).
+#
+# The destintion dir will be an overlay drive.
+msqfs() {
+  local dir=$1
+  local name=$2
+  local dst=$3
+
+  mkdir -p /mnt/${name}
+  mount -t tmpfs root-tmpfs /mnt/${name}
+  mkdir -p /mnt/${name}/ro /mnt/${name}/rw /mnt/${name}/work
+
+
+  if [ -f /boot/efi/hash.${name} ]; then
+       veritysetup open ${dir}/${name}.sqfs recovery ${dir}/${name}.sqfs.verifty $(cat /boot/efi/hash.${name})
+       if [ $? -ne 0 ]; then
+         echo "Error: Failed to mount ${name}"
+         return 1
+       fi
+       mount -t squashfs /dev/mapper/${name} /mnt/${name}/ro
+       ${dst}
+       if [ $? -ne 0 ]; then
+         echo "Error: Failed to mount ${name}"
+         return 1
+       fi
+   else
+     # TODO: if secure mode, bail out
+
+     mount -o loop,ro -t squashfs ${dir}/${name}.sqfs /mnt/${name}/ro
+     if [ $? -ne 0 ]; then
+       echo "Error: Failed to mount ${nme}"
+       return 1
+     fi
+   fi
+
+
+    mount -t overlay \
+      -o lowerdir=/mnt/${name}/ro,upperdir=/mnt/${name}/rw,workdir=/mnt/${name}/work \
+      overlayfs ${dst}
+}
+
+
+# Mount recovery using files in the EFI partition, mounted in /boot/efi
+#
+mount_recovery() {
+  dir=${1:-/boot/efi}
+  echo "Mounting recovery squash as rootfs"
+  mount -o bind /initos/recovery /sysroot
+
+  if [ -f ${dir}/local.tgz ]; then
+    tar -C /sysroot -xf ${dir}/local.tgz
+  fi
+  if [ -f ${dir}/wpa_supplicant.conf ]; then
+    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
+  fi
+  if [ -f ${dir}/interfaces ]; then
+    cp ${dir}/interfaces /sysroot/etc/network/interfaces
+  fi
+  if [ -f ${dir}/authorized_keys ]; then
+    # Bug in the sqfs TODO: remove
+    if [ -f /sysroot/root/.ssh ]; then
+      rm /sysroot/root/.ssh
+    fi
+    chown -R root /sysroot/root
+    mkdir -p /sysroot/root/.ssh
+    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
+  fi
+  if [ -d ${dir}/dropbear ]; then
+    cp -a ${dir}/dropbear /sysroot/etc
+  fi
+
+  if [ "$MODE" = "s" ]; then
+    busybox sh
+  fi
+}
+
+# unlock_c will open the LUKS partition as 'c' volume and mount it as btrfs.
+# This is the default - if the user presses 'r' we will try to mount the BTRFS_ROOT
+# which is not encrypted, and should be present on a USB recovery disk.
+# 'r' will also create a shell before swapping roots.
+unlock_c() {
+  local part=$1
+
+  if cryptsetup luksOpen $part c; then
+    mount_btrfs /dev/mapper/c
+  else
+    echo "Error: Failed to unlock LUKS partition"
+    return 1
+  fi
+}
+
+
+# Mount a BTRFS subvolume as /sysroot - ready for the switch root
+mount_btrfs() {
+  local root_device=$1
+
+  BTRFS_OPTS="-o nobarrier -o compress"
+
+  # Mount the root device. It is expected that modules, firmware are present and updated.
+  mkdir -p /sysroot /x
+  mount -t btrfs "${root_device}" /x
+
+  INITOS_ROOT=${INITOS_ROOT:-initos/recovery}
+
+  if [ -f /x/initos/initos.env ]; then
+    . /x/initos/initos.env
+  else
+    if [ -d "/x/@" ]; then
+      INITOS_ROOT="@"
+    fi
+  fi
+
+  mount -t btrfs "${root_device}" /sysroot -o subvol=${INITOS_ROOT} \
+    -o noatime -o nodiratime
+
+  mkdir -p /lib/modules /lib/firmware /home /var/log /var/cache
+  mount -o bind /x/initos/modules /lib/modules
+  mount -o bind /x/@home /home
+  mount -o bind /x/@cache /var/cache
+  mount -o bind /x/@log /var/log
+  mount -o bind /x/initos/firmware /lib/firmware
+
+  # TODO: if the lib/modules and firmware are missing - unsquash the modloop-lts after
+  # verifying the signature/
+}
+
+cmdline() {
+  local c=$(cat $1)
+
+  # look for "--" in cmd, extract everything after
+  # [[ is for extended tests, =~ regex
+  if [[ "$c" =~ ".*--.*" ]]; then
+    # The # means 'remove patern', ## remove longest pattern
+    export KOPT_cmd="${c#*-- }"
+    # % and %% remove from the end
+    c="${c%%--*}"
+  fi
+
+
+  set -- $c
+
+  for opt; do
+    echo $opt
+    # split opt in key and value
+    key="${opt%%=*}"
+    value="${opt#*=}"
+    export "KOPT_${key/./_}"="$value" || true
+  done
+#  echo "cmdline: $c"
+#  echo "cmd: $KOPT_cmd"
+#
+#  env
+  if [ -n "$KOPT_cmd" ]; then
+    echo "Will running command instead of init: $KOPT_cmd"
+  fi
+}
+
+# Mounts the /sysroot as an overlayfs, with /media/root-ro as the real root.
+mount_overlay() {
+  mkdir -p /media/root-rw
+
+  mount -t tmpfs root-tmpfs /media/root-rw
+
+  mkdir -p /media/root-rw/work /media/root-rw/root
+
+  mount -t overlay \
+   -o lowerdir=/media/root-ro,upperdir=/media/root-rw/root,workdir=/media/root-rw/work \
+   overlayfs /sysroot
+}
+
+# All remaining mounted dirs will be moved under same dir in /sysroot,
+# ready to switch_root
+move_mounted_to_sysroot() {
+  # From original alpine init
+  cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
+    if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
+      mkdir -p /sysroot/$DIR
+      mount -o move $DIR /sysroot/$DIR
+    fi
+  done
+
+  sync
+}
+
+unlock_tpm() {
+  local part=$1
+
+  # To find the
+
+  #export TPM2TOOLS_TCTI="device:/dev/tpm0"
+  PASSPHRASE=$(tpm2_unseal -c 0x81800000 -p pcr:sha256:0,1,2,3)
+  echo -n "$PASSPHRASE" | cryptsetup open $part c -
+}
+
+initramfs_init_vm() {
+
+    # When used with VM, expect vda to be the recovery squashfs
+    mkdir -p /media/root-ro
+
+    udev_start
+    mount -t squashfs /dev/vda /media/root-ro
+
+    mkdir -p /lib/modules/$(uname -r)
+    mount -t squashfs /dev/vdb /lib/modules/$(uname -r)
+
+    mount_overlay
+
+    udevadm settle
+
+    # Test the time to do a start, init, poweroff
+    if [ -n "$KOPT_cmdx"  ]; then
+      ${KOPT_cmdx}
+      poweroff -d 0 -f
+    fi
+    move_mounted_to_sysroot
+
+
+    echo "Switching root"
+
+    if [ -n "$KOPT_cmd"  ]; then
+      exec switch_root /sysroot ${KOPT_cmd}
+    fi
+    if [ "$key" = "s" ]; then
+      exec switch_root /sysroot /bin/sh
+    elif [ -f /sysroot/sbin/openrc-init ]; then
+      exec switch_root /sysroot /sbin/openrc-init
+    else
+      exec switch_root /sysroot /sbin/init
+    fi
+}
+
+setup_chroot() {
+
+    # https://wiki.gentoo.org/wiki/Chroot/en
+    mount --rbind /dev ${R}/dev
+    mount --make-rslave ${R}/dev
+    mount -t proc /proc ${R}/proc
+    mount --rbind /sys ${R}/sys
+    mount --make-rslave ${R}/sys
+    mount --rbind /tmp ${R}/tmp
+}
+
+function chroot_clean() {
+    X=${1}
+
+    umount ${X}/dev/pts
+    umount  ${X}/dev/
+    umount  ${X}/proc/
+    umount  ${X}/tmp/
+    umount  ${X}/sys/
+}
+
+
+# Main entry point - called by the init script
+initramfs_init() {
+  initramfs_1st
+
+  echo "Starting INITOS initramfs"
+
+  # Required - without this there is no display
+  modprobe -a simpledrm
+
+  # alpine kernel doesn't need this.
+  #echo "Loaded simple DRM, console should be visible"
+
+  # Save the current blkid - before loading the other modules
+  # This should show if any kernel modules are finding the root
+  export ORIG_BLKID=$(blkid)
+  export ORIG_FS=$(cat /proc/filesystems)
+
+  set -x # For debugging - may be removed later, but useful to see what is happening.
+  cmdline /proc/cmdline
+
+  # Load a set of core modules we use
+  initramfs_mods
+
+  # Save the current blkid - before loading the other modules
+  export MODS_BLKID=$(blkid)
+
+  # Debug before searching for volumes
+  #busybox sh
+
+  # Attempt to find the root device - need to load modules and check blocks until
+  # we find the root we want.
+
+  if [ -e /dev/vda ] ; then
+      initramfs_init_vm
+      return
+  fi
+
+
+  udev_start
+
+  echo "Press 'r' for recovery (BTRFS_ROOT), 'a' for console. 'c' for manual LUKS. Default is LUKS if tpm2 is possible, recovery otherwise"
+  read -t 6 -n 1 key
+
+  export MODE=$key
+
+  udevadm settle
+
+  if [ "$MODE" = "a" ]; then
+        busybox sh
+  fi
+  echo "Key: $key"
+
+  find_and_mount_boot
+
+  # this is normally done by sysinit - we want tpm2 to be loaded
+  hwdrivers
+
+  find_and_mount_root
+
+  echo "Rootfs mounted, preparing to switch root"
+
+  # Only unsigned debug image
+  if [ "$key" = "r" ] || [ "$key" = "a" ]; then
+    echo "Run additional setup before - root is in /sysroot"
+    /bin/busybox sh
+  fi
+
+  udevadm control --exit || true
+
+  #rm -rf /run/udev
+  #rm -rf /run/openrc
+
+  # If .dockerenv is present - openrc will not run the 'sysinit' stage
+
+  move_mounted_to_sysroot
+  echo "Switching root"
+
+  if [ "$key" = "s" ]; then
+    exec switch_root /sysroot /bin/sh
+  elif [ -f /sysroot/sbin/openrc-init ]; then
+    exec switch_root /sysroot /sbin/openrc-init
+  else
+    exec switch_root /sysroot /sbin/init
+  fi
+}
+
+## When running a PID 1 - run a initramfs init, depending on environment.
+if [ "$$" = "1" ]; then
+  # Running as PID 1 - initramfs or docker container or VM
+  # TODO: identify if VM, pod or host and run different functions
+
+  initramfs_init
+
+else
+
+  # Running as a script - from shell.
+  $*
+fi
+

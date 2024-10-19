@@ -1,0 +1,135 @@
+#!/bin/sh
+
+# Setup a VM using the recovery image and initramfs.
+# This is useful for testing - but also to setup a VM with a disk and image, or
+# recover/fix an image.
+#
+# Using cloud-hypervisor initially - for more diversity, qemu should also work.
+# Planning to include initos as well in a docker image.
+#
+# Using virtiofs as well.
+
+# Work dir for temp files/cache.
+# Can be a btrfs subvolume, or a tmpfs. I have a btrfs mounted on/x/, and use vol
+# for 'volumes'.
+WORK=${WORK:-/x/initos}
+
+# For running the steps that need a container, use this shared dir and source dir.
+# Should be mounted in docker, will be created on the USB/recovery.
+SRCDIR=${SRCDIR:-/ws/initos}
+
+set -x
+set -e
+
+if [ -z $VM ]; then
+  vmsuffix="${0#*setup-vm}"
+
+  if [ -z "$vmsuffix" ]; then
+    VM=vm1
+  else
+    VM=$vmsuffix
+  fi
+fi
+
+VMDIR=/x/vol/${VM}
+
+mkdisk() {
+  mkdir -p ${VMDIR}
+  qemu-img create -f raw ${VMDIR}/disk.img 10G
+  dev=$(losetup -f ${VMDIR}/disk.img --show)
+  mkfs.btrfs ${VMDIR}/disk.img
+  #parted $dev mklabel gpt
+}
+
+run_virtiofsd() {
+  local dir=${1:-${VMDIR}}
+
+  # Faster than virtio-9p or regular 9p/nfs
+  # FUSE messages over vhost-user socket
+  # DAX (using host buffers) not enabled.
+  ${WORK}/virt/virtiofsd \
+      --socket-path=${VMDIR}/virtiofs.sock \
+      --shared-dir=$dir \
+      --cache=never \
+      --allow-mmap \
+      --xattr \
+      --allow-direct-io \
+      --thread-pool-size=2 &
+  # Save the PID
+
+  echo $! > ${VMDIR}/virtiofsd.pid
+
+#       --log-level debug \
+}
+
+install() {
+  if [ ! -f ${WORK}/virt/ch-remote ]; then
+    wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/ch-remote -O ${WORK}/virt/ch-remote
+  fi
+  if [ ! -f ${WORK}/virt/cloud-hypervisor-static ]; then
+    wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/cloud-hypervisor-static -O ${WORK}/virt/cloud-hypervisor-static
+    wget -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish -O ${WORK}/virt/virtiofsd.zip
+    unzip ${WORK}/virt/virtiofsd.zip -d ${WORK}/virt
+    chmod +x ${WORK}/cloud-hypervisor-static
+  fi
+}
+
+run() {
+  local cmd="$1"
+  echo "CMD: $cmd"
+
+  if [ ! -f ${VMDIR}/disk.img ] ; then
+    mkdisk
+  fi
+
+  # Alpine kernel includes no filesystem - virtiofs is a module
+
+  # memory shared needed for fs
+  #
+  sudo rm ${VMDIR}/virtiofsd.sock || true
+  run_virtiofsd
+
+  KERNEL_VERSION=$(cat ${WORK}/boot/version-virt)
+
+  # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
+  # Otherwise the virtio-console driver is used - faster but less early messages
+
+  # virtio-net is used for eth
+  # tap is the address of the tap on the VM side
+
+  #  --vsock \
+  #  --pmem file=${WORK}/boot/efi/recovery.sqfs \
+
+  # Adding ip=172.17.1.22 to kernel cmdline adds 10 sec delay
+  # noquiet debug loglevel=8 ignore_loglevel
+
+  # --serial tty --console off --cmdline "console=ttyS0 trace_clock=global quiet" \
+  sudo rm -f ${VMDIR}/ch.sock
+
+  echo "$cmd"
+  sudo time ${WORK}/virt/cloud-hypervisor-static \
+    --kernel ${WORK}/boot/vmlinuz-${KERNEL_VERSION} \
+    --memory size=1G,shared=on --pvpanic \
+    --cpus boot=2 --rng src=/dev/urandom \
+    --api-socket=${VMDIR}/ch.sock \
+    --cmdline "trace_clock=global panic=-1 reboot=acpi console=hvc0 quiet virt -- ${cmd}" \
+    --disk path=${WORK}/boot/efi/recovery.sqfs path=${WORK}/virt/modloop-${KERNEL_VERSION}.sqfs path=${VMDIR}/disk.img \
+    --net tap=vm1,ip=172.17.1.23,mask=255.255.128.0,iommu=on \
+    --initramfs ${WORK}/virt/initramfs-${KERNEL_VERSION} \
+    --fs tag=myfs,socket=${VMDIR}/virtiofs.sock,num_queues=1,queue_size=512
+
+    #--fs tag=/dev/root,socket=$PWD/virtiofs-rootfs.sock \
+    #--cmdline "console=hvc0 rootfstype=virtiofs root=/dev/root ro debug" \
+
+
+
+  # exit with openrc-shutdown -p 0
+  # or poweroff -d 0 -f
+
+  # mount -t virtiofs  myfs /mnt
+
+}
+
+CMD=$1
+shift
+$CMD "$*"
