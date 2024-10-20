@@ -19,9 +19,6 @@
 # modified to fit specific needs - without having to add complex config and logic to
 # hide what is actually happening.
 
-# Where do we pull images from
-REPO=${REPO:-git.h.webinf.info/costin}
-
 # Will wipe a disk a create the partitions needed for initos.
 # This should be called explicitly by the user - it will normally not be done automatically.
 # In practice we need ~100M on the EFI, and some btrfs volume.
@@ -32,24 +29,24 @@ wipe_disk() {
 
   # use 100% to fill the disk. This is total, EFI and root.
   # It is possible to later use the rest of the disk for LUKS, LVM or other work partitions.
-  size=${2:-5G}
 
   parted --script --machine -- "${disk_dev}" mklabel gpt
-  #parted --script --machine -- "${DISK}" unit s print
+
+  parted --script --machine -- "${disk_dev}" unit s print
 
 
-  parted "$disk_dev" mkpart ESP fat32 1 1024
+  parted "$disk_dev" mkpart ESP fat32 1 2048
   parted "$disk_dev" set 1 boot on
 
-  parted "$disk_dev" mkpart primary ext4 1024 4096
-  parted "$disk_dev" name 2 "recovery"
-
-  parted "$disk_dev" mkpart primary ext4 4096 4596
-  parted "$disk_dev" name 3 "recovery_verity"
+#  parted "$disk_dev" mkpart primary ext4 2048 4096
+#  parted "$disk_dev" name 2 "recovery"
+#
+#  parted "$disk_dev" mkpart primary ext4 4096 4596
+#  parted "$disk_dev" name 3 "recovery_verity"
 
   # Create the Linux partition
-  parted "$disk_dev" mkpart primary ext4 4596 8GiB
-  parted "$disk_dev" name 4 "LUKS"
+  parted "$disk_dev" mkpart primary ext4 2048 8GiB
+  parted "$disk_dev" name 2 "LUKS"
 
   partprobe $disk_dev
 
@@ -60,10 +57,20 @@ mkcrpyt() {
   local disk_dev=$1
 
   export PASSPHRASE=$(openssl rand -base64 32)
-#  echo -n "$PASSPHRASE" | openssl pkeyutl -encrypt \
-#       -pubin -inkey $PUBLIC_KEY -pkeyopt rsa_padding_mode:oaep \
-#       -pkeyopt rsa_oaep_md:sha256 -out $ENCRYPTED_PASSPHRASE_FILE
+  if [ -f /boot/root.pem ]; then
+    echo -n "$PASSPHRASE" | openssl pkeyutl -encrypt \
+         -pubin -inkey /boot/root.pem \
+         -pkeyopt rsa_padding_mode:oaep \
+         -pkeyopt rsa_oaep_md:sha256 \
+         -out /boot/efi/DISK_RECOVERY_KEY
+  fi
+  echo -n $disk_dev > /boot/efi/ENCRYPTED_DISK_NAME
+
   echo -n "$PASSPHRASE" > /run/passphrase
+
+  save_tpm $PASSPHRASE
+
+  echo "Consider adding a recovery key"
 
   # Linux LUKS partition type is 8309
   # -v -c aes-xts-plain64 -s 512 --hash sha512 --pbkdf pbkdf2 \
@@ -71,17 +78,20 @@ mkcrpyt() {
   echo -n "$PASSPHRASE" | cryptsetup luksFormat --type luks2 ${disk_dev} -
 
   echo -n "$PASSPHRASE" | cryptsetup luksOpen ${disk_dev} c -
-  # To add an escrow key
-  #   echo -n "$PASSPHRASE" |
-  # cryptsetup luksAddKey $DEVICE <(echo -n "$PASSPHRASE_NEW")
 
   mkfs.btrfs /dev/mapper/c
+  # Doesn't really matter, visible after encyption unlock.
   btrfs filesystem label /dev/mapper/c "ROOT"
-
-
 
   # TODO: encrypt the PASSPRASE with the root public key, save it to USB for recovery.
   # TODO: if tpm present, save it to TPM
+}
+
+add_key() {
+  local disk_dev=$1
+  local key_file=$2
+
+  cat /run/passphrase | cryptsetup luksAddKey $disk_dev
 }
 
 
@@ -92,9 +102,6 @@ recover_key() {
   PASSPHRASE=$(openssl pkeyutl -decrypt \
      -inkey $PRIVATE_KEY -in $ENCRYPTED_PASSPHRASE_FILE \
      -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256)
-
-  # TODO: auto yes
-  # TODO: gen key, save key
 }
 
 efidump() {
@@ -108,21 +115,29 @@ gen_pass() {
 
 ## Save the LUKS password to TPM
 save_tpm() {
+  PASSPHRASE=$1
+
     # Key will be disabled if ...
+    # Shows the same output every time, probably fine to repeat.
     tpm2_createpolicy --policy-pcr -l sha256:0,1,2,3 -L policy.digest
 
-    # -C hierarch - e for endorsement, default is owner, also platform
-    # -g sha256 - default
-    # -G defaults to rsa2048:null:aes128cfb
-    # -c file - where to store the 'context' (info about key)
-    tpm2_createprimary -C p -c primary.ctx --format=pem --output=primary_pub.pem
-    # displays info -
-    tpm2_print -t TPMS_CONTEXT primary.ctx
-    ### Handle: 0x80000000, sequence: 6, 10, etc - size 1914
+    tpm2_getcap handles_persistent | grep -q 0x81800001
+    if [ $? -ne 0 ]; then
+      # -C hierarch - e for endorsement, default is owner, also platform
+      # -g sha256 - default
+      # -G defaults to rsa2048:null:aes128cfb
+      # -c file - where to store the 'context' (info about key)
+      tpm2_createprimary -C p -c primary.ctx --format=pem --output=primary_pub.pem
+      # displays info - including key handle (it seems to be temporary )
+      tpm2_print -t TPMS_CONTEXT primary.ctx
+      ### Handle: 0x80000000, sequence: 2, 6, 10, etc - size 1914
 
-    tpm2_evictcontrol -c primary.ctx -o primary.tr -C p
-    tpm2 print -t ESYS_TR primary.tr
-    # Handle: 0x81800001
+      # Get a persistent handle
+      tpm2_evictcontrol -c primary.ctx -o primary.tr -C p
+      # To remove: replace -c primary.ctx with -c 0x81800001
+      tpm2 print -t ESYS_TR primary.tr
+      # Should hopefully create Handle: 0x81800001
+    fi
 
     # '-C p' worked on some where '-C e' didn't
 
@@ -132,16 +147,15 @@ save_tpm() {
     # -u and -r seem to be used to allow the object to be moved to another TPM
     # -C context (parent object) - not sure how to list
     # -r and -u - where to store the output
-    echo ${PASSPHRASE} | tpm2_create -u key.pub -r key.priv \
-        -C primary.ctx -L policy.digest -i -
+    echo ${PASSPHRASE} | tpm2_create -u key.pub -r key.priv -C 0x81800001 -L policy.digest -i -
     # -C 0x81000000 also works as -C - from handles-persistent
     # -c key.ctx -> also load in the same step, but ChromeOS TPM doesn't support it
     # without -i creates an RSA public key
 
-    tpm2_evictcontrol -C p -c 0x81800001
+    tpm2_evictcontrol -C p -c 0x81800002
     # -c - the out file for the context for the key
     # tpm2_create generates the 'export' files.
-    tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx -n key.name
+    tpm2_load -C 0x81800001 -u key.pub -r key.priv -c key.ctx -n key.name
 
     # -C p - platform (only one working on my chromebook)
     # -c ctx - the key handle or ctx file

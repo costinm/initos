@@ -1,0 +1,190 @@
+#!/bin/sh
+
+# A separate script is used for 'secure' mode:
+# - look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
+# - fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
+
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+export INIT_OS=secure
+
+export HASH_PREFIX=/boot
+
+. /sbin/init-common.sh
+
+
+# Load modules we may need - modules are also loaded if we get to udev
+# or nlplug-findfs, but we may skip that if the core modules are enough.
+initramfs_mods() {
+  # Not including USB drivers.
+
+  modprobe scsi_mod
+  # Support scsi disks - needed for sata ?
+  modprobe sd_mod
+
+  # for loading recovery
+  modprobe squashfs
+
+  modprobe loop
+  modprobe dm-verity
+  #v "$(lsmod)"
+}
+
+# Secure mode expects the EFI partition to be labeled BOOT.
+# Will not attempt to lookup USB_BOOT (which is used in recovery/install)
+find_and_mount_boot() {
+  bootd=$(findfs LABEL=BOOT)
+  if [ -n "$bootd" ]; then
+    mkdir -p /boot/efi
+    fsck.vfat -y $bootd
+    mount -t vfat $bootd /boot/efi
+    rm /boot/efi/FSCK*.REC
+    if [ $? -ne 0 ]; then
+      lfatal "Failed to mount $bootd partition"
+    fi
+    mount_boot /boot/efi
+  else
+    lfatal "Failed to find BOOT partition"
+  fi
+}
+
+# Logic to find an mount the root device.
+# For secure mode, expect a LUKS device.
+find_and_mount_root() {
+  mkdir -p /sysroot
+
+  if [ -f /sysroot/sbin/init ]; then
+    return
+  fi
+
+  # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
+  #  (opinionated partitioning, 1 is EFI)
+  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  if [ -n "$cryptd" ]; then
+    echo "Found LUKS device: ${cryptd}"
+    unlock_tpm $cryptd
+    if [ $? -eq 0 ]; then
+      mount_btrfs /dev/mapper/c
+      if [ $? -eq 0 ]; then
+          return
+      fi
+      logi "Failed to mount BTRFS root, fallback to recovery"
+    fi
+    logi "Failed to unlock encrypted disk with TPM, fallback to recovery"
+  else
+    logi "No LUKS volume found, fallback to recovery"
+  fi
+
+  # No point to have an option to ask for console key - we'll boot to recovery
+  # and wait for SSH or login and enter the key.
+}
+
+recovery_rootfs() {
+  mount_recovery /boot/efi
+  if [ $? -eq 0 ]; then
+    return
+  fi
+  lfatal "Failed to mount recovery"
+}
+
+
+# Mount recovery using files in the EFI partition, mounted in /boot/efi
+#
+mount_recovery() {
+  dir=${1:-/boot/efi}
+
+  logi "Mounting recovery squash as rootfs"
+  mount -o bind /initos/recovery /sysroot
+
+  if [ -f ${dir}/interfaces ]; then
+    cp ${dir}/interfaces /sysroot/etc/network/interfaces
+  fi
+  if [ -d ${dir}/dropbear ]; then
+    cp -a ${dir}/dropbear /sysroot/etc
+  fi
+
+  # TODO: from boot partition !
+  if [ -f ${dir}/authorized_keys ]; then
+    mkdir -p /sysroot/root/.ssh
+    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
+  fi
+  if [ -f ${dir}/wpa_supplicant.conf ]; then
+    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
+  fi
+}
+
+# Main entry point - called by the init script
+initramfs_init() {
+  initramfs_1st
+  mount_proc
+
+  logi "Starting INITOS initramfs secure $(uname -r)"
+
+  # TODO: wrong location - for some reason doesn't show up in boot
+  logv "Files on boot: " $(ls -l /boot)
+
+  # Required - without this there is no display
+  modprobe -a simpledrm
+
+  # Save the current blkid - before loading the other modules
+  # This should show if any kernel modules are finding the root
+  logv BLKID at boot: $(blkid)
+  logv FS at boot: $(cat /proc/filesystems)
+
+
+  # Load a set of core modules we use
+  initramfs_mods
+
+  # Save the current blkid - before loading the other modules
+  logv BLKID after initramfs mods: $(blkid)
+
+  # Attempt to find the root device - need to load modules and check blocks until
+  # we find the root we want.
+  udev_start
+
+  udevadm settle
+
+  set -x # For debugging - may be removed later, but useful to see what is happening.
+
+  find_and_mount_boot
+
+  logi "Recovery,modules,firmware mounted $(cat /proc/uptime)"
+
+  # this is normally done by sysinit - we want tpm2 to be loaded
+  # Needs to happen after full firmware and modules are in place
+  hwdrivers
+
+  udevadm trigger
+  udevadm settle
+
+  logv BLKID after hwdrivers $(blkid)
+
+  find_and_mount_root
+
+  if [ ! -f /sysroot/sbin/init ]; then
+    recovery_rootfs
+  fi
+
+  udevadm control --exit || true
+
+  # In memory, not disk
+  edump /sysroot/x/initios/log/boot
+
+  move_mounted_to_sysroot
+
+  logi "Root mounted $(cat /proc/uptime)"
+
+  if [ -f /sysroot/sbin/openrc-init ]; then
+    exec switch_root /sysroot /sbin/openrc-init
+  else
+    exec switch_root /sysroot /sbin/init
+  fi
+  lfatal "Failed to switch root"
+}
+
+## When running a PID 1 - run a initramfs init, depending on environment.
+if [ "$$" = "1" ]; then
+  initramfs_init
+else
+  $*
+fi
+

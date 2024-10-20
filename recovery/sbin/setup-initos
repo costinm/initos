@@ -23,6 +23,13 @@ WORK=${WORK:-/x/initos}
 # Should be mounted in docker, will be created on the USB/recovery.
 SRCDIR=${SRCDIR:-/ws/initos}
 
+# If the source dir is mounted, use it as a prefix to load fresh files
+# Otherwise - use the files in the recovery image.
+if [ -d $SRCDIR/recovery ]; then
+  cp -a $SRCDIR/recovery/sbin/* /sbin/
+  cp -a $SRCDIR/recovery/etc/* /etc
+fi
+
 ## All functions after this line are run inside a container, chroot or host running
 # 'recovery' or alpine installer or distro.
 
@@ -68,8 +75,12 @@ vlinux_alpine() {
 # vinit updates the initramfs for the virt kernel, in case init script is changed.
 vinit() {
   VKERNEL_VERSION=$(cat /boot/version-virt)
+  # -k - keep the file
+  # -t - temp dir where all is stored
 
-  mkinitfs  -i $SRCDIR/recovery/init -F "base btrfs squashfs virtio eudev initos" -o ${WORK}/virt/initramfs-$VKERNEL_VERSION $VKERNEL_VERSION
+  rm -rf ${WORK}/virt/initfs
+  mkdir -p ${WORK}/virt/initfs
+  mkinitfs -k -t ${WORK}/virt/initfs  -i /sbin/init-vm -F "base btrfs squashfs virtio initos" -o ${WORK}/virt/initramfs-$VKERNEL_VERSION $VKERNEL_VERSION
 }
 
 # Generate an unsigned efi image, based on alpine with a custom init script.
@@ -100,43 +111,117 @@ efi() {
 
   [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules" && return
 
-  # Uses mkinitfs.conf added from file in the docker image.
-  # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
-
-  # -k - keep the file
-  # -t - temp dir where all is stored
-  # -i - what init file to use - replace default with our script.
-  #rm -rf ${WORK}/initrd
-  # -k -t ${WORK}/initrd
   local img=/boot/initrd-initos.img-${KERNEL_VERSION}
 
-  echo "features=\"ata base btrfs keymap mmc nvme scsi usb cryptsetup squashfs tpm2 clevis initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
-  cp /etc/passwd /usr/share/mkinitfs/passwd
-  cp /etc/group /usr/share/mkinitfs/group
-
-  mkinitfs  -i $SRCDIR/recovery/init -o ${img}  $KERNEL_VERSION
-
-  echo "Built initramfs ${img} for ${KERNEL_VERSION}"
+  build_initrd ${KERNEL_VERSION} ${img}
 
   echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /boot/cmdline
 
   mkdir -p /boot/efi/EFI/BOOT
   efi-mkuki \
     -c /boot/cmdline \
-    -o /boot/efi/EFI/BOOT/BOOTX64.EFI \
+    -o /boot/efi/EFI/BOOT/Initos-NEW.EFI \
       ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}
 
   echo ${KERNEL_VERSION} > /boot/efi/version
-
-  # InitOS-${KERNEL_VERSION}.EFI
 }
+
+build_initrd() {
+  local KERNEL_VERSION=$1
+  local img=$2
+
+  echo "Built initramfs ${img} for ${KERNEL_VERSION}"
+
+  local KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
+  [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
+
+  [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules" && return
+
+    # Uses mkinitfs.conf added from file in the docker image.
+    # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
+
+    # -k - keep the file
+    # -t - temp dir where all is stored
+    # -i - what init file to use - replace default with our script.
+    #rm -rf ${WORK}/initrd
+    # -k -t ${WORK}/initrd
+    local img=/boot/initrd-initos.img-${KERNEL_VERSION}
+
+    echo "features=\"ata base btrfs keymap mmc nvme scsi usb cryptsetup squashfs tpm2 clevis initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
+    cp /etc/passwd /usr/share/mkinitfs/passwd
+    cp /etc/group /usr/share/mkinitfs/group
+    #cp /boot/efi/hash* /boot/
+
+    rm -rf ${WORK}/initfs.host
+    mkinitfs -k -t ${WORK}/initfs.host -i /sbin/init-usb -o ${img}  $KERNEL_VERSION
+}
+
+# sign creates a signed UKI.
+# The initramfs is different - the additional file will disable shell and trigger verification.
+sign() {
+  set -e
+  local KERNEL_VERSION=$(cat /boot/version)
+
+  # Need to rebuild the initrd - for some reason the hash is not found.
+
+  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
+  if [ ! -f /etc/uefi-keys/db.crt ]; then
+    sign_init
+  fi
+  if [ ! -f /etc/uefi-keys/root.pem ]; then
+      openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /etc/uefi-keys/root.key
+      openssl ec -in /etc/uefi-keys/root.key -pubout -out /etc/uefi-keys/root.pem
+      ssh-keygen -y -f /etc/uefi-keys/root.key > /etc/uefi-keys/authorized_keys
+    fi
+    cp /etc/uefi-keys/root.pem /boot/efi/EFI
+    cp /etc/uefi-keys/root.pem /boot/
+
+  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
+
+  # The hash must be on the signed initrd - not on the efi disk (which is mounted)
+  cp /boot/efi/hash* /boot/
+  (find /boot/hash* /boot/root.pem | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
+
+  # TODO: add authorized_keys and root.pem
+
+  echo "loglevel=0 quiet console=ttyS0 console=tty1 net.ifnames=1 panic=5 rdinit=/sbin/init-secure initos.secure" > /boot/cmdline.secure
+
+  efi-mkuki \
+    -c /boot/cmdline.secure \
+    -o /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI \
+      ${KERNEL} \
+       /boot/intel-ucode.img /boot/amd-ucode.img \
+       /boot/initrd-initos.img-${KERNEL_VERSION} /boot/initos-hashes.cpio.gz
+
+   #    ${WORK}/initos-secure.cpio.gz
+
+  sbsign --cert /etc/uefi-keys/db.crt --key /etc/uefi-keys/db.key \
+    --output /boot/efi/EFI/BOOT/BOOTX64.EFI \
+    /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
+  echo ${KERNEL_VERSION} > /boot/efi/EFI/BOOT/BOOTX64.version
+  echo ${KERNEL_VERSION} > /boot/efi/EFI/BOOT/BOOTX64.${KERNEL_VERSION}
+  rm /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
+
+  cp /etc/uefi-keys/*`.auth` /boot/efi/EFI
+  cp /etc/uefi-keys/*`crt` /boot/efi/EFI
+  cp /etc/uefi-keys/*`cer` /boot/efi/EFI
+
+
+  chmod 755 /boot/efi/EFI/*.auth
+  chmod 755 /boot/efi/EFI/*.crt
+  chmod 755 /boot/efi/EFI/*.cer
+
+  rm /.dockerenv
+  # TODO: also sign the squash and modules
+}
+
 
 # Incremental efi build - only replaces init
 efi2() {
   KERNEL_VERSION=$(cat /boot/version)
   KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
   local img=/boot/initrd-initos.img-${KERNEL_VERSION}
-  cp $SRCDIR/recovery/init /init
+  cp /sbin/init-usb  /init
  (find /init | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-xtra.cpio.gz
  (find /boot/efi/hash* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
 
@@ -145,7 +230,7 @@ efi2() {
   mkdir -p /boot/efi/EFI/BOOT
   efi-mkuki \
     -c /boot/cmdline \
-    -o /boot/efi/EFI/BOOT/BOOTX64.EFI \
+    -o /boot/efi/EFI/BOOT/Initos-NEW.EFI \
       ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img} /boot/initos-hashes.cpio.gz /boot/initos-xtra.cpio.gz
 
 }
@@ -160,56 +245,43 @@ firmware_sqfs() {
   cd /x/initos/firmware
   rm -f /boot/efi/firmware.sqfs
   mksquashfs . /boot/efi/firmware.sqfs
+  veritysetup format --root-hash-file=/boot/efi/hash.firmware /boot/efi/firmware.sqfs /boot/efi/firmware.sqfs.verity
+
 }
+
 mods_sqfs() {
   local ver=$1
   cd /x/initos/modules/${ver}
   rm -f /boot/efi/modules-${ver}.sqfs
   mksquashfs . /boot/efi/modules-${ver}.sqfs
+  veritysetup format --root-hash-file=/boot/efi/hash.modules-${ver} /boot/efi/modules-${ver}.sqfs /boot/efi/modules-${ver}.sqfs.verity
 }
 
-# sign creates a signed UKI.
-# The initramfs is different - the additional file will disable shell and trigger verification.
-sign() {
-  local KERNEL_VERSION=$(cat /boot/version)
+# Creating the recovery is a bit more complicated with docker - there are few ways:
+# - use crane, if the image is pushed.
+# - start a temp image, docker export
+recovery_sqfs_crane() {
+  local img=$1
+  local out=$2
 
-  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
-  if [ ! -f /etc/uefi-keys/db.crt ]; then
-    sign_init
-  fi
-  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
+  mkdir -p ${WORK}/boot/efi
+  rm -f ${WORK}/boot/efi/${out}.sqfs
 
-  veritysetup format --root-hash-file=/boot/efi/hash.recovery /boot/efi/recovery.sqfs /boot/efi/recovery.sqfs.verity
-  veritysetup format --root-hash-file=/boot/efi/hash.firmware /boot/efi/firmware.sqfs /boot/efi/firmware.sqfs.verity
-  veritysetup format --root-hash-file=/boot/efi/hash.modules /boot/efi/modules-${KERNEL_VERSION}.sqfs /boot/efi/modules-${KERNEL_VERSION}.sqfs.verity
+  crane export  ${img} | sqfstar ${WORK}/boot/efi/${out}.sqfs -e .dockerenv
+  veritysetup format --root-hash-file=/boot/efi/hash.${out} /boot/efi/${out}.sqfs /boot/efi/${out}.sqfs.verity
+}
 
-  echo "Built secure initramfs ${KERNEL_VERSION}"
+recovery_sqfs_docker_export() {
+  local out=recovery
 
-  (find /boot/efi/hash* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
+  mkdir -p /boot/efi
+  rm -f /boot/efi/recovery.sqfs
 
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 initos.secure" > /boot/cmdline.secure
+  # Read all stdin
+  #cat ${WORK}/work/recovery.tar |
+  sqfstar /boot/efi/recovery.sqfs -e .dockerenv
 
-  efi-mkuki \
-    -c /boot/cmdline.secure \
-    -o /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI \
-      ${KERNEL} \
-       /boot/intel-ucode.img /boot/amd-ucode.img /boot/initos-hashes.cpio.gz \
-       /boot/initrd-initos.img-${KERNEL_VERSION}
-
-   #    ${WORK}/initos-secure.cpio.gz
-
-  sbsign --cert /etc/uefi-keys/db.crt --key /etc/uefi-keys/db.key \
-    --output /boot/efi/EFI/BOOT/InitOS-${KERNEL_VERSION}-signed.EFI \
-    /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
-
-  rm /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
-
-  cp /etc/uefi-keys/*.auth /boot/efi/EFI
-
-  chmod 777 /boot/efi/EFI/*.auth
-
-  rm /.dockerenv
-  # TODO: also sign the squash and modules
+  veritysetup format --root-hash-file=/boot/efi/hash.${out} /boot/efi/${out}.sqfs /boot/efi/${out}.sqfs.verity
 }
 
 # Generate the key pairs for signing the kernel and the disk image.
@@ -230,11 +302,9 @@ sign_init() {
 
 install_recovery() {
   cp -a ${SRCDIR}/recovery/sbin/* /sbin/
-  cp -a -f ${SRCDIR}/recovery/etc/* /etc/
   cp -a ${SRCDIR}/recovery/home /
   cp -a ${SRCDIR}/recovery/root /
   chown -R root /root
-  cp -a ${SRCDIR}/recovery/init /
 
   alpine_add_common
   alpine_add_base
@@ -242,14 +312,16 @@ install_recovery() {
 
   apk add openrc-init
 
+  # Add the config files
+  cp -a -f ${SRCDIR}/recovery/etc/* /etc/
+
   (cd /etc/init.d && ln -s agetty agetty.tty1)
   (cd /etc/init.d && ln -s agetty agetty.tty2)
-  (cd /etc/init.d && ln -s agetty agetty.ttyS0)
-  (cd /etc/init.d && ln -s agetty agetty.hvc0)
+  rc-update add agetty.tty1 boot
   rc-update add agetty.tty1 boot
   rc-update add agetty.tty2 default
-  rc-update add agetty.ttyS0 boot
-  rc-update add agetty.hvc0 boot
+#  rc-update add agetty.ttyS0 boot
+#  rc-update add agetty.hvc0 boot
 
   rc-update add devfs sysinit
   rc-update add dmesg sysinit
@@ -304,7 +376,7 @@ install_recovery() {
   # Temp - debug only
   # TODO: in initrd, patch /etc/shadow to remove password instead
   # would be useful with all cloud images...
-  passwd -d root
+  #passwd -d root
 
 }
 
@@ -342,6 +414,7 @@ alpine_add_recovery() {
   apk add busybox-openrc
 
   apk add dropbear dropbear-openrc
+  apk add openssh-keygen
   # fsverity CLI
   #apk add fsverity-utils
 
@@ -357,7 +430,8 @@ alpine_add_recovery() {
 
   apk add cryptsetup uuidgen
 
-  apk add clevis
+  # clevis adds bash, jose, cacklib
+  # apk add clevis
 
   apk add bridge
 
@@ -381,6 +455,7 @@ alpine_add_recovery() {
   #apk add pcituils
 
   apk add efi-mkuki
+  apk add efi-mkkeys
   apk add sbsigntool
 
   apk add openssh-sftp-server
@@ -413,7 +488,8 @@ alpine_add_recovery() {
   # nsjail can listen on a port and start container on connection
   # supports macvlan
   # can act as an init (restart on exit)
-  apk add nsjail
+  # logs of deps (abseil, protobuf)
+  #apk add nsjail
 
   # init with a single process. Can reap even if not running as PID1.
   apk add tini
@@ -426,7 +502,7 @@ alpine_add_recovery() {
   #  apk add iproute2 tcpdump procps
 
   # For OCI interaction
-  #apk add crane
+  apk add crane
   # Can also encrypt/decrypt - 3.7M + 2M for keygen
   #apk add age
 
@@ -457,14 +533,13 @@ alpine_add_base() {
 
   # Add the user to the sudoers group
   addgroup admin wheel
+  addgroup admin kvm
   addgroup build users # otherwise swayunlock fails, /etc/shaddow permissions
   addgroup build video
   addgroup build audio
 
-
-
   # Disable IPv6 for now - seems to be broken in some cases. Can be enabled in rootfs.
-  echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.conf
+  #echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.conf
 
   chown root /root
 

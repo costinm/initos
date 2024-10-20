@@ -43,7 +43,7 @@ set -e
 
 
 # Source files
-VOLS="-v ${SRCDIR}:/ws/${APP}"
+VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
 
 # APK cache - to avoid downloading files.
 VOLS="$VOLS -v ${WORK}/work/cache:/etc/apk/cache"

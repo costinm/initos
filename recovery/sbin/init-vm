@@ -1,0 +1,114 @@
+#!/bin/sh
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+. /sbin/init-common.sh
+
+# Main function after modules loaded and system mounted.
+# Expects /dev/vda to be the recovery squashfs,
+# /dev/vdb modules corresponsing to the kernel.
+# /dev/vdc is the real root, expected to be btrfs.
+initramfs_init_vm() {
+    # Test the time to do a start, init, poweroff
+    # Not loading hardware modules - the root can do it if needed.
+    #udevadm settle
+    cmdline /proc/cmdline
+
+    # Run a command before mounting
+    if [ -n "$KOPT_cmd0"  ]; then
+      # Should be about 0.4
+      ${KOPT_cmd0}
+      cat /proc/uptime
+      poweroff -d 0 -f
+    fi
+
+    # When used with VM, expect vda to be the recovery squashfs
+    mkdir -p /media/root-ro
+
+    # Don't need udev - required modules are enough
+    #udev_start
+
+    mount -t squashfs /dev/vda /media/root-ro
+
+    if [ -f /dev/vdb ]; then
+      mkdir -p /lib/modules/$(uname -r)
+      mount -t squashfs /dev/vdb /lib/modules/$(uname -r)
+    fi
+
+    mount_overlay
+
+    if [ -f /dev/vdc ]; then
+      mkidr -p /x
+      # This takes a long time
+      echo Loading btfs module
+      cat /proc/uptime
+      time modprobe btrfs
+      cat /proc/uptime
+      mount -t btrfs /dev/vdc /x
+    fi
+
+    # Will get the link local IPv6 address !
+    ifconfig eth0 up
+    ifconfig lo up
+
+    cd /sysroot/etc/init.d
+    ln -s agetty agetty.hvc0
+    cd /sysroot/etc/runlevels/default
+    ln -s ../../init.d/agetty.hvc0 agetty.hvc0
+    rm dropbear
+#    cd /sysroot/etc/runlevels/boot
+#    ln -s ../../init.d/agetty.hvc0 agetty.hvc0
+    rm /sysroot/etc/network/interfaces
+    rm /sysroot/etc/sysctl.conf
+
+    #busybox sh
+    # Test the time to do a start, init, poweroff
+    if [ -n "$KOPT_cmdx"  ]; then
+      ${KOPT_cmdx}
+      poweroff -d 0 -f
+    fi
+    move_mounted_to_sysroot
+
+    if [ -n "$KOPT_cmd"  ]; then
+      echo exec switch_root /sysroot /bin/sh -c "${KOPT_cmd}"
+      exec switch_root /sysroot /bin/sh -c "${KOPT_cmd}"
+    fi
+    if [ -f /sysroot/sbin/openrc-init ]; then
+      exec switch_root /sysroot /sbin/openrc-init
+    else
+      exec switch_root /sysroot /sbin/init
+    fi
+}
+
+
+# Mounts the /sysroot as an overlayfs, with /media/root-ro as the real root.
+mount_overlay() {
+  mkdir -p /media/root-rw
+
+  mount -t tmpfs root-tmpfs /media/root-rw
+
+  mkdir -p /media/root-rw/work /media/root-rw/root
+
+  mount -t overlay \
+   -o lowerdir=/media/root-ro,upperdir=/media/root-rw/root,workdir=/media/root-rw/work \
+   overlayfs /sysroot
+}
+
+core_mods() {
+  # Not loaded in alpine virt kernel - it will allow identifying the disk
+
+  modprobe squashfs
+  modprobe virtio_blk
+  modprobe virtio_iommu
+  modprobe virtio_net
+
+  # No need to load simpledrm - using console
+}
+
+initramfs_1st
+
+mount_proc
+
+# At this point - no filesystems, only md, mdp, blkext block devices.
+core_mods
+
+initramfs_init_vm

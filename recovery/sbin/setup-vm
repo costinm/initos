@@ -74,6 +74,13 @@ install() {
   fi
 }
 
+# Testing:
+# Run a command before swaproot, poweroff immediatly after.
+# CMD_XTRA=cmdx=/bin/ls setup-vm run # 2.05 sec
+#
+# Run a command after pivot, poweroff
+# setup-vm run "df; poweroff -d 0 -f" # About same
+
 run() {
   local cmd="$1"
   echo "CMD: $cmd"
@@ -87,9 +94,22 @@ run() {
   # memory shared needed for fs
   #
   sudo rm ${VMDIR}/virtiofsd.sock || true
-  run_virtiofsd
+
+  OPTS=
+  if [ -n "$VDIR" ]; then
+    run_virtiofsd $VDIR
+    OPTS="$OPTS --fs tag=myfs,socket=${VMDIR}/virtiofs.sock,num_queues=1,queue_size=512"
+  fi
+
+
 
   KERNEL_VERSION=$(cat ${WORK}/boot/version-virt)
+  if [ -n "$MODS" ]; then
+    DISKS="$DISKS path=${WORK}/virt/modloop-${KERNEL_VERSION}.sqfs"
+  fi
+  if [ -n "$DISK" ]; then
+    DISKS="$DISKS path=${VMDIR}/disk.img"
+  fi
 
   # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
   # Otherwise the virtio-console driver is used - faster but less early messages
@@ -112,11 +132,11 @@ run() {
     --memory size=1G,shared=on --pvpanic \
     --cpus boot=2 --rng src=/dev/urandom \
     --api-socket=${VMDIR}/ch.sock \
-    --cmdline "trace_clock=global panic=-1 reboot=acpi console=hvc0 quiet virt -- ${cmd}" \
-    --disk path=${WORK}/boot/efi/recovery.sqfs path=${WORK}/virt/modloop-${KERNEL_VERSION}.sqfs path=${VMDIR}/disk.img \
+    --cmdline "trace_clock=global panic=-1 reboot=acpi console=hvc0 quiet xip=172.17.1.24 ${CMD_XTRA} -- ${cmd}" \
+    --disk path=${WORK}/boot/efi/recovery.sqfs  ${DISKS} \
     --net tap=vm1,ip=172.17.1.23,mask=255.255.128.0,iommu=on \
     --initramfs ${WORK}/virt/initramfs-${KERNEL_VERSION} \
-    --fs tag=myfs,socket=${VMDIR}/virtiofs.sock,num_queues=1,queue_size=512
+    $OPTS
 
     #--fs tag=/dev/root,socket=$PWD/virtiofs-rootfs.sock \
     #--cmdline "console=hvc0 rootfstype=virtiofs root=/dev/root ro debug" \

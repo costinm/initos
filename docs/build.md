@@ -7,7 +7,7 @@
 export WORK=/x/initos
 
 # All components. Result in ${WORK}/boot/efi - can be copied to a USB EFI partition.
-./recovery/sbin/setup-in-docker all
+./setup.sh all
 
 ```
 
@@ -18,27 +18,27 @@ Alternatively, step-by-step full build:
 
 # start and build the recovery container locally, from edge:alpine.
 # All other steps will use the docker image.
-./recovery/sbin/setup-in-docker recovery
+./setup.sh recovery
 
 # Export the docker container to ${WORK}/recovery and build the sqfs (drun recovery_sqfs)
-./recovery/sbin/setup-in-docker recovery_sqfs
+./setup.sh recovery_sqfs
 
 # Download linux alpine kernel, modules and firmware
 # The kernel version is in ${WORK}/boot/version - other kernel versions and modules can be copied from
 # debian, alpine, ubuntu, etc, following the same layout.
-./recovery/sbin/setup-in-docker drun linux_alpine
-./recovery/sbin/setup-in-docker drun firmware_sqfs
-./recovery/sbin/setup-in-docker drun mods_sqfs
+./setup.sh drun linux_alpine
+./setup.sh drun firmware_sqfs
+./setup.sh drun mods_sqfs
 
 # Build the UKI - using boot/version, the kernel, modules.
-./recovery/sbin/setup-in-docker drun efi
+./setup.sh drun efi
 # Second build - fast incremental (only replaces init)
-./recovery/sbin/setup-in-docker drun efi2
+./setup.sh drun efi2
 
 # Optional - can be run on a different machine/VM with the root keys available.
 # Will use a separate recovery container - the keys are not mounted on the regular container.
 # The signed image does not allow shell or options.
-./recovery/sbin/setup-in-docker drun sign
+./setup.sh drun sign
 
 
 ```
