@@ -7,6 +7,8 @@ jobs:
   build-docker:
     name: Build-in-docker
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v2
@@ -19,8 +21,8 @@ jobs:
         with:
           push: true
           tags: ghcr.io/costinm/ugate/initios-recovery:latest
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          #username: ${{ github.actor }}
+          #password: ${{ secrets.GITHUB_TOKEN }}
 #          registry: docker.pkg.github.com
 #          repository: costinm/ugate/ugate/initos
           #tag_with_ref: true
