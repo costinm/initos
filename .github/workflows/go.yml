@@ -21,8 +21,8 @@ jobs:
         with:
           push: true
           tags: ghcr.io/costinm/ugate/initios-recovery:latest
-          #username: ${{ github.actor }}
-          #password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 #          registry: docker.pkg.github.com
 #          repository: costinm/ugate/ugate/initos
           #tag_with_ref: true
