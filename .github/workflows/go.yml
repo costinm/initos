@@ -12,16 +12,25 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
+
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: push recovery
-        uses: docker/build-push-action@v1
+        uses: docker/build-push-action@v6
         with:
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          registry: docker.pkg.github.com
-          repository: costinm/initos/initos
-          tag_with_ref: true
+          push: true
+          tags: costinm/initios-recovery:latest
+          #username: ${{ github.actor }}
+          #password: ${{ secrets.GITHUB_TOKEN }}
+          #registry: docker.pkg.github.com
+          #repository: costinm/initos/initos
+          #tag_with_ref: true
 
 #      - name: Upload EFI image
 #        uses: actions/upload-artifact@v2
