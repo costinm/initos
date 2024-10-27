@@ -45,11 +45,8 @@ SRCDIR=${SRCDIR:-/ws/initos}
 # are used to build the UKI in the EFI partition and modules/firmware go to different
 # subvolumes.
 linux_alpine() {
-  set -x
-  echo "Installing linux LTS"
-
-  apk add intel-ucode amd-ucode
   apk add linux-lts
+  apk add intel-ucode amd-ucode
 
   KERNEL_VERSION=$(cat /usr/share/kernel/lts/kernel.release)
 
