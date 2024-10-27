@@ -118,6 +118,7 @@ save_tpm() {
   PASSPHRASE=$1
 
     # Key will be disabled if ...
+
     # Shows the same output every time, probably fine to repeat.
     #tpm2_createpolicy --policy-pcr -l sha256:0,1,2,3 -L policy.digest
     tpm2_createpolicy --policy-pcr -l sha256:8 -L policy.digest

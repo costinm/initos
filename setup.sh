@@ -7,6 +7,60 @@ export REPO=${REPO:-git.h.webinf.info/costin}
 export IMAGE=${IMAGE:-${REPO}/initos-recovery:latest}
 export CONTAINER=initos-recovery
 
+
+# All builds an '[/x/initos]/boot/efi' dir ready to use with a USB disk or
+# copied on a (large enough - at least 1G) EFI partition
+all() {
+  recovery
+  usb
+  sign
+}
+
+# Build the USB installer files - need to go to a large EFI partition.
+# Will download the debian and alpine kernels.
+usb() {
+  mkdir -p ${WORK}/boot/efi
+  # For the recovery docker build.
+  # All other steps are run in a container or chroot.
+  export DOCKER_BUILDKIT=1
+  docker build --progress plain -o ${WORK}/boot/efi \
+     -t ${REPO}/initos-recovery:latest -f ${SRCDIR}/tools/Dockerfile.boot ${SRCDIR}
+}
+
+# Sign will sign the EFI files - using the keys in /etc/uefi-keys
+# This is a separate step - not using the sleeping docker container/pod/etc - but
+# a fresh container that only signs.
+sign() {
+  VOLS="-v ${WORK}/boot:/boot"
+  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin/setup-initos:/sbin/setup-initos"
+  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin/initos-secure:/sbin/initos-secure"
+  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin/initos-common.sh:/sbin/initos-common.sh"
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/initos"
+
+  mkdir -p ${HOME}/.ssh/initos/uefi-keys
+
+  # Inside the host or container - initos files will be under /initos (for now)
+  docker run -it --rm \
+      ${VOLS} \
+      -v ${HOME}/.ssh/initos/uefi-keys:/etc/uefi-keys \
+    ${REPO}/initos-recovery:latest /sbin/setup-initos sign
+}
+
+# Build image
+recovery() {
+  set -e
+ # For the recovery docker build.
+ # All other steps are run in a container or chroot.
+ export DOCKER_BUILDKIT=1
+   docker build --progress plain \
+     -t ${REPO}/initos-recovery:latest --target recovery -f ${SRCDIR}/Dockerfile ${SRCDIR}
+  docker push ${REPO}/initos-recovery:latest
+}
+
+
+####### For development and testing ########
+
 # Build the USB installer files - need to go to a large EFI partition.
 usb() {
   mkdir -p ${WORK}/tmp
@@ -72,17 +126,6 @@ deb() {
   docker run -v /lib/modules:/lib/modules ${IMAGE} /sbin/setup-initos mod_sqfs
 }
 
-# All builds an '[/x/initos]/boot/efi' dir ready to use with a USB disk or
-# copied on a (large enough - at least 1G) EFI partition
-all() {
-  # Get kernel, modules, firmware - and create sqfs and populate /x/initos/boot
-  drun sqfs
-
-  recovery_sqfs
-  efi
-  sign
-}
-
 allvirt() {
   # Get kernel, modules, firmware - and create sqfs and populate /x/initos/boot
   drun vlinux_alpine
@@ -126,6 +169,8 @@ export_recovery() {
 # Generate recovery image as $REPO/initos-recovery:latest. Will not push.
 # A container initos-recovery running the image will be left running (sleep).
 # Will mount source dir and /x/vol/initos in the container.
+recovery_local() {
+  mkdir -p ${WORK}/work/cache
 recovery_local() {
   mkdir -p ${WORK}/work/cache
   docker rm -f initos-recovery || true

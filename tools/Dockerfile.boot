@@ -71,6 +71,10 @@ EOF
 ## Run docker build with -o DIR - the files with be saved.
 FROM scratch as efi
 
-COPY --link --from=deb-efi /boot/efi/ ./
+# Unsigned EFI files - signing and 'customization' is a separate step
+# using the recovery docker image.
+COPY --link --from=deb-efi /boot/ ./
+COPY --link --from=alpine-efi /boot/ ./
 
-COPY --link --from=alpine-efi /boot/efi/ ./
+# Copy the kernel and initrd files, for signing and customization.
+# We append a custom command line and initrd.
