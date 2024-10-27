@@ -7,16 +7,25 @@ export REPO=${REPO:-git.h.webinf.info/costin}
 export IMAGE=${IMAGE:-${REPO}/initos-recovery:latest}
 export CONTAINER=initos-recovery
 
+
+# All builds an '[/x/initos]/boot/efi' dir ready to use with a USB disk or
+# copied on a (large enough - at least 1G) EFI partition
+all() {
+  recovery
+  usb
+  sign
+}
+
 # Build the USB installer files - need to go to a large EFI partition.
+# Will download the debian and alpine kernels.
 usb() {
-  mkdir -p ${WORK}/tmp
+  mkdir -p ${WORK}/boot/efi
   # For the recovery docker build.
   # All other steps are run in a container or chroot.
   export DOCKER_BUILDKIT=1
-  docker build --progress plain -o ${WORK}/tmp \
+  docker build --progress plain -o ${WORK}/boot/efi \
      -t ${REPO}/initos-recovery:latest -f ${SRCDIR}/tools/Dockerfile.boot ${SRCDIR}
 }
-
 
 # Sign will sign the EFI files - using the keys in /etc/uefi-keys
 # This is a separate step - not using the sleeping docker container/pod/etc - but
@@ -37,7 +46,6 @@ sign() {
       -v ${HOME}/.ssh/initos/uefi-keys:/etc/uefi-keys \
     ${REPO}/initos-recovery:latest /sbin/setup-initos sign
 }
-
 
 # Build image
 recovery() {
@@ -70,17 +78,6 @@ sh() {
 # Build debian EFI and modules.
 deb() {
   docker run -v /lib/modules:/lib/modules ${IMAGE} /sbin/setup-initos mod_sqfs
-}
-
-# All builds an '[/x/initos]/boot/efi' dir ready to use with a USB disk or
-# copied on a (large enough - at least 1G) EFI partition
-all() {
-  # Get kernel, modules, firmware - and create sqfs and populate /x/initos/boot
-  drun sqfs
-
-  recovery_sqfs
-  efi
-  sign
 }
 
 allvirt() {

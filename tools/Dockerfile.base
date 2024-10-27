@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.10
+
 ARG BASE=debian:bookworm-slim
 
 # Build a dev pod - initially based on Istio build-tools.
@@ -20,17 +22,19 @@ USER root
 
 ENV LANG C.UTF-8
 
-COPY home/bin/* /usr/local/bin/
+COPY recovery/* /
 
 # Will execute a stage using the podinstall script
 ARG STAGE=add_tools
+
 # Default values - will be used in the podinstall script
 ARG DEV=base
-ARG REMOTE_DESKTOP=crd
+ARG REMOTE_DESKTOP=kasm
 ARG USERNAME=build
 
-# Istio sets it to /home - need to copy or link the files
+# Istio base sets it to /home - need to copy or link the files
 ENV HOME /x/home/${USERNAME}
+
 ENV FONTCONFIG_PATH /etc/fonts
 
 ENV PATH /sbin:/usr/sbin:/bin:/usr/bin:/x/sync/app/bin:/x/sync/app/home/bin:/usr/local/bin:${PATH}
@@ -40,14 +44,14 @@ WORKDIR /x/home/${USERNAME}
 # Not installing accessibility dbus
 ENV NO_AT_BRIDGE 1
 
-RUN /usr/local/bin/podinstall docker_run_install ${STAGE}
-
-#COPY podhome/* /home/
+RUN setup-deb docker_run_install ${STAGE}
 
 # Context should be in the home directory - all tools should be in bin
 # Otherwise sshd will consider the account locked
 # Istio dev has /home directory
 # Assume a volume will be mounted on /x with R/W state.
 
-ENTRYPOINT ["/usr/local/bin/podrun"]
+# Default is set for running in K8S / CloudRun / etc.
+# Will detect if running as non-root.
+ENTRYPOINT ["/sbin/init-pod"]
 CMD ["pod"]

@@ -23,3 +23,8 @@ ext4btrfs() {
 
   # btrfs subvolume delete /x/ext2_saved
 }
+
+# Run a command in a recovery chroot
+recovery() {
+  /initos/recovery/usr/bin/arch-chroot /initos/recovery $*
+}

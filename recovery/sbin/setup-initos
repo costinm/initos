@@ -45,9 +45,6 @@ SRCDIR=${SRCDIR:-/ws/initos}
 # are used to build the UKI in the EFI partition and modules/firmware go to different
 # subvolumes.
 linux_alpine() {
-  set -x
-  echo "Installing linux LTS"
-
   apk add intel-ucode amd-ucode
   apk add linux-lts
 
@@ -56,15 +53,19 @@ linux_alpine() {
   # This is the version that will be used in the UKI (can be changed)
   echo $KERNEL_VERSION > /boot/version
 
+  # Versioned name, matching the modules dir.
   mv /boot/vmlinuz-lts /boot/vmlinuz-${KERNEL_VERSION}
+  ln -s /boot/vmlinuz-${VKERNEL_VERSION}  /boot/vmlinuz
 }
 
 # vlinux_alpine gets the virtual kernel, creates a squash with the modules.
 vlinux_alpine() {
   # Also get virt since we are here...
   apk add linux-virt
+
   VKERNEL_VERSION=$(cat /usr/share/kernel/virt/kernel.release)
   echo $VKERNEL_VERSION > /boot/version-virt
+
   mv /boot/vmlinuz-virt /boot/vmlinuz-${VKERNEL_VERSION}
   ln -s /boot/vmlinuz-${VKERNEL_VERSION}  /boot/vmlinuz-virt
 

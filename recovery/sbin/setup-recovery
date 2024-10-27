@@ -156,7 +156,8 @@ alpine_add_recovery() {
   # /lib/modules, /boot/vmlinuz-lts (plus config, system map)
   apk add gummiboot
 
-  apk add efibootmgr
+  # To modify keys, control efi
+  apk add efibootmgr mokutil
 
   apk add squashfs-tools
 

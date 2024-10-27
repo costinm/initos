@@ -125,8 +125,6 @@ edump() {
   # current date and time
   export LOG_DIR=${dst}/$(date +"%Y-%m-%d-%H-%M-%S")
   mkdir -p ${LOG_DIR}
-  #mkdir -p ${dst}
-  #export LOG_DIR=$(mktemp -d -p ${dst} )
 
   echo $LOG_V > ${LOG_DIR}/logv
 
@@ -141,6 +139,7 @@ edump() {
 
   dmesg > ${LOG_DIR}/dmesg.log
 
+  env > ${LOG_DIR}/env.log
 }
 
 
@@ -263,6 +262,7 @@ mount_overlay() {
 
 
 # Mount a BTRFS subvolume as /sysroot - ready for the switch root
+#
 mount_btrfs() {
   local root_device=$1
 
@@ -277,6 +277,19 @@ mount_btrfs() {
     fi
 
   INITOS_ROOT=${INITOS_ROOT:-initos/recovery}
+
+  if [ ! -d /x/vol ]; then
+    btrfs subvol create /x/vol
+  fi
+
+  if [ ! -d /x/vol/images ]; then
+    mkdir -p /x/vol/images
+    chattr +C /x/vol/images
+  fi
+
+  if [ -f /x/swap ]; then
+    swapon /x/swap
+  fi
 
   if [ -f /x/initos/initos.env ]; then
     . /x/initos/initos.env
@@ -393,13 +406,6 @@ cmdline() {
     value="${opt#*=}"
     export "KOPT_${key/./_}"="$value" || true
   done
-#  echo "cmdline: $c"
-#  echo "cmd: $KOPT_cmd"
-#
-#  env
-#  if [ -n "$KOPT_cmd" ]; then
-#    echo "Will running command instead of init: $KOPT_cmd"
-#  fi
 }
 
 upstamp() {
@@ -479,13 +485,6 @@ verify() {
   openssl dgst -sha256 -verify "$public_key_file" -signature "$signature_file" <(echo "$sha256_hash")
 
   #minisign -Vm <file> -P RWSpi0c9eRkLp+M2v00IqZhHRq2sCG6snS3PkDu99XzIe3en5rZWO9Yq
-
-  # Check the verification result
-  # if [[ $? -eq 0 ]]; then
-  #   echo "Verification successful!"
-  # else
-  #   echo "Verification failed!"
-  # fi
 }
 
 
