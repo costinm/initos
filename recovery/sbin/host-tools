@@ -1,9 +1,5 @@
 #!/bin/sh
 
-check() {
-
-}
-
 seed() {
   # Disk is read only - but allows adding a new disk, where the writes will go.
   # This can be useful with VMs, sharing a RO base.
@@ -19,7 +15,7 @@ scrub() {
   btrfs balance start -m /x
 }
 
-ext4() {
+ext4btrfs() {
   local disk=$1
 
   e2fsck -fvy ${disk}

@@ -1,0 +1,31 @@
+#!/bin/sh
+
+# Script around OCI image-based initialization of the OS
+
+# Creating the recovery is a bit more complicated with docker - there are few ways:
+# - use crane, if the image is pushed.
+# - start a temp image, docker export
+recovery_sqfs_crane() {
+  local img=$1
+  local out=$2
+
+  mkdir -p ${WORK}/boot/efi
+  rm -f ${WORK}/boot/efi/${out}.sqfs
+
+  crane export  ${img} | sqfstar ${WORK}/boot/efi/${out}.sqfs -e .dockerenv
+  veritysetup format --root-hash-file=/boot/efi/hash.${out} /boot/efi/${out}.sqfs /boot/efi/${out}.sqfs.verity
+}
+
+# Use as a pipe - with docker export ... | setup-oci recovery_sqfs_docker_export
+recovery_sqfs_docker_export() {
+  local out=recovery
+
+  mkdir -p /boot/efi
+  rm -f /boot/efi/recovery.sqfs
+
+  # Read all stdin
+  #cat ${WORK}/work/recovery.tar |
+  sqfstar /boot/efi/recovery.sqfs -e .dockerenv
+
+  veritysetup format --root-hash-file=/boot/efi/hash.${out} /boot/efi/${out}.sqfs /boot/efi/${out}.sqfs.verity
+}

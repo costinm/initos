@@ -1,5 +1,6 @@
 #!/bin/sh
 
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Based on Alpine mkinitrd, but with different init script:
 # - various checks to detect an BTRFS rootfs in 'insecure' mode, fallback to recovery subvol or sqfs
@@ -88,6 +89,7 @@ logi() {
 # Verbose log - saved but not shown on console
 logv() {
   local msg="$*"
+  # TODO: if serial (usb) console available - use it (headless)
 
   LOG_V="${LOG_V}\n${msg}"
 }
@@ -116,17 +118,18 @@ edump() {
   local dst=${1:-/boot/efi}
 
   if [ ! -d /boot/efi/EFI ]; then
-    echo $LOGV
+    echo $LOG_V
     return
   fi
 
-  mkdir -p ${dst}
-  export LOG_DIR=$(mktemp -d -p ${dst} )
+  # current date and time
+  export LOG_DIR=${dst}/$(date +"%Y-%m-%d-%H-%M-%S")
+  mkdir -p ${LOG_DIR}
+  #mkdir -p ${dst}
+  #export LOG_DIR=$(mktemp -d -p ${dst} )
 
-  echo $LOGV > ${LOG_DIR}/logv
+  echo $LOG_V > ${LOG_DIR}/logv
 
-  echo "$ORIG_BLKID" > ${LOG_DIR}/blkid_before_mods
-  echo "$ORIG_FS" > ${LOG_DIR}/filesystems_before_mods
   echo "$ORIG_DEVICES" > ${LOG_DIR}/devices_before_mods
 
   blkid > ${LOG_DIR}/blkid
@@ -155,15 +158,30 @@ move_mounted_to_sysroot() {
   sync
 }
 
+# unlock the encrypted disk using the TPM. 'c' mapper will be used.
 
 unlock_tpm() {
   local part=$1
+
+  if [ -z "$part" ]; then
+    part=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  fi
+
+  # Arch recommends: 1,2,5,7 ( firmware, firmware options, GPT layout, secure boot status)
+  PCRS="0,1,7"
+  # 2 = pluggable executable code
+  # 3 = pluggable firmware data
+  # 4 = boot manager code
+  # 5 = boot manager data, include GPT partitions
+  # 6 = resume events
+  # 7 = secure boot status, certificates
 
   # The setup script makes sure this handle is set - we may try multiple handles or
   # list nv persistent and try all.
 
   #export TPM2TOOLS_TCTI="device:/dev/tpm0"
   PASSPHRASE=$(tpm2_unseal -c 0x81800000 -p pcr:sha256:0,1,2,3)
+  PASSPHRASE2=$(tpm2_unseal -c 0x81800002 -p pcr:sha256:8)
   echo -n "$PASSPHRASE" | cryptsetup open $part c -
 }
 
@@ -174,57 +192,69 @@ mount_boot() {
   # It would be tempting to add persistent overlay here and make the root
   # modifiable - but that breaks the security model, we can't verify the overlay.
   # For any configs, certs, etc - we can add them to the UKI or rebuild.
+  mkdir /initos
+  mount -t tmpfs root-tmpfs /initos
 
   # From alpine original script
-  mkdir -p /initos/recovery
+  mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
   logi "Mounting boot partition, signatures $(ls /boot)"
 
-  msqfs $dir recovery /initos/recovery
+  mount_verity recovery /initos/recovery
 
   if [ -f ${dir}/firmware.sqfs ]; then
     mkdir -p /lib/firmware
-    msqfs $dir firmware /lib/firmware
+    mount_verity firmware /lib/firmware
   fi
 
   ver=$(uname -r)
   if [ -f ${dir}/modules-${ver}.sqfs ]; then
     mkdir -p /lib/modules/${ver}
-    msqfs $dir modules-${ver} /lib/modules/${ver}
+    mount_verity modules-${ver} /lib/modules/${ver}
   fi
 }
+
+HASH_DIR=${HASH_DIR:-/boot/efi}
 
 # Mount a SQFS file as a dm-verity device (if signatures found on the
 # initrd /boot dir, in secure mode).
 #
 # The destintion dir will be an overlay drive.
-msqfs() {
-  local dir=$1
-  local name=$2
-  local dst=$3
+mount_verity() {
+  local name=$1
+  local dst=$2
+  local dir=${3:-/boot/efi}
 
-  mkdir -p /mnt/${name}
-  mount -t tmpfs root-tmpfs /mnt/${name}
-  mkdir -p /mnt/${name}/ro /mnt/${name}/rw /mnt/${name}/work
+  mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name}
 
-  veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity $(cat /boot/efi/hash.${name})
+  # For SECURE, use /boot/hash.${name} which is signed. For insecure - it is only
+  # used to verify integrity, not authenticity.
+  veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity $(cat ${HASH_DIR}/hash.${name})
   if [ $? -ne 0 ]; then
-     logi "Error: Failed to mount ${name}"
-     if [ "${INIT_OS}" -eq "secure" ]; then
-       lfatal "Error: Failed to mount ${name}"
-     else
-       busybox ash
-     fi
+     logi "Error: Failed to mount ${name} - verity integrity or missing files"
+     lfatal "Error: Failed to mount ${name}"
      return 1
   fi
+  mount_overlay $name $dst /dev/mapper/${name} squashfs
+}
 
-  mount -t squashfs /dev/mapper/${name} /mnt/${name}/ro
+# Mount an overlayfs on top of a squashfs, dm-verity or other RO device.
+# name and destination are needed, device (default to /dev/mapper/NAME)
+# and type (default to squashfs) are optional.
+mount_overlay() {
+  local name=$1
+  local dst=$2
+  local dev=${3:-/dev/mapper/${name}}
+  local type=${4:-squashfs}
+
+  mount -t $type $dev /initos/ro/${name}
   if [ $? -ne 0 ]; then
      lfatal "Error: Failed to sqfs ${name}"
      return 1
   fi
 
+  mkdir -p ${dst}
   mount -t overlay \
-    -o lowerdir=/mnt/${name}/ro,upperdir=/mnt/${name}/rw,workdir=/mnt/${name}/work \
+    -o lowerdir=/initos/ro/${name},upperdir=/initos/rw/${name},workdir=/initos/work/${name} \
     overlayfs ${dst}
   if [ $? -ne 0 ]; then
      lfatal "Error: Failed to mount overlay ${name}"
@@ -300,7 +330,9 @@ retry() {
   done
 }
 
+# Setup a chroot env
 setup_chroot() {
+  R=${1:-/sysroot}
 
     # https://wiki.gentoo.org/wiki/Chroot/en
     mount --rbind /dev ${R}/dev
@@ -309,10 +341,28 @@ setup_chroot() {
     mount --rbind /sys ${R}/sys
     mount --make-rslave ${R}/sys
     mount --rbind /tmp ${R}/tmp
+
+    mount -o bind /lib/modules ${R}/lib/modules
+    mount -o bind /lib/firmware ${R}/lib/firmware
+    #mount -o bind /ws/initos ${R}/ws/initos
+    mount -o bind /x/vol/devvm-1/initos ${R}/x/initos/
+    mount -o bind /x/vol/devvm-1/initos/boot ${R}/boot
+
+}
+
+enter_chroot() {
+  R=${1:-/sysroot}
+  shift
+
+ # No --net
+ unshare --root=${R} --pid --mount --fork --mount-proc --uts --ipc --cgroup --propagation shared  -- $*
+ #chroot ${R} /bin/busybox ash
+
+
 }
 
 chroot_clean() {
-    X=${1}
+    X=${1:-/sysroot}
 
     umount ${X}/dev/pts
     umount  ${X}/dev/
@@ -390,3 +440,52 @@ udev_start()
     echo Udevadm  $?
 	fi
 }
+
+# host files identifies the (insecure) host config. It is used for the recovery
+# image customization or for the rootfs configuration.
+# In secure mode it can be signed or encrypted - but it can't hold private keys
+# secure unless TPM is used - however at that point a real disk is simpler.
+host_files() {
+  if [ -f /sys/class/net/wlan0/address ]; then
+    export MAC=$(cat /sys/class/net/wlan0/address)
+  elif [ -f /sys/class/net/eth0/address ]; then
+    export MAC=$(cat /sys/class/net/eth0/address)
+  else
+    export MAC="00:00:00:00:00:00"
+  fi
+
+  MAC=${MAC//:/-}
+
+  mkdir -p /boot/efi/${MAC}
+  if [ -f /boot/efi/${MAC}/initos.env ]; then
+    . /boot/efi/${MAC}/initos.env
+  fi
+
+  if [ -f /boot/efi/${MAC}/hostname ]; then
+    hostname $(cat /boot/efi/${MAC}/hostname)
+  fi
+}
+
+# Verify the signature of a file using a public key.
+verify() {
+  file_to_verify="$1"
+  signature_file="$2"
+  public_key_file="$3"
+
+  # Calculate the SHA256 hash of the file
+  sha256_hash=$(sha256sum "$file_to_verify" | awk '{print $1}')
+
+  # Verify the signature using the public key
+  openssl dgst -sha256 -verify "$public_key_file" -signature "$signature_file" <(echo "$sha256_hash")
+
+  #minisign -Vm <file> -P RWSpi0c9eRkLp+M2v00IqZhHRq2sCG6snS3PkDu99XzIe3en5rZWO9Yq
+
+  # Check the verification result
+  # if [[ $? -eq 0 ]]; then
+  #   echo "Verification successful!"
+  # else
+  #   echo "Verification failed!"
+  # fi
+}
+
+
