@@ -25,10 +25,10 @@ SRCDIR=${SRCDIR:-/ws/initos}
 
 # If the source dir is mounted, use it as a prefix to load fresh files
 # Otherwise - use the files in the recovery image.
-if [ -d $SRCDIR/recovery ]; then
-  cp -a $SRCDIR/recovery/sbin/* /sbin/
-  cp -a $SRCDIR/recovery/etc/* /etc
-fi
+#if [ -d $SRCDIR/recovery ]; then
+#  cp -a $SRCDIR/recovery/sbin/* /sbin/
+#  cp -a $SRCDIR/recovery/etc/* /etc
+#fi
 
 ## All functions after this line are run inside a container, chroot or host running
 # 'recovery' or alpine installer or distro.
@@ -45,6 +45,9 @@ fi
 # are used to build the UKI in the EFI partition and modules/firmware go to different
 # subvolumes.
 linux_alpine() {
+  set -x
+  echo "Installing linux LTS"
+
   apk add intel-ucode amd-ucode
   apk add linux-lts
 
@@ -102,6 +105,7 @@ efi() {
 
   # Expects that the modloop is already created, and the cache under ${WORK}/modules may
   # exist.
+  EFI_FILE=${EFI_FILE:-/boot/efi/EFI/BOOT/Initos-NEW.EFI}
 
   KERNEL_VERSION=$(cat /boot/version)
   [ -z ${KERNEL_VERSION} ] && echo "Missing kernel config" && return
@@ -115,12 +119,12 @@ efi() {
 
   build_initrd ${KERNEL_VERSION} ${img}
 
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /boot/cmdline
+  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init iomem=relaxed" > /boot/cmdline
 
   mkdir -p /boot/efi/EFI/BOOT
   efi-mkuki \
     -c /boot/cmdline \
-    -o /boot/efi/EFI/BOOT/Initos-NEW.EFI \
+    -o ${EFI_FILE} \
       ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}
 
   echo ${KERNEL_VERSION} > /boot/efi/version
@@ -184,7 +188,7 @@ sign() {
 
   # TODO: add authorized_keys and root.pem
 
-  echo "loglevel=0 quiet console=ttyS0 console=tty1 net.ifnames=1 panic=5 rdinit=/sbin/init-secure initos.secure" > /boot/cmdline.secure
+  echo "loglevel=0 quiet console=ttyS0 console=tty1 net.ifnames=0 panic=5 rdinit=/sbin/init-secure initos.secure" > /boot/cmdline.secure
 
   efi-mkuki \
     -c /boot/cmdline.secure \
@@ -225,7 +229,7 @@ efi2() {
  (find /init | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-xtra.cpio.gz
  (find /boot/efi/hash* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
 
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=1 panic=5 debug_init iomem=relaxed" > /boot/cmdline
+  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init iomem=relaxed" > /boot/cmdline
 
   mkdir -p /boot/efi/EFI/BOOT
   efi-mkuki \
@@ -237,52 +241,73 @@ efi2() {
 
 
 sqfs() {
+  version=${1:-$(cat /boot/version)}
   firmware_sqfs
-  mods_sqfs $(cat /boot/version)
+  mod_sqfs $version
 }
 
+# firmware_sqfs builds /boot/efi/firmware.sqfs using /x/initos/firmware or /lib/firmware
 firmware_sqfs() {
-  cd /x/initos/firmware
-  rm -f /boot/efi/firmware.sqfs
-  mksquashfs . /boot/efi/firmware.sqfs
-  veritysetup format --root-hash-file=/boot/efi/hash.firmware /boot/efi/firmware.sqfs /boot/efi/firmware.sqfs.verity
 
+  DST=${DST:-/boot/efi}
+
+  if [ -d /x/initos/firmware ]; then
+    cd /x/initos/firmware
+  elif [ -d /lib/firmware ]; then
+    cd /lib/firmware
+  else
+    echo "No firmware found"
+    return
+  fi
+
+  rm -f ${DST}/firmware${SUFFIX}.sqfs
+  mksquashfs . ${DST}/firmware${SUFFIX}.sqfs
+  veritysetup format --root-hash-file=${DST}/hash.firmware${SUFFIX} ${DST}/firmware${SUFFIX}.sqfs ${DST}/firmware${SUFFIX}.sqfs.verity
 }
 
-mods_sqfs() {
-  local ver=$1
-  cd /x/initos/modules/${ver}
-  rm -f /boot/efi/modules-${ver}.sqfs
-  mksquashfs . /boot/efi/modules-${ver}.sqfs
-  veritysetup format --root-hash-file=/boot/efi/hash.modules-${ver} /boot/efi/modules-${ver}.sqfs /boot/efi/modules-${ver}.sqfs.verity
+# mod_sqfs builds /boot/efi/modules-${version}.sqfs
+# Source should be in /x/initos/modules/${version} or /lib/modules/${version}
+mod_sqfs() {
+  ver=${1:-$(cat /boot/version)}
+
+  DST=${DST:-/boot/efi}
+
+  if [ -z "$ver" ]; then
+    echo "No version specified"
+    return
+  fi
+
+  if [ -d /x/initos/modules/${ver} ]; then
+    cd /x/initos/modules/${ver}
+  elif [ -d /lib/modules/${ver} ]; then
+    cd /lib/modules/${ver}
+  else
+    echo "No modules found for ${ver}"
+    return
+  fi
+
+  rm -f ${DST}/modules-${ver}.sqfs
+  mksquashfs . ${DST}/modules-${ver}.sqfs
+  veritysetup format --root-hash-file=${DST}/hash.modules-${ver} \
+     ${DST}/modules-${ver}.sqfs \
+     ${DST}/modules-${ver}.sqfs.verity
 }
 
-# Creating the recovery is a bit more complicated with docker - there are few ways:
-# - use crane, if the image is pushed.
-# - start a temp image, docker export
-recovery_sqfs_crane() {
-  local img=$1
-  local out=$2
+recovery_sqfs() {
+  DST=${DST:-/boot/efi}
+  out=${out:-recovery}
 
-  mkdir -p ${WORK}/boot/efi
-  rm -f ${WORK}/boot/efi/${out}.sqfs
+  # -one-file-system also works on the host - but not so well in a container.
+  cd /
+  rm -f ${DST}/recovery.sqfs
 
-  crane export  ${img} | sqfstar ${WORK}/boot/efi/${out}.sqfs -e .dockerenv
-  veritysetup format --root-hash-file=/boot/efi/hash.${out} /boot/efi/${out}.sqfs /boot/efi/${out}.sqfs.verity
+  mksquashfs  . ${DST}/${out}.sqfs \
+    -regex -e "x/.*" -e "lib/modules/.*" -e "lib/firmware/.*" -e "boot/.*" \
+     -e "proc/.*" -e "sys/.*" -e "run/.*" -e "work/.*" -e "ws/.*" -e "etc/apk/cache.*"
+
+  veritysetup format --root-hash-file=${DST}/hash.${out} ${DST}/${out}.sqfs ${DST}/${out}.sqfs.verity
 }
 
-recovery_sqfs_docker_export() {
-  local out=recovery
-
-  mkdir -p /boot/efi
-  rm -f /boot/efi/recovery.sqfs
-
-  # Read all stdin
-  #cat ${WORK}/work/recovery.tar |
-  sqfstar /boot/efi/recovery.sqfs -e .dockerenv
-
-  veritysetup format --root-hash-file=/boot/efi/hash.${out} /boot/efi/${out}.sqfs /boot/efi/${out}.sqfs.verity
-}
 
 # Generate the key pairs for signing the kernel and the disk image.
 # This is done before install - as a separate step/process - the rest can be automated easily,
@@ -294,288 +319,25 @@ sign_init() {
   efi-mkkeys -s h.webinf.info
 }
 
-
-### Alpine specific packages for the recovery image.
-# Not using "--no-cache" - and installing one by one.
-# When running in docker, this will be cached to /var/cache/apk/[INDEX] - which is a mounted dir.
-# /etc/apk/cache will cache the actual files
-
-install_recovery() {
-  cp -a ${SRCDIR}/recovery/sbin/* /sbin/
-  cp -a ${SRCDIR}/recovery/home /
-  cp -a ${SRCDIR}/recovery/root /
-  chown -R root /root
-
-  alpine_add_common
-  alpine_add_base
-  alpine_add_recovery
-
-  apk add openrc-init
-
-  # Add the config files
-  cp -a -f ${SRCDIR}/recovery/etc/* /etc/
-
-  (cd /etc/init.d && ln -s agetty agetty.tty1)
-  (cd /etc/init.d && ln -s agetty agetty.tty2)
-  rc-update add agetty.tty1 boot
-  rc-update add agetty.tty1 boot
-  rc-update add agetty.tty2 default
-#  rc-update add agetty.ttyS0 boot
-#  rc-update add agetty.hvc0 boot
-
-  rc-update add devfs sysinit
-  rc-update add dmesg sysinit
-
-  # Those 3 can be used instead of udev
-  # This is the busybox mdev
-  # apk add busybox-mdev-openrc
-  # busybox-mdev busybox-mdev-openrc
-  #apk add mdev-conf
-  #rc-update add hwdrivers sysinit
-  #rc-update add mdev sysinit
-
-  # apk add --quiet mdevd mdevd-openrc
-  #rc-update add hwdrivers sysinit
-  #rc-update add mdevd-init sysinit
-  #rc-update add mdevd sysinit
-
-  # modloop will load after dev-mount, read KOPT_modoop and KOPT_modloop_verify
-  # checks using openssl using public key under /etc/apk/keys/*.pub
-  # Modules are loaded as overlay (so more can be added)
-  #rc-update del modloop sysinit
-  rc-update add udev sysinit
-  rc-update add udev-trigger sysinit
-  rc-update add udev sysinit
-  rc-update add udev-settle sysinit
-  rc-update add udev-trigger sysinit
-  rc-update add cgroups sysinit
-
-  #  rc-update add connman boot
-  rc-update add acpid boot
-  rc-update add hwclock boot
-  rc-update add syslog boot
-  rc-update add ntpd boot
-  rc-update add wpa_supplicant boot
-  rc-update add modules boot
-  rc-update add sysctl boot
-  rc-update add hostname boot
-  rc-update add bootmisc boot
-  rc-update add syslog boot
-  rc-update add hwclock boot
-  rc-update add networking boot
-
-  rc-update add dropbear default
-  rc-update add udev-postmount default
-
-
-  rc-update add mount-ro shutdown
-  rc-update add killprocs shutdown
-  rc-update add savecache shutdown
-
-  rc-update --update
-  # Temp - debug only
-  # TODO: in initrd, patch /etc/shadow to remove password instead
-  # would be useful with all cloud images...
-  #passwd -d root
-
-}
-
-alpine_add_common() {
-    echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
-    apk -U --no-progress update
-
-    apk list -I
-
-    #apk add alpine-base # Installs openrc
-    apk add ifupdown-ng libcap2  openrc  alpine-conf  alpine-release  busybox-openrc  busybox-suid
-
-    apk add eudev eudev-hwids udev-init-scripts udev-init-scripts-openrc
-    apk del busybox-mdev-openrc mdev-conf || true
-    #setup-devd udev
-
-    # Will add busybox-mdev as baseline
-    apk add openrc
-    apk add alpine-conf
-    apk add   busybox-suid busybox-binsh
-    apk add iw ifupdown-ng ifupdown-ng-wifi
-    apk add ca-certificates-bundle
-    # Using it for few things - minisign can probably be used instead.
-    # 765k bin + 5M lib
-    apk add openssl
-    apk add ssl_client
-
-}
-
-# If starting with an alpine distro, add the packages we need.
-alpine_add_recovery() {
-
-  apk add rsync
-  
-  apk add busybox-openrc
-
-  apk add dropbear dropbear-openrc
-  apk add openssh-keygen
-  # fsverity CLI
-  #apk add fsverity-utils
-
-  # To build the UKI
-  apk add binutils
-
-  apk add tpm2-tools tpm2-tss-tcti-device tpm2-tss-tcti-cmd tpm2-tss
-  
-  apk add lsblk
-
-  # sgdisk gptfdisk
-  apk add  parted
-
-  apk add cryptsetup uuidgen
-
-  # clevis adds bash, jose, cacklib
-  # apk add clevis
-
-  apk add bridge
-
-  # 400k
-  apk add minisign
-
-  apk add btrfs-progs
-
-  apk add mkinitfs
-  echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
-
-  # 104 packages, 1.1G under lib/firmware
-  # /lib/modules, /boot/vmlinuz-lts (plus config, system map)
-  apk add gummiboot
-
-  apk add efibootmgr
-
-  apk add squashfs-tools
-
-  # troubleshooting
-  #apk add pcituils
-
-  apk add efi-mkuki
-  apk add efi-mkkeys
-  apk add sbsigntool
-
-  apk add openssh-sftp-server
-
-  apk add curl
-
-  apk add dmidecode
-
-  # fsck, etc
-  apk add dosfstools
-
-  apk add wpa_supplicant wpa_supplicant-openrc
-
-
-  # from karios - not sure we need it
-  apk add  findutils findmnt \
-    htop haveged \
-    iproute2 \
-    irqbalance \
-    lm-sensors \
-    lsscsi \
-    lvm2 \
-    mdadm \
-    smartmontools \
-    sudo strace util-linux bridge 
-
-  apk add cloud-hypervisor virtiofsd
-
-  # similar to ujail and others - no server.
-  # nsjail can listen on a port and start container on connection
-  # supports macvlan
-  # can act as an init (restart on exit)
-  # logs of deps (abseil, protobuf)
-  #apk add nsjail
-
-  # init with a single process. Can reap even if not running as PID1.
-  apk add tini
-
-  #apk add secureboot-hook
-
-  # Others that may be useful but not required:
-
-  # apk add kmod lddtree kmod-libs
-  #  apk add iproute2 tcpdump procps
-
-  # For OCI interaction
-  apk add crane
-  # Can also encrypt/decrypt - 3.7M + 2M for keygen
-  #apk add age
-
-  #e2fsprogs
-
-  # apk add lvm2
-
-}
-
-# Base users, groups, packages.
-alpine_add_base() {
-  [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
-
-
-  mkdir -p /boot/efi
-  mkdir -p /lib/modules
-  mkdir -p /lib/firmware
-  mkdir -p ${WORK}
-  mkdir -p /mnt/usb
-
-  addgroup -g 1000 build
-  addgroup -g 1001 admin
-  #addgroup -g 1002 tss
-
-  adduser -G build -g "Builder" build -u 1000 -D -s /bin/sh -h /home/build
-  adduser -G admin -g "Admin" admin -u 1001 -D -s /bin/sh -h /home/admin
-  #adduser -G tss -g "Builder" tss -u 1002
-
-  # Add the user to the sudoers group
-  addgroup admin wheel
-  addgroup admin kvm
-  addgroup build users # otherwise swayunlock fails, /etc/shaddow permissions
-  addgroup build video
-  addgroup build audio
-
-  # Disable IPv6 for now - seems to be broken in some cases. Can be enabled in rootfs.
-  #echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.conf
-
-  chown root /root
-
-# -H: don't create home
-# -D: no pass
-# -S - system user - nologin (i.e. /bin/login and passwd access will be disabled - ssh ok)
-# -g - 'gecos' or name
-  # Enable a system user to use login:
-  #passwd -u build
-  # Remove password: -d
-
-}
-
-ui() {
-  apk add firefox-esr
-  #  apk add mesa-dri-gallium
-  setup-desktop sway
-  apk add kitty
-  apk add rofi-wayland rofi-pass rofi-top
-  apk add chromium
-
-  apk add seatd
-
-
-  #apk add i3wm dbus-x11
-  #apk add tint2 rofi alttab i3status
-
-  #apk add xorg-server
-  #apk add xinit
-
-#  apk add xset
-#  apk add xrandr
-#  apk add xmodmap
-#  apk add xinput
-#  apk add xhost
-#  apk add xkill
+chk_firmware() {
+  set +x
+  # Get a list of all loaded modules - mostly AI generated.
+  modules=$(lsmod | awk 'NR>1 {print $1}')
+
+  for module in $modules; do
+    modinfo_output=$(/usr/sbin/modinfo $module)
+
+    # Extract firmware information
+    #firmware_lines=$(echo "$modinfo_output" | grep -i 'firmware:')
+    firmware_lines=$(echo "$modinfo_output" | grep -ioE 'firmware:[[:space:]][^ ]+' | cut -d ' ' -f2-)
+
+    if [ -n "$firmware_lines" ]; then
+      echo $module
+      while read -r firmware; do
+          echo "$module: $firmware"
+      done < "$firmware_lines"
+    fi
+  done
 }
 
 alpine_clear() {
@@ -584,8 +346,21 @@ alpine_clear() {
   echo "" > /etc/machine-id || true
 }
 
-alpine_add_extra() {
-  apk add bash bash-completion 
+
+# Add the Alpine ISO image to the boot disk (expanded to EFI instead of ISO)
+# This is useful for recovery if recovery fails. 
+efi_alpine_installer() {
+  set -e
+  mkdir -p ${DIST} ${WORK}/boot
+
+    if [ ! -f ${WORK}/alpine.iso ]; then
+      curl -Lo ${WORK}/alpine.iso https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso
+    fi
+    cd ${WORK}/dist
+    bsdtar xf ${WORK}/alpine.iso
+    cfgf=$(ls ${DIST}/boot/config-*)
+
 }
+
 
 $*

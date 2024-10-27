@@ -98,4 +98,13 @@ stop() {
 }
 
 
+podman_recovery() {
+  # if running on recovery
+  mount -t tmpfs /var/lib/containers
+
+  #crane pull --format oci git.h.webinf.info/costin/initos-recovery:latest /tmp/r
+  docker run --privileged -it --net host git.h.webinf.info/costin/initos-recovery:latest /bin/sh
+}
+
+
 $*

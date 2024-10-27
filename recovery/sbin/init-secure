@@ -4,9 +4,8 @@
 # - look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
 # - fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
 
-export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
-export INIT_OS=secure
 
+export INIT_OS=secure
 export HASH_PREFIX=/boot
 
 . /sbin/init-common.sh
@@ -52,7 +51,7 @@ find_and_mount_boot() {
 find_and_mount_root() {
   mkdir -p /sysroot
 
-  if [ -f /sysroot/sbin/init ]; then
+  if [ -d /sysroot/etc ]; then
     return
   fi
 
@@ -160,14 +159,14 @@ initramfs_init() {
 
   find_and_mount_root
 
-  if [ ! -f /sysroot/sbin/init ]; then
+  if [ ! -d /sysroot/sbin/etc ]; then
     recovery_rootfs
   fi
 
   udevadm control --exit || true
 
   # In memory, not disk
-  edump /sysroot/x/initios/log/boot
+  edump /sysroot/x/initos/log/boot
 
   move_mounted_to_sysroot
 
