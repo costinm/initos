@@ -18,11 +18,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           push: true
-          tags: costinm/initios-recovery:latest
+          tags: docker.pkg.github.com/costinm/ugate/ugate/initios-recovery:latest
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-          #registry: docker.pkg.github.com
-          repository: costinm/ugate/ugate/initos
+#          registry: docker.pkg.github.com
+#          repository: costinm/ugate/ugate/initos
           #tag_with_ref: true
 
 #      - name: Upload EFI image
