@@ -220,22 +220,6 @@ sign() {
     rm /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
     echo $KERNEL_VERSION
   done
-
-  # local KERNEL_VERSION=$(cat /boot/version)
-  # KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-
-  # efi-mkuki \
-  #   -c /boot/cmdline.secure \
-  #   -o /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI \
-  #     ${KERNEL} \
-  #      /boot/intel-ucode.img /boot/amd-ucode.img \
-  #      /boot/initrd-initos.img-${KERNEL_VERSION} /boot/initos-hashes.cpio.gz
-
-  # sbsign --cert /etc/uefi-keys/db.crt --key /etc/uefi-keys/db.key \
-  #   --output /boot/efi/EFI/BOOT/BOOTX64.EFI \
-  #   /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
-
-  # rm /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
 }
 
 

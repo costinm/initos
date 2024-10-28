@@ -96,13 +96,11 @@ run() {
 
   KERNEL_VERSION=$(cat ${WORK}/boot/version-virt)
   
-  DISKS="$DISKS path=${WORK}/boot/modules-${KERNEL_VERSION}.sqfs"
+  #DISKS="$DISKS path=${WORK}/boot/modules-${KERNEL_VERSION}.sqfs"
+  DISKS="$DISKS path=${WORK}/virt/modloop-${KERNEL_VERSION}.sqfs"
   
-  if [ -n "$DISK" ]; then
-    if [ ! -f ${VMDIR}/disk.img ] ; then
-      mkdisk
-    fi
-    DISKS="$DISKS path=${VMDIR}/disk.img"
+  if [  -f ${VMDIR}/disk.img ] ; then
+      DISKS="$DISKS path=${VMDIR}/disk.img"
   fi
 
   # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
