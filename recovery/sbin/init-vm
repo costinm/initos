@@ -8,9 +8,6 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 # /dev/vdb modules corresponsing to the kernel.
 # /dev/vdc is the real root, expected to be btrfs.
 initramfs_init_vm() {
-    # Test the time to do a start, init, poweroff
-    # Not loading hardware modules - the root can do it if needed.
-    #udevadm settle
     cmdline /proc/cmdline
 
     # Run a command before mounting
@@ -25,7 +22,7 @@ initramfs_init_vm() {
     mkdir -p /media/root-ro
 
     # Don't need udev - required modules are enough
-    #udev_start
+    blkid
 
     mount -t squashfs /dev/vda /media/root-ro
 
@@ -50,6 +47,7 @@ initramfs_init_vm() {
     ifconfig eth0 up
     ifconfig lo up
 
+    # Adjust openrc
     cd /sysroot/etc/init.d
     ln -s agetty agetty.hvc0
     cd /sysroot/etc/runlevels/default
@@ -60,23 +58,23 @@ initramfs_init_vm() {
     rm /sysroot/etc/network/interfaces
     rm /sysroot/etc/sysctl.conf
 
+    chroot /sysroot passwd -d root
+
     #busybox sh
-    # Test the time to do a start, init, poweroff
-    if [ -n "$KOPT_cmdx"  ]; then
+    # Test the time to do a start, init, cmd, poweroff
+    if [ -n "$KOPT_cmd1"  ]; then
       ${KOPT_cmdx}
       poweroff -d 0 -f
     fi
+
     move_mounted_to_sysroot
 
     if [ -n "$KOPT_cmd"  ]; then
       echo exec switch_root /sysroot /bin/sh -c "${KOPT_cmd}"
       exec switch_root /sysroot /bin/sh -c "${KOPT_cmd}"
     fi
-    if [ -f /sysroot/sbin/openrc-init ]; then
-      exec switch_root /sysroot /sbin/openrc-init
-    else
-      exec switch_root /sysroot /sbin/init
-    fi
+
+    exec switch_root /sysroot /sbin/init
 }
 
 
@@ -105,7 +103,6 @@ core_mods() {
 }
 
 initramfs_1st
-
 mount_proc
 
 # At this point - no filesystems, only md, mdp, blkext block devices.

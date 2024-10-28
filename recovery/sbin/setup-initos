@@ -134,6 +134,28 @@ efi() {
   done
 }
 
+
+# Incremental efi build - only replaces init
+efi2() {
+  KERNEL_VERSION=$(cat /boot/version)
+  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
+  local img=/boot/initrd-initos.img-${KERNEL_VERSION}
+
+ cp /sbin/init-usb  /init
+ (find /init /sbin/init* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-xtra.cpio.gz
+
+  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init iomem=relaxed" > /boot/cmdline
+
+  mkdir -p /boot/efi/EFI/BOOT
+  efi-mkuki \
+    -c /boot/cmdline \
+    -o /boot/efi/EFI/BOOT/Initos-NEW.EFI \
+      ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}  /boot/initos-xtra.cpio.gz
+
+}
+
+
+
 build_initrd() {
   local KERNEL_VERSION=$1
   local img=$2
@@ -163,7 +185,6 @@ build_initrd() {
     rm -rf ${WORK}/initfs.host
     mkinitfs -k -t ${WORK}/initfs.host -i /sbin/init-usb -o ${img}  $KERNEL_VERSION
 }
-
 # sign creates a signed UKI.
 # The initramfs is different - the additional file will disable shell and trigger verification.
 sign() {
@@ -177,20 +198,21 @@ sign() {
       openssl ec -in /etc/uefi-keys/root.key -pubout -out /etc/uefi-keys/root.pem
       ssh-keygen -y -f /etc/uefi-keys/root.key > /etc/uefi-keys/authorized_keys
   fi
-  cp /etc/uefi-keys/root.pem /boot/efi/EFI/
+  mkdir -p /boot/efi/KEYS
+
+  cp /etc/uefi-keys/root.pem /boot/efi/KEYS/
   cp /etc/uefi-keys/root.pem /boot/
 
   # The hash must be on the signed initrd - not on the efi disk (which is mounted)
   cp /boot/efi/hash* /boot/
-  cp /etc/uefi-keys/*`.auth` /boot/efi/EFI
-  cp /etc/uefi-keys/*`crt` /boot/efi/EFI
-  cp /etc/uefi-keys/*`cer` /boot/efi/EFI
+  cp /etc/uefi-keys/*.auth /boot/efi/KEYS
+  cp /etc/uefi-keys/*.crt /boot/efi/KEYS
+  cp /etc/uefi-keys/*.cer /boot/efi/KEYS
 
 
-  chmod 755 /boot/efi/EFI/*.auth
-  chmod 755 /boot/efi/EFI/*.crt
-  chmod 755 /boot/efi/EFI/*.cer
-
+  chmod 755 /boot/efi/KEYS/*.auth
+  chmod 755 /boot/efi/KEYS/*.crt
+  chmod 755 /boot/efi/KEYS/*.cer
 
   (find /boot/hash* /boot/root.pem \
    | sort \
@@ -223,24 +245,6 @@ sign() {
 }
 
 
-# Incremental efi build - only replaces init
-efi2() {
-  KERNEL_VERSION=$(cat /boot/version)
-  KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-  local img=/boot/initrd-initos.img-${KERNEL_VERSION}
-  cp /sbin/init-usb  /init
- (find /init | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-xtra.cpio.gz
- (find /boot/efi/hash* | sort | cpio --quiet --renumber-inodes -o -H newc | gzip) > /boot/initos-hashes.cpio.gz
-
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init iomem=relaxed" > /boot/cmdline
-
-  mkdir -p /boot/efi/EFI/BOOT
-  efi-mkuki \
-    -c /boot/cmdline \
-    -o /boot/efi/EFI/BOOT/Initos-NEW.EFI \
-      ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img} /boot/initos-hashes.cpio.gz /boot/initos-xtra.cpio.gz
-
-}
 
 mods_sqfs() {
   for version in $(ls /lib/modules) ; do
