@@ -75,6 +75,70 @@ mount_proc() {
   mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
 }
 
+mount_disk() {
+  bootd=${1}
+  boott=${2:-vfat}
+  dst=${3:-/boot/efi}
+
+  mkdir -p $dst
+
+  if [ "$boott" == "vfat" ] ; then
+    fsck.vfat -y $bootd
+  fi 
+
+  mount -t ${boott} ${bootd} ${dst}
+  if [ $? -ne 0 ]; then
+    lfatal "Failed to mount $bootd partition"
+  fi
+  
+  rm ${dst}/FSCK*.REC || true
+}
+
+# Mount a boot disk - with recovery, firmware, modules, etc.
+# Each component is a separate unionfs.
+mount_boot() {
+  local dir=${1:-/boot/efi}
+  # It would be tempting to add persistent overlay here and make the root
+  # modifiable - but that breaks the security model, we can't verify the overlay.
+  # For any configs, certs, etc - we can add them to the UKI or rebuild.
+  mkdir /initos
+  mount -t tmpfs root-tmpfs /initos
+
+  # From alpine original script
+  mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
+  logi "Mounting boot partition, signatures"
+
+  mount_verity recovery /initos/recovery ${dir}
+
+  if [ -f ${dir}/firmware.sqfs ]; then
+    mkdir -p /lib/firmware
+    mount_verity firmware /lib/firmware ${dir}
+  fi
+
+  ver=$(uname -r)
+  if [ -f ${dir}/modules-${ver}.sqfs ]; then
+    mkdir -p /lib/modules/${ver}
+    mount_verity modules-${ver} /lib/modules/${ver} ${dir}
+  fi
+}
+
+
+
+# All remaining mounted dirs will be moved under same dir in /sysroot,
+# ready to switch_root
+move_mounted_to_sysroot() {
+  # From original alpine init
+  cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
+    if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
+      mkdir -p /sysroot/$DIR
+      mount -o move $DIR /sysroot/$DIR
+    fi
+  done
+
+  sync
+}
+
+
 
 export LOG_V=""
 
@@ -123,7 +187,7 @@ edump() {
   fi
 
   # current date and time
-  export LOG_DIR=${dst}/$(date +"%Y-%m-%d-%H-%M-%S")
+  export LOG_DIR=${dst}/logs/$(date +"%Y-%m-%d-%H-%M-%S")
   mkdir -p ${LOG_DIR}
 
   echo $LOG_V > ${LOG_DIR}/logv
@@ -140,21 +204,6 @@ edump() {
   dmesg > ${LOG_DIR}/dmesg.log
 
   env > ${LOG_DIR}/env.log
-}
-
-
-# All remaining mounted dirs will be moved under same dir in /sysroot,
-# ready to switch_root
-move_mounted_to_sysroot() {
-  # From original alpine init
-  cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
-    if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
-      mkdir -p /sysroot/$DIR
-      mount -o move $DIR /sysroot/$DIR
-    fi
-  done
-
-  sync
 }
 
 # unlock the encrypted disk using the TPM. 'c' mapper will be used.
@@ -184,36 +233,6 @@ unlock_tpm() {
   echo -n "$PASSPHRASE" | cryptsetup open $part c -
 }
 
-# Mount a boot disk - with recovery, firmware, modules, etc.
-# Each component is a separate unionfs.
-mount_boot() {
-  local dir=${1:-/boot/efi}
-  # It would be tempting to add persistent overlay here and make the root
-  # modifiable - but that breaks the security model, we can't verify the overlay.
-  # For any configs, certs, etc - we can add them to the UKI or rebuild.
-  mkdir /initos
-  mount -t tmpfs root-tmpfs /initos
-
-  # From alpine original script
-  mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
-  logi "Mounting boot partition, signatures $(ls /boot)"
-
-  mount_verity recovery /initos/recovery
-
-  if [ -f ${dir}/firmware.sqfs ]; then
-    mkdir -p /lib/firmware
-    mount_verity firmware /lib/firmware
-  fi
-
-  ver=$(uname -r)
-  if [ -f ${dir}/modules-${ver}.sqfs ]; then
-    mkdir -p /lib/modules/${ver}
-    mount_verity modules-${ver} /lib/modules/${ver}
-  fi
-}
-
-HASH_DIR=${HASH_DIR:-/boot/efi}
-
 # Mount a SQFS file as a dm-verity device (if signatures found on the
 # initrd /boot dir, in secure mode).
 #
@@ -225,6 +244,8 @@ mount_verity() {
 
   mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name}
 
+  HASH_DIR=${HASH_DIR:-${dir}}
+  
   # For SECURE, use /boot/hash.${name} which is signed. For insecure - it is only
   # used to verify integrity, not authenticity.
   veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity $(cat ${HASH_DIR}/hash.${name})
@@ -264,7 +285,7 @@ mount_overlay() {
 # Mount a BTRFS subvolume as /sysroot - ready for the switch root
 #
 mount_btrfs() {
-  local root_device=$1
+  local root_device=${1:-/dev/mapper/c}
 
   BTRFS_OPTS="-o nobarrier -o compress"
 

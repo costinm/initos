@@ -42,27 +42,6 @@ initramfs_mods() {
   # btrfs, vfat are are normally present - but may be loaded if missing
 }
 
-find_boot() {
-  bootd=$(findfs LABEL=USB_BOOT)
-  if [ -z "$bootd" ]; then
-    bootd=$(findfs LABEL=BOOT)
-  fi
-  if [ -n "$bootd" ]; then
-    mkdir -p /boot/efi
-    fsck.vfat -y $bootd
-    mount -t vfat $bootd /boot/efi
-    if [ $? -ne 0 ]; then
-      lfatal "Failed to mount $bootd partition"
-    fi
-    rm /boot/efi/FSCK*.REC || true
-    mount_boot /boot/efi
-    # only in insecure mode - for secure it should be signed.
-    if [ -f ${dir}/initos.env ]; then
-      . ${dir}/initos.env
-    fi
-  fi
-}
-
 
 # Logic to find an mount the root device.
 #
@@ -206,7 +185,35 @@ initramfs_init() {
         set -x
   fi
 
-  find_boot
+  bootd=$(findfs LABEL=USB_BOOT)
+  if [ -n "$bootd" ]; then
+    # USB: images are under EFI partition
+    mount_disk $bootd vfat /boot/efi
+    mount_boot /boot/efi
+  else
+    # Separate boot and EFI partition on disk
+    bootd=$(findfs LABEL=BOOT_BTRFS)
+    if [ -n "$bootd" ]; then
+      mount_disk $bootd btrfs /boot
+      bootd=$(findfs LABEL=BOOT)
+      if [ -n "$bootd" ]; then
+        mount_disk $bootd vfat /boot/efi
+      fi
+      mount_boot /boot
+    else
+      # Only boot partition on disk - this case should be removed 
+      bootd=$(findfs LABEL=BOOT)
+      if [ -n "$bootd" ]; then
+        mount_disk $bootd vfat /boot/efi
+        mount_boot /boot/efi
+      fi
+    fi
+  fi
+
+  # only in insecure mode - for secure it should be signed.
+  if [ -f /boot/efi/initos.env ]; then
+    . /boot/efi/initos.env
+  fi
 
   echo "Boot, firmware, modules and recovery mounted"
 

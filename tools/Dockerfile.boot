@@ -18,6 +18,7 @@ RUN --mount=target=/var/lib/cache,id=apt,type=cache <<EOF
    firmware-misc-nonfree \
    firmware-realtek \
    linux-image-amd64
+
 EOF
 
 
@@ -35,7 +36,7 @@ RUN --mount=target=/etc/apk/cache,id=apk,type=cache /sbin/setup-initos linux_alp
 RUN <<EOF
   /sbin/setup-initos recovery_sqfs
   /sbin/setup-initos firmware_sqfs
-  /sbin/setup-initos mod_sqfs
+  /sbin/setup-initos mods_sqfs
 EOF
 
 COPY ./recovery/sbin/ /sbin/
@@ -55,7 +56,7 @@ COPY --from=deb --link /boot/ /boot/
 RUN  <<EOF
     mod_dir=$(ls /lib/modules)
     echo -n ${mod_dir} > /boot/version
-    /sbin/setup-initos mod_sqfs
+    /sbin/setup-initos mods_sqfs
 EOF
 
 COPY --from=alpine-efi /boot/intel-ucode.img /boot/

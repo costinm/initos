@@ -85,29 +85,23 @@ run() {
   local cmd="$1"
   echo "CMD: $cmd"
 
-  if [ ! -f ${VMDIR}/disk.img ] ; then
-    mkdisk
-  fi
-
   # Alpine kernel includes no filesystem - virtiofs is a module
-
-  # memory shared needed for fs
-  #
-  sudo rm ${VMDIR}/virtiofsd.sock || true
 
   OPTS=
   if [ -n "$VDIR" ]; then
+    sudo rm ${VMDIR}/virtiofsd.sock || true
     run_virtiofsd $VDIR
     OPTS="$OPTS --fs tag=myfs,socket=${VMDIR}/virtiofs.sock,num_queues=1,queue_size=512"
   fi
 
-
-
   KERNEL_VERSION=$(cat ${WORK}/boot/version-virt)
-  if [ -n "$MODS" ]; then
-    DISKS="$DISKS path=${WORK}/virt/modloop-${KERNEL_VERSION}.sqfs"
-  fi
+  
+  DISKS="$DISKS path=${WORK}/boot/modules-${KERNEL_VERSION}.sqfs"
+  
   if [ -n "$DISK" ]; then
+    if [ ! -f ${VMDIR}/disk.img ] ; then
+      mkdisk
+    fi
     DISKS="$DISKS path=${VMDIR}/disk.img"
   fi
 
@@ -126,7 +120,7 @@ run() {
   # --serial tty --console off --cmdline "console=ttyS0 trace_clock=global quiet" \
   sudo rm -f ${VMDIR}/ch.sock
 
-  echo "$cmd"
+  #echo "$cmd"
   sudo time ${WORK}/virt/cloud-hypervisor-static \
     --kernel ${WORK}/boot/vmlinuz-${KERNEL_VERSION} \
     --memory size=1G,shared=on --pvpanic \

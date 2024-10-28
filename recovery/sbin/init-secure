@@ -28,24 +28,6 @@ initramfs_mods() {
   #v "$(lsmod)"
 }
 
-# Secure mode expects the EFI partition to be labeled BOOT.
-# Will not attempt to lookup USB_BOOT (which is used in recovery/install)
-find_and_mount_boot() {
-  bootd=$(findfs LABEL=BOOT)
-  if [ -n "$bootd" ]; then
-    mkdir -p /boot/efi
-    fsck.vfat -y $bootd
-    mount -t vfat $bootd /boot/efi
-    rm /boot/efi/FSCK*.REC
-    if [ $? -ne 0 ]; then
-      lfatal "Failed to mount $bootd partition"
-    fi
-    mount_boot /boot/efi
-  else
-    lfatal "Failed to find BOOT partition"
-  fi
-}
-
 # Logic to find an mount the root device.
 # For secure mode, expect a LUKS device.
 find_and_mount_root() {
@@ -67,10 +49,15 @@ find_and_mount_root() {
           return
       fi
       logi "Failed to mount BTRFS root, fallback to recovery"
+      busybox ash
     fi
     logi "Failed to unlock encrypted disk with TPM, fallback to recovery"
+    logi " cryptsetup open ${cryptd} c"
+    logi " /init mount_btrfs"
+    busybox ash
   else
     logi "No LUKS volume found, fallback to recovery"
+    busybox ash
   fi
 
   # No point to have an option to ask for console key - we'll boot to recovery
@@ -78,7 +65,9 @@ find_and_mount_root() {
 }
 
 recovery_rootfs() {
-  mount_recovery /boot/efi
+  echo RECOVERY ROOT
+  busybox ash
+  mount_recovery /boot
   if [ $? -eq 0 ]; then
     return
   fi
@@ -89,7 +78,7 @@ recovery_rootfs() {
 # Mount recovery using files in the EFI partition, mounted in /boot/efi
 #
 mount_recovery() {
-  dir=${1:-/boot/efi}
+  dir=${1:-/boot}
 
   logi "Mounting recovery squash as rootfs"
   mount -o bind /initos/recovery /sysroot
@@ -144,7 +133,22 @@ initramfs_init() {
 
   set -x # For debugging - may be removed later, but useful to see what is happening.
 
-  find_and_mount_boot
+  bootd=$(findfs LABEL=BOOT_BTRFS)
+  if [ -n "$bootd" ]; then
+    mount_disk $bootd btrfs /boot
+    bootd=$(findfs LABEL=BOOT)
+    if [ -n "$bootd" ]; then
+      mount_disk $bootd vfat /boot/efi
+    fi
+    mount_boot /boot
+  else 
+    # Will go away - only use the NVME.
+    bootd=$(findfs LABEL=BOOT)
+    if [ -n "$bootd" ]; then
+      mount_disk $bootd vfat /boot/efi
+    fi
+    mount_boot /boot/efi
+  fi
 
   logi "Recovery,modules,firmware mounted $(cat /proc/uptime)"
 
@@ -159,7 +163,7 @@ initramfs_init() {
 
   find_and_mount_root
 
-  if [ ! -d /sysroot/sbin/etc ]; then
+  if [ ! -d /sysroot/etc ]; then
     recovery_rootfs
   fi
 

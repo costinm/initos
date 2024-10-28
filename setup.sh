@@ -19,11 +19,12 @@ all() {
 # Build the USB installer files - need to go to a large EFI partition.
 # Will download the debian and alpine kernels.
 usb() {
-  mkdir -p ${WORK}/boot/efi
+  mkdir -p ${WORK}/boot
+
   # For the recovery docker build.
   # All other steps are run in a container or chroot.
   export DOCKER_BUILDKIT=1
-  docker build --progress plain -o ${WORK}/boot/efi \
+  docker build --progress plain -o ${WORK}/boot \
      -t ${REPO}/initos-recovery:latest -f ${SRCDIR}/tools/Dockerfile.boot ${SRCDIR}
 }
 
@@ -58,52 +59,7 @@ recovery() {
   docker push ${REPO}/initos-recovery:latest
 }
 
-
-####### For development and testing ########
-
-# Build the USB installer files - need to go to a large EFI partition.
-usb() {
-  mkdir -p ${WORK}/tmp
-  # For the recovery docker build.
-  # All other steps are run in a container or chroot.
-  export DOCKER_BUILDKIT=1
-  docker build --progress plain -o ${WORK}/tmp \
-     -t ${REPO}/initos-recovery:latest -f ${SRCDIR}/tools/Dockerfile.boot ${SRCDIR}
-}
-
-
-# Sign will sign the EFI files - using the keys in /etc/uefi-keys
-# This is a separate step - not using the sleeping docker container/pod/etc - but
-# a fresh container that only signs.
-sign() {
-  VOLS="-v ${WORK}/boot:/boot"
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin/setup-initos:/sbin/setup-initos"
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin/initos-secure:/sbin/initos-secure"
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin/initos-common.sh:/sbin/initos-common.sh"
-  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
-  VOLS="$VOLS -v ${WORK}:/x/initos"
-
-  mkdir -p ${HOME}/.ssh/initos/uefi-keys
-
-  # Inside the host or container - initos files will be under /initos (for now)
-  docker run -it --rm \
-      ${VOLS} \
-      -v ${HOME}/.ssh/initos/uefi-keys:/etc/uefi-keys \
-    ${REPO}/initos-recovery:latest /sbin/setup-initos sign
-}
-
-
-# Build image
-recovery() {
-  set -e
- # For the recovery docker build.
- # All other steps are run in a container or chroot.
- export DOCKER_BUILDKIT=1
-   docker build --progress plain \
-     -t ${REPO}/initos-recovery:latest --target recovery -f ${SRCDIR}/Dockerfile ${SRCDIR}
-  docker push ${REPO}/initos-recovery:latest
-}
-
+# 
 
 ####### For development and testing ########
 
@@ -171,8 +127,6 @@ export_recovery() {
 # Will mount source dir and /x/vol/initos in the container.
 recovery_local() {
   mkdir -p ${WORK}/work/cache
-recovery_local() {
-  mkdir -p ${WORK}/work/cache
   docker rm -f initos-recovery || true
   docker run -it --name initos-recovery \
       -v ${SRCDIR}:/ws/initos \
@@ -210,9 +164,8 @@ if [ $# -eq 0 ]; then
   echo
   echo "For development/making changes:"
   echo "   recovery - rebuild the recovery image from scratch after making changes"
-  echo "   recovery_sqfs - rebuild the recovery.sqfs image on boot/efi"
-  echo "   efi - create the UKI image (not signed)"
-  echo "   sign - create the keys if missing and sign the UKI"
+  echo "   usb -  use recovery image to download deb and alpine kernels and build UKI for USB"
+  echo "   sign - sign the usb image. If 'usb' was not called, will download the files"
 
   exit 1
 fi
