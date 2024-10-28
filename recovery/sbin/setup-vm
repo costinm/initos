@@ -36,7 +36,7 @@ VMDIR=/x/vol/${VM}
 mkdisk() {
   mkdir -p ${VMDIR}
   qemu-img create -f raw ${VMDIR}/disk.img 10G
-  dev=$(losetup -f ${VMDIR}/disk.img --show)
+  #dev=$(losetup -f ${VMDIR}/disk.img --show)
   mkfs.btrfs ${VMDIR}/disk.img
   #parted $dev mklabel gpt
 }
