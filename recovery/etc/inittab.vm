@@ -8,10 +8,11 @@
 
 # On virtual console
 #hvc0::respawn:/sbin/getty -L 115200 hvc0 vt100
+ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
 
 # -n - don't prompt for user name
 # -l
-hvc0::respawn:/sbin/getty -n /sbin/autologin
+#hvc0::respawn:/sbin/getty -n /sbin/autologin
 
 # Stuff to do for the 3-finger salute
 ::ctrlaltdel:/sbin/reboot

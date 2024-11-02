@@ -28,3 +28,8 @@ ext4btrfs() {
 recovery() {
   /initos/recovery/usr/bin/arch-chroot /initos/recovery $*
 }
+
+# On debian, find the explicitly installed packages
+find_installed_deb() {
+  dpkg --get-selections | grep -v deinstall | cut -f1
+}

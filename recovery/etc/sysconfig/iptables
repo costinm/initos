@@ -1,0 +1,4 @@
+*filter
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -j ACCEPT
+COMMIT

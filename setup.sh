@@ -8,6 +8,8 @@ export IMAGE=${IMAGE:-${REPO}/initos-recovery:latest}
 export CONTAINER=initos-recovery
 
 
+#export DOCKER_OPTS="--network br-lan"
+
 # All builds an '[/x/initos]/boot/efi' dir ready to use with a USB disk or
 # copied on a (large enough - at least 1G) EFI partition
 all() {
@@ -54,7 +56,7 @@ recovery() {
  # For the recovery docker build.
  # All other steps are run in a container or chroot.
  export DOCKER_BUILDKIT=1
-   docker build --progress plain \
+  docker build --progress plain  \
      -t ${REPO}/initos-recovery:latest --target recovery -f ${SRCDIR}/Dockerfile ${SRCDIR}
   docker push ${REPO}/initos-recovery:latest
 }
@@ -70,22 +72,32 @@ recovery() {
 # calling the setup-initos script.
 # Everything except building the recovery image is done in the recovery container.
 drun() {
-  ${SRCDIR}/recovery/sbin/setup-in-docker drun /ws/initos/recovery/sbin/setup-initos $*
+  ${SRCDIR}/recovery/sbin/start-docker drun /ws/initos/recovery/sbin/setup-initos $*
 }
 
+START_DOCKER=${SRCDIR}/recovery/sbin/start-docker
+
 sh() {
-  ${SRCDIR}/recovery/sbin/setup-in-docker drunit /bin/sh
+  ${SRCDIR}/recovery/sbin/start-docker drunit /bin/sh
 }
 
 # Build debian EFI and modules.
 deb() {
-  docker run -v /lib/modules:/lib/modules ${IMAGE} /sbin/setup-initos mod_sqfs
+  docker run $DOCKER_OPTS -v /lib/modules:/lib/modules ${IMAGE} /sbin/setup-initos mod_sqfs
+}
+
+build_deb() {
+  NAME=debvm APP=initos IMAGE=debian:bookworm-slim $START_DOCKER start
+  docker exec debvm /ws/initos/recovery/setup-deb docker_build add_tools 
+  docker commit debvm ${REPO}/deb-base:latest
+  mkdir -p /x/vol/devvm-v/rootfs-ro
+  docker export debvm | (cd /x/vol/devvm-v/rootfs-ro/ && sudo tar -xf  - )
+
 }
 
 allvirt() {
   # Get kernel, modules, firmware - and create sqfs and populate /x/initos/boot
-  drun vlinux_alpine
-  recovery_sqfs
+  #recovery_sqfs
   drun vinit
 }
 
@@ -97,20 +109,26 @@ recovery_sqfs_crane() {
 }
 
 recovery_sqfs() {
-  docker rm -f initos-tmp
-  docker run --name initos-tmp ${IMAGE} echo
+  docker push ${REPO}/initos-recovery:latest
 
-  mkdir -p ${WORK}/boot/efi
-  rm -f ${WORK}/boot/efi/recovery.sqfs
-
-  docker export initos-tmp | docker run -i \
-    -v ${WORK}/boot/efi:/boot/efi \
-    -v ${SRCDIR}:/ws/initos \
-     --rm ${IMAGE} /sbin/setup-initos recovery_sqfs_docker_export
-
-  docker stop initos-tmp
-  docker rm initos-tmp
+  drun recovery_sqfs ${REPO}/initos-recovery:latest recovery
 }
+
+# recovery_sqfs() {
+#   docker rm -f initos-tmp
+#   docker run --name initos-tmp ${IMAGE} echo
+
+#   mkdir -p ${WORK}/boot/efi
+#   rm -f ${WORK}/boot/efi/recovery.sqfs
+
+#   docker export initos-tmp | docker run -i \
+#     -v ${WORK}/boot/efi:/boot/efi \
+#     -v ${SRCDIR}:/ws/initos \
+#      --rm ${IMAGE} /sbin/setup-initos recovery_sqfs_docker_export
+
+#   docker stop initos-tmp
+#   docker rm initos-tmp
+# }
 
 export_recovery() {
   if [ -f ${WORK}/recovery/bin/busybox ]; then
@@ -128,7 +146,7 @@ export_recovery() {
 recovery_local() {
   mkdir -p ${WORK}/work/cache
   docker rm -f initos-recovery || true
-  docker run -it --name initos-recovery \
+  docker run -it $DOCKER_OPTS --name initos-recovery \
       -v ${SRCDIR}:/ws/initos \
       -v ${WORK}:/x/initos \
       -v ${WORK}/work/cache:/etc/apk/cache \

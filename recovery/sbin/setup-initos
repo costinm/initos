@@ -62,7 +62,7 @@ linux_alpine() {
 }
 
 # vlinux_alpine gets the virtual kernel, creates a squash with the modules.
-vlinux_alpine() {
+xxxxxvlinux_alpine() {
   # Also get virt since we are here...
   apk add linux-virt
 
@@ -84,6 +84,14 @@ vinit() {
   VKERNEL_VERSION=$(cat /boot/version-virt)
   # -k - keep the file
   # -t - temp dir where all is stored
+  if [ -d $SRCDIR/recovery/sbin ]; then
+    cp $SRCDIR/recovery/sbin/* /sbin/
+  fi
+
+  if [ ! -d ${WORK}/modules/${VKERNEL_VERSION} ]; then
+    mkdir -p ${WORK}/modules/${VKERNEL_VERSION}
+    unsquashfs -d ${WORK}/modules/${VKERNEL_VERSION} /boot/efi/modules-${VKERNEL_VERSION}.sqfs 
+  fi
 
   rm -rf ${WORK}/virt/initfs
   mkdir -p ${WORK}/virt/initfs
@@ -109,27 +117,27 @@ vinit() {
 # The '@firmware' and '@modules' subvolumes must also be created
 # if using separate volumes - for now they're in @recovery rootfs.
 efi() {
-
   # Expects that the modloop is already created, and the cache under ${WORK}/modules may
   # exist.
-  EFI_FILE=${EFI_FILE:-/boot/efi/EFI/BOOT/Initos-NEW.EFI}
+  mkdir -p /boot/usb/EFI/BOOT
+  mkdir -p /boot/initos
 
+  # For each kernel we have a module for, create an EFI image
   for KERNEL_VERSION in $(ls /lib/modules) ; do
     KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-    [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
+    [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && continue
 
-    [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules" && return
+    [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules for $KERNEL_VERSION" && continue
 
-    local img=/boot/initrd-initos.img-${KERNEL_VERSION}
+    local img=/boot/initos/initrd-${KERNEL_VERSION}.img
 
     build_initrd ${KERNEL_VERSION} ${img}
 
     echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init iomem=relaxed" > /boot/cmdline
 
-    mkdir -p /boot/efi/EFI/BOOT
     efi-mkuki \
       -c /boot/cmdline \
-      -o ${EFI_FILE} \
+      -o /boot/efi/InitOS-${KERNEL_VERSION}.EFI \
         ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}
   done
 }
@@ -153,8 +161,6 @@ efi2() {
       ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}  /boot/initos-xtra.cpio.gz
 
 }
-
-
 
 build_initrd() {
   local KERNEL_VERSION=$1
@@ -227,16 +233,17 @@ sign() {
   for k in $(ls /boot/vmlinuz-*) ; do
     KERNEL_VERSION=${k##*vmlinuz-}
     KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-
+    [ -f /boot/initos/initrd-${KERNEL_VERSION}.img ] || continue
     efi-mkuki \
       -c /boot/cmdline.secure \
       -o /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI \
         ${KERNEL} \
         /boot/intel-ucode.img /boot/amd-ucode.img \
-        /boot/initrd-initos.img-${KERNEL_VERSION} /boot/initos-hashes.cpio.gz
+        /boot/initos/initrd-${KERNEL_VERSION}.img \
+        /boot/initos-hashes.cpio.gz
 
     sbsign --cert /etc/uefi-keys/db.crt --key /etc/uefi-keys/db.key \
-      --output /boot/efi/EFI/BOOT/InitOS-Signed-${KERNEL_VERSION}.EFI \
+      --output /boot/efi/InitOS-Signed-${KERNEL_VERSION}.EFI \
       /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI
 
     rm /boot/efi/EFI/BOOT/tmp-${KERNEL_VERSION}.EFI

@@ -130,8 +130,8 @@ move_mounted_to_sysroot() {
   # From original alpine init
   cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
     if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
-      mkdir -p /sysroot/$DIR
-      mount -o move $DIR /sysroot/$DIR
+      mkdir -p /sysroot$DIR
+      mount -o move $DIR /sysroot$DIR
     fi
   done
 
@@ -162,7 +162,7 @@ lfatal() {
   echo "FAILED: $*"
   edump
 
-  if [ "${INIT_OS}" -eq "secure" ]; then
+  if [ "${INIT_OS}" = "secure" ]; then
     sleep 5
     reboot -f
   fi
@@ -266,6 +266,7 @@ mount_overlay() {
   local dev=${3:-/dev/mapper/${name}}
   local type=${4:-squashfs}
 
+  mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name} ${dst}
   mount -t $type $dev /initos/ro/${name}
   if [ $? -ne 0 ]; then
      lfatal "Error: Failed to sqfs ${name}"
@@ -425,7 +426,10 @@ cmdline() {
     # split opt in key and value
     key="${opt%%=*}"
     value="${opt#*=}"
-    export "KOPT_${key/./_}"="$value" || true
+    if [[ "$key" =~ "initos.*" ]]; then
+      key=${key/-/_}
+      export "KOPT_${key/./_}"="$value" || true
+    fi
   done
 }
 

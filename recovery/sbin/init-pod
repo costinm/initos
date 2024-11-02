@@ -2,8 +2,9 @@
 
 # Functions to run various things at 'pod' startup ( or docker image, VM)
 # Expects tini (for zombies).
-# Detects if vncserver is installed - and starts it if it is. Same for CRD.
-# 
+#
+# For 'dev' pods, detects if vncserver is installed - and starts it if it is. Same for CRD.
+# Pods are expected to use debian or ubuntu rootfs.
 
 APPS_DIR=/x/sync/app
 
@@ -21,6 +22,8 @@ function start_x() {
   if [ -f /etc/init.d/x11-common ]; then
     /etc/init.d/x11-common start
   fi
+
+  rm -f /tmp/.X11-unix/* || true
 
   if [ -f /etc/init.d/chrome-remote-desktop ]; then
     usermod -a -G chrome-remote-desktop ${USERNAME} || true
@@ -103,7 +106,7 @@ function add_main_user() {
 
   usermod -p '*' ${USERNAME}
 
-  chown ${u} /home /work
+  #chown ${u} /home /work
 
   # rm -rf /work && ln -s /x/work /work
 
@@ -194,6 +197,15 @@ function pod() {
   fi
 
   exec sleep infinity
+}
+
+# Startup script for a VM - at this point the init has loaded the modules, pivot root.
+# 
+function vm() {
+  hostname $(cat /etc/hostname)
+  ifup -a
+  /etc/init.d/ssh start
+  pod
 }
 
 if [ -z ${1+x} ] ; then

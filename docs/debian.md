@@ -1,8 +1,9 @@
 
+Difference between debian and alpine kernel:
 
 - has simple-drm linked in
 - no zstd on firmware load - any firmware must be decompressed
-- 
+
 
 The debian rootfs needs few adjustments:
 - disable lid switch if using a laptop (otherwise the screen will turn off when closing the lid)
@@ -17,3 +18,19 @@ Also useful: remove journamd, use busybox syslogd with circular buffer.
 
 Wifi:
 systemctl enable wpa_supplicant@wlan0.service
+
+
+# In a VM
+
+- apt purge systemd !
+- add vc
+- ifupdown-ng
+
+Files to update:
+/etc/network/interfaces
+/etc/hosts
+/etc/wpa_supplicant/wpa_supplicant.conf
+
+- add docker br-lan network
+- fix-docker iptables for router
+- machine id ? 

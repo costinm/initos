@@ -1,13 +1,28 @@
 #!/bin/sh
 
-# Start a container with mounted volumes.
-#
+# Start a docker container, with a set of mounted volumes for development, build or to run services.
+# This provides an alternative to Dockerfile - with more flexibility and performance, but without the
+# 'remote execution' features.
+# 
+# Modern Dockerfiles allows caching - so full reproduction between 2 runs is not guaranteed anymore, and 
+# it was wasteful anyways - a clean build (in a different volume) provides the same benefits. 
+# 
+# A Dockerfile contains multiple 'stages', a stage can copy or mount files from a previous stage.
+# Instead, each stage is a standalone 'run' operation, with mounted volumes.
+# Instead of Dockerfile syntax, regular shell is used (or any other language).
+# Images are pushed and manipulated with 'crane'.
 #
 # Environment:
-#   APP=appname, default to initos
-#   REPO - base repository
-#   IMAGE - image
+#   NAME - pod name - defaults to current working directory basename.
+#   TAG - defaults to 'latest'
+#   REPO - base repository, NAME:TAG will be added
+#   IMAGE - final image, defaults to REPO/NAME:TAG
 #
+# Directory layout outside the container:
+#    WORK ( defaults to /x/vol/$NAME )
+#    SRCDIR - /ws/$NAME - source directory
+# 
+# Directory layout inside the container:
 #   /ws/$APP - the source directory (read only)
 #   /work/$APP - the work directory, with /work/$APP/dist for the files to be distributed
 #   /run/secrets/$APP - secrets volume
@@ -16,8 +31,19 @@
 #
 # For clean build - remove the container and work directory.
 # Different builds can run in parallel, with different work dirs and containers.
+#
+# Using 2 modes: dstart is running like a pod, followed by dexec
+# This mode is very flexible and also works with pods and VMs.
+#
+# drun is running an ephemeral container for each command and removes it after.
+# It is less flexibile but simpler.
 
-APP=${APP:-initos}
+
+NAME=${NAME:-$(basename $PWD)}
+TAG=${TAG:-latest}
+
+
+APP=${APP:-${NAME}}
 CONTAINER=${CONTAINER:-$APP}
 
 # Docker repo where we push images or get pre-build/saved images.
@@ -34,12 +60,6 @@ SRCDIR=${SRCDIR:-/ws/$APP}
 set -x
 set -e
 
-# Using 2 modes: dstart is running like a pod, followed by dexec
-# This mode is very flexible and also works with pods and VMs.
-#
-# drun is running an ephemeral container for each command and removes it after.
-# It is less flexibile but simpler.
-
 
 
 # Source files
@@ -55,17 +75,22 @@ VOLS="$VOLS -v ${WORK}/firmware:/lib/firmware"
 
 # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
 VOLS="$VOLS -v ${WORK}:/x/${APP}"
+DOCKER_OPTS="--net br-lan"
+
+drun() {
+  run $*
+}
 
 # Run a build command in the recovery image
-drun() {
-  docker run --rm \
+run() {
+  docker run $DOCKER_OPTS --rm \
     ${VOLS} \
     ${IMAGE} \
      $*
 }
 
 drunit() {
-  docker run -it --rm \
+  docker run $DOCKER_OPTS -it --rm \
     ${VOLS} \
     ${IMAGE} \
     $*
@@ -83,18 +108,17 @@ push() {
 # This can also be a chroot, pod, VM or any equivalent jail/container, with
 # volumes mounted on /x and the required places.
 start() {
-  local img=${1:-${IMAGE}}
-  local name=${2:-${CONTAINER}}
-
-  docker run --name ${name} -d \
+  local n=${1:-${NAME}}
+  
+  docker run $DOCKER_OPTS --name ${n} -d \
       ${VOLS} \
-      ${img} \
+      ${IMAGE} \
         sleep infinity
 }
 
 stop() {
-  local name=${1:-${APP}}
-  docker stop $name
+  local n=${1:-${NAME}}
+  docker stop $n
 }
 
 
@@ -103,7 +127,7 @@ podman_recovery() {
   mount -t tmpfs /var/lib/containers
 
   #crane pull --format oci git.h.webinf.info/costin/initos-recovery:latest /tmp/r
-  docker run --privileged -it --net host git.h.webinf.info/costin/initos-recovery:latest /bin/sh
+  docker run $DOCKER_OPTS --privileged -it --net host git.h.webinf.info/costin/initos-recovery:latest /bin/sh
 }
 
 

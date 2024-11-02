@@ -40,7 +40,7 @@ function docker_build() {
 #    df > /home/log/df-before-${stage}.log
 #    dpkg -l > /home/log/pkg-before-${stage}.log
 #
-#    $stage
+     $stage
 #
 #    df > /home/log/df-after-${stage}.log
 #    dpkg -l > /home/log/dpkg-after-${stage}.log
@@ -110,9 +110,11 @@ function add_tools() {
           net-tools \
           lsof \
          tcpdump \
-         iptables iproute2  
+         iptables iproute2 bridge-utils \
+         bsdutils btrfs-progs
 
     echo Y | $APTINSTALL sudo
+
 
     echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
      
@@ -143,10 +145,10 @@ function add_tools() {
   # Istio base image has git messed up
   $APTINSTALL git
 
-  # fuser3 bash-completions
+  # fuser3
   # dnsutils, net-tools, tcpdump, iptables, iproute2, netcad-openbsd - network debugging
   # curl
-  # tmux, vim, less, bash-completion, mc - text based UI
+  # tmux, vim, less, mc - text based UI
 
   # Not sure:
   # syncthing - optional, may use the APP volume instead or docker image
@@ -165,7 +167,7 @@ function add_ui() {
   # 219M on top of istio image. Includes x11-common but not xorg
   $APTINSTALL  \
            i3 dbus-x11 desktop-base libdbus-glib-1-2 \
-          kitty i3status rofi tint2
+          kitty i3status rofi tint2 alttab
 
   echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
 

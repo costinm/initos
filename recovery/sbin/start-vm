@@ -1,0 +1,146 @@
+#!/bin/sh
+
+# Start a 'Pod' using the recovery image and initramfs.
+#
+# Using cloud-hypervisor initially - for more diversity, qemu should also work, crosvm would be ideal if it had binaries.
+#
+# Using virtiofs.
+
+# Work dir for temp files/cache.
+# Can be a btrfs subvolume, or a tmpfs. I have a btrfs mounted on/x/, and use vol
+# for 'volumes'.
+WORK=${WORK:-/x/initos}
+
+# For running the steps that need a container, use this shared dir and source dir.
+# Should be mounted in docker, will be created on the USB/recovery.
+SRCDIR=${SRCDIR:-/ws/initos}
+
+set -x
+set -e
+
+if [ -z $VM ]; then
+  vmsuffix="${0#*start-vm}"
+
+  if [ -z "$vmsuffix" ]; then
+    VM=$(basename $PWD)
+  else
+    VM=$vmsuffix
+  fi
+fi
+
+VMDIR=/x/vol/${VM}
+
+run_virtiofsd() {
+  local dir=${1:-${VMDIR}}
+
+  # Faster than virtio-9p or regular 9p/nfs
+  # FUSE messages over vhost-user socket
+  # DAX (using host buffers) not enabled.
+  ${WORK}/virt/virtiofsd \
+      --socket-path=${VMDIR}/virtiofs.sock \
+      --shared-dir=$dir \
+      --cache=never \
+      --allow-mmap \
+      --xattr \
+      --allow-direct-io \
+      --thread-pool-size=2 &
+
+  # Save the PID
+  echo $! > ${VMDIR}/virtiofsd.pid
+#       --log-level debug \
+}
+
+# Testing:
+# Run a command before swaproot, poweroff immediatly after.
+# CMD_XTRA=cmdx=/bin/ls setup-vm run # 2.05 sec
+#
+# Run a command after pivot, poweroff
+# setup-vm run "df; poweroff -d 0 -f" # About same
+
+run() {
+  local cmd="$1"
+  echo "CMD: $cmd"
+
+  # Alpine kernel includes no filesystem - virtiofs is a module
+
+  OPTS=
+  CMD_OPT=
+
+  if [ -e ${VMDIR}/rootfs ] ; then
+    sudo rm ${VMDIR}/virtiofsd.sock || true
+    run_virtiofsd ${VMDIR}/rootfs
+    OPTS="$OPTS --fs tag=/dev/root,socket=${VMDIR}/virtiofs.sock,num_queues=1,queue_size=512"
+    CMD_OPTS="$CMD_OPTS initos_vrw=1"
+  elif [ -e ${VMDIR}/x] ; then
+    sudo rm ${VMDIR}/virtiofsd.sock || true
+    run_virtiofsd ${VMDIR}/x
+    OPTS="$OPTS --fs tag=/dev/root,socket=${VMDIR}/virtiofs.sock,num_queues=1,queue_size=512"
+    CMD_OPTS="$CMD_OPTS initos_vx=1"
+  fi
+
+  KERNEL_VERSION=$(cat ${WORK}/boot/version-virt)
+  
+  DISKS="$DISKS path=${WORK}/boot/efi/modules-${KERNEL_VERSION}.sqfs"
+  
+  if [  -f ${VMDIR}/disk.img ] ; then
+      DISKS="$DISKS path=${VMDIR}/disk.img"
+  fi
+  if [  -f ${VMDIR}/disk2.img ] ; then
+      DISKS="$DISKS path=${VMDIR}/disk2.img"
+  fi
+
+  # Debian kernel doesn't seem to work with hvc0, serial is fine
+  OPTS="$OPTS --serial tty --console off"
+
+  OPTS="$OPTS --kernel ${WORK}/boot/vmlinuz-${KERNEL_VERSION}"
+  OPTS="$OPTS --memory size=8G,shared=on --cpus boot=6"
+
+  #OPTS="$OPTS --serial socket=${VMDIR}/serial.sock --console off"
+
+  # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
+  # Otherwise the virtio-console driver is used - faster but less early messages
+
+  # virtio-net is used for eth
+  # tap is the address of the tap on the VM side
+
+  #  --vsock \
+  #  --pmem file=${WORK}/boot/efi/recovery.sqfs \
+
+  # Adding ip=172.17.1.22 to kernel cmdline adds 10 sec delay
+  # noquiet debug loglevel=8 ignore_loglevel
+
+  # --serial tty --console off --cmdline "console=ttyS0 trace_clock=global quiet" \
+  sudo rm -f ${VMDIR}/ch.sock
+  sudo rm -f ${VMDIR}/serial.sock
+
+  sudo time ${WORK}/virt/cloud-hypervisor-static \
+    --pvpanic \
+    --rng src=/dev/urandom \
+    --api-socket=${VMDIR}/ch.sock \
+    --cmdline "${CMD_OPTS} console=hvc0 console=ttyS0 trace_clock=global net.ifnames=0  panic=-1 reboot=acpi quiet initos.ip=172.17.1.24 ${CMD_XTRA} --${cmd}" \
+    --disk path=${WORK}/boot/efi/recovery.sqfs  ${DISKS} \
+    --net tap=vm-$VM,ip=172.17.1.23,mask=255.255.128.0,iommu=on \
+    --initramfs ${WORK}/boot/initramfs-${KERNEL_VERSION} \
+    $OPTS 
+
+  brctl addif br-lan vm-$VM
+   # --net .. mac=...
+    #--fs tag=/dev/root,socket=$PWD/virtiofs-rootfs.sock \
+    #--cmdline "console=hvc0 rootfstype=virtiofs root=/dev/root ro debug" \
+    #systemd.unit=rescue.target systemd.debug-shell=1 systemd.log_level=debug
+
+
+  # exit with openrc-shutdown -p 0
+  # or poweroff -d 0 -f
+
+  # mount -t virtiofs /dev/root /mnt
+
+}
+
+stop() {
+  ${WORK}/virt/ch-remote --api-socket=${VMDIR}/ch.sock shutdown-vmm
+}
+
+CMD=$1
+shift
+$CMD "$*"

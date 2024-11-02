@@ -6,3 +6,5 @@ kernel/drivers/block/virtio*
 kernel/drivers/net/virtio_*
 kernel/drivers/char/virtio_*
 kernel/drivers/gpu/drm/virtio
+kernel/drivers/gpu/drm/virtio
+kernel/drivers/scsi/virtio*

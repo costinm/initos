@@ -1,6 +1,7 @@
 #!/bin/sh
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
 . /sbin/init-common.sh
 
 # Main function after modules loaded and system mounted.
@@ -8,104 +9,119 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 # /dev/vdb modules corresponsing to the kernel.
 # /dev/vdc is the real root, expected to be btrfs.
 initramfs_init_vm() {
-    cmdline /proc/cmdline
+  # Unlike real machine where cmdline is only for kernel, using
+  # it for basic params related to setup.
+  cmdline /proc/cmdline
 
-    # Run a command before mounting
-    if [ -n "$KOPT_cmd0"  ]; then
-      # Should be about 0.4
-      ${KOPT_cmd0}
-      cat /proc/uptime
-      poweroff -d 0 -f
-    fi
+  # Run a command before mounting
+  # if [ -n "$KOPT_initos_cmd0"  ]; then
+  #   # Should be about 0.4
+  #   ${KOPT_initos_cmd0}
+  #   cat /proc/uptime
+  #   #poweroff -d 0 -f
+  # fi
+  
+  # mount a tmpfs - will be moved to /sysroot
+  mkdir /initos
+  mount -t tmpfs root-tmpfs /initos
 
-    # When used with VM, expect vda to be the recovery squashfs
-    mkdir -p /media/root-ro
-
-    # Don't need udev - required modules are enough
-    blkid
-
-    mount -t squashfs /dev/vda /media/root-ro
-
-    if [ -f /dev/vdb ]; then
-      mkdir -p /lib/modules/$(uname -r)
-      mount -t squashfs /dev/vdb /lib/modules/$(uname -r)
-    fi
-
-    mount_overlay
-
-    if [ -f /dev/vdc ]; then
-      mkidr -p /x
-      # This takes a long time
-      echo Loading btfs module
-      cat /proc/uptime
-      time modprobe btrfs
-      cat /proc/uptime
+  # When used with VM, expect vda to be the recovery/init squashfs
+  # and vdb to the the matching modules file.
+  if [ -e /dev/vdb ]; then
+    mount_overlay $(uname -r) /lib/modules/$(uname -r) /dev/vdb squashfs
+  fi
+  
+  mount_overlay recovery /initos/recovery /dev/vda squashfs
+  
+  mkdir -p /sysroot
+  
+  if [ -n "$KOPT_initos_vrw"  ]; then
+    mount -t virtiofs /dev/root /sysroot
+    if [ -e /dev/vdc ]; then
+      mkdir -p /x
       mount -t btrfs /dev/vdc /x
     fi
+  else 
+    bootd=$(findfs LABEL=rootfs)
+    if [ -n "$bootd" ]; then
+      # This takes a long time
+      #echo Loading btfs module
+      #cat /proc/uptime
+      #time modprobe btrfs
+      #cat /proc/uptime
+      mount -t ext4 $bootd /sysroot
+    else
+      echo "No rootfs found"
+      poweroff -f
+    fi
+  fi
 
-    # Will get the link local IPv6 address !
+  if [ -n "$KOPT_initos_vx"  ]; then
+    mkdir -p /x
+    mount -t virtiofs /dev/root /x
+  fi
+
+      # Adjust openrc
+  #     cd /sysroot/etc/init.d
+  #     ln -s agetty agetty.hvc0
+  #     cd /sysroot/etc/runlevels/default
+  #     ln -s ../../init.d/agetty.hvc0 agetty.hvc0
+  #     rm dropbear
+  # #    cd /sysroot/etc/runlevels/boot
+  # #    ln -s ../../init.d/agetty.hvc0 agetty.hvc0
+  #     rm /sysroot/etc/network/interfaces
+
+    # Will get the link local IPv6 address 
     ifconfig eth0 up
     ifconfig lo up
 
-    # Adjust openrc
-    cd /sysroot/etc/init.d
-    ln -s agetty agetty.hvc0
-    cd /sysroot/etc/runlevels/default
-    ln -s ../../init.d/agetty.hvc0 agetty.hvc0
-    rm dropbear
-#    cd /sysroot/etc/runlevels/boot
-#    ln -s ../../init.d/agetty.hvc0 agetty.hvc0
-    rm /sysroot/etc/network/interfaces
-    rm /sysroot/etc/sysctl.conf
+    #chroot /sysroot passwd -d root
 
-    chroot /sysroot passwd -d root
-
+    #echo "Before chroot"
     #busybox sh
     # Test the time to do a start, init, cmd, poweroff
     if [ -n "$KOPT_cmd1"  ]; then
-      ${KOPT_cmdx}
+      ${KOPT_cmd1}
       poweroff -d 0 -f
     fi
-
+    set -x
     move_mounted_to_sysroot
 
+    #busybox sh
     if [ -n "$KOPT_cmd"  ]; then
-      echo exec switch_root /sysroot /bin/sh -c "${KOPT_cmd}"
-      exec switch_root /sysroot /bin/sh -c "${KOPT_cmd}"
+      echo exec switch_root /sysroot "${KOPT_cmd}"
+      exec switch_root /sysroot ${KOPT_cmd}
     fi
 
     exec switch_root /sysroot /sbin/init
 }
 
-
-# Mounts the /sysroot as an overlayfs, with /media/root-ro as the real root.
-mount_overlay() {
-  mkdir -p /media/root-rw
-
-  mount -t tmpfs root-tmpfs /media/root-rw
-
-  mkdir -p /media/root-rw/work /media/root-rw/root
-
-  mount -t overlay \
-   -o lowerdir=/media/root-ro,upperdir=/media/root-rw/root,workdir=/media/root-rw/work \
-   overlayfs /sysroot
-}
-
 core_mods() {
-  # Not loaded in alpine virt kernel - it will allow identifying the disk
+  # Required for debian
+  modprobe virtio_console
+  modprobe virtio_pci
 
+  # Not present on debian
+  #modprobe virtio_iommu
+
+  modprobe virtio_net
   modprobe squashfs
   modprobe virtio_blk
-  modprobe virtio_iommu
-  modprobe virtio_net
-
-  # No need to load simpledrm - using console
 }
 
-initramfs_1st
-mount_proc
+initramfs_init() {
+  initramfs_1st
+  mount_proc
+  # At this point - no filesystems, only md, mdp, blkext block devices.
+  core_mods
 
-# At this point - no filesystems, only md, mdp, blkext block devices.
-core_mods
+  initramfs_init_vm
+}
 
-initramfs_init_vm
+
+if [ "$$" = "1" ]; then
+  initramfs_init
+else
+  # Running as a script - from shell.
+  $*
+fi

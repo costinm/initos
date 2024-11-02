@@ -83,6 +83,15 @@ find_root() {
         echo "Use /sbin/init-secure unlock_tpm ${cryptd} to use TPM"
         busybox sh
     else
+      unlock_tpm $cryptd
+      if [ $? -eq 0 ]; then
+        mount_btrfs /dev/mapper/c
+        if [ $? -eq 0 ]; then
+          logi "Rootfs mounted using TPM in insecure mode"
+          return
+        fi
+        logi "Failed to mount BTRFS root, fallback to recovery"
+      fi
       logv "Found LUKS device, not using TPM in insecure mode: ${cryptd}"
     fi
   fi

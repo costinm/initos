@@ -56,8 +56,17 @@ find_and_mount_root() {
     logi " /init mount_btrfs"
     busybox ash
   else
+    if [ "$MODE" = "c" ]; then
+      logv "Found LUKS device, TPM failed, console unlock: ${cryptd}"
+      cryptsetup luksOpen $cryptd c
+      if [ $? -eq 0 ]; then
+        mount_btrfs /dev/mapper/c
+        if [ $? -eq 0 ]; then
+          return
+        fi
+    fi
     logi "No LUKS volume found, fallback to recovery"
-    busybox ash
+    #busybox ash
   fi
 
   # No point to have an option to ask for console key - we'll boot to recovery
@@ -66,7 +75,7 @@ find_and_mount_root() {
 
 recovery_rootfs() {
   echo RECOVERY ROOT
-  busybox ash
+  #busybox ash
   mount_recovery /boot
   if [ $? -eq 0 ]; then
     return
@@ -129,6 +138,9 @@ initramfs_init() {
   # we find the root we want.
   udev_start
 
+  echo "Press 'r' for recovery (BTRFS_ROOT), 'c' for manual LUKS. Default is LUKS if tpm2 is possible, recovery otherwise"
+  read -t 3 -n 1 key
+
   udevadm settle
 
   set -x # For debugging - may be removed later, but useful to see what is happening.
@@ -136,11 +148,12 @@ initramfs_init() {
   bootd=$(findfs LABEL=BOOT_BTRFS)
   if [ -n "$bootd" ]; then
     mount_disk $bootd btrfs /boot
+    mount_boot /boot
+
     bootd=$(findfs LABEL=BOOT)
     if [ -n "$bootd" ]; then
       mount_disk $bootd vfat /boot/efi
     fi
-    mount_boot /boot
   else 
     # Will go away - only use the NVME.
     bootd=$(findfs LABEL=BOOT)

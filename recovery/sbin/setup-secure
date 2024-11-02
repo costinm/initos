@@ -1,7 +1,11 @@
 #!/bin/sh
 
-# Install script for Initos. It assumes we run in a recovery image or an alpine rootfs
-# with all the tools needed.
+# Install script for Initos. It assumes it was directly booted or chroot/container in the recovery image, where all
+# tools are available.
+# 
+# wipe_disk  requires the /dev/DISK to be available - bind mount if running in a container.
+# 
+# 
 
 # Unlike ignition (which runs in Dracut initramfs), this script runs on a full alpine OS
 # with networking and the usual tools. It is not designed to wipe the disk or be declarative -
@@ -30,9 +34,10 @@ wipe_disk() {
   # use 100% to fill the disk. This is total, EFI and root.
   # It is possible to later use the rest of the disk for LUKS, LVM or other work partitions.
 
-  parted --script --machine -- "${disk_dev}" mklabel gpt
+  # List partitions with parted
+  partitions=$(parted --script --machine -- "${disk_dev}" unit s print)
 
-  parted --script --machine -- "${disk_dev}" unit s print
+  parted --script --machine -- "${disk_dev}" mklabel gpt
 
 
   parted "$disk_dev" mkpart ESP fat32 1 2048
@@ -53,20 +58,15 @@ wipe_disk() {
   mkfs.vfat ${disk_dev}${suffix}1 -n BOOT
 }
 
+# Create a LUKS encrypted filesystem, with a btrtf volume on top.
+# The password is random and saved to TPM and in 'escrow' using the /boot/root.pem public key
+# (that means the mesh owner can recover the passoword)
 mkcrpyt() {
   local disk_dev=$1
 
-  export PASSPHRASE=$(openssl rand -base64 32)
-  if [ -f /boot/root.pem ]; then
-    echo -n "$PASSPHRASE" | openssl pkeyutl -encrypt \
-         -pubin -inkey /boot/root.pem \
-         -pkeyopt rsa_padding_mode:oaep \
-         -pkeyopt rsa_oaep_md:sha256 \
-         -out /boot/efi/DISK_RECOVERY_KEY
-  fi
-  echo -n $disk_dev > /boot/efi/ENCRYPTED_DISK_NAME
+  init_pass
 
-  echo -n "$PASSPHRASE" > /run/passphrase
+  echo -n $disk_dev > /boot/efi/ENCRYPTED_DISK_NAME
 
   save_tpm $PASSPHRASE
 
@@ -87,13 +87,29 @@ mkcrpyt() {
   # TODO: if tpm present, save it to TPM
 }
 
+# Add a key to the LUKS partition. This is a recovery key, not the main key - allows owner to open the disk 
+# without TPM.
 add_key() {
   local disk_dev=$1
   local key_file=$2
 
-  cat /run/passphrase | cryptsetup luksAddKey $disk_dev
+  cat $SECRETS/passphrase | cryptsetup luksAddKey $disk_dev
 }
 
+SECRETS=/run/secrets/luks
+
+init_pass() {
+  export PASSPHRASE=$(openssl rand -base64 32)
+  mkdir -p $SECRETS
+  echo -n "$PASSPHRASE" > $SECRETS/passphrase
+  if [ -f /boot/root.pem ]; then
+    echo -n "$PASSPHRASE" | openssl pkeyutl -encrypt \
+         -pubin -inkey /boot/root.pem \
+         -pkeyopt rsa_padding_mode:oaep \
+         -pkeyopt rsa_oaep_md:sha256 \
+         -out /boot/efi/DISK_RECOVERY_KEY
+  fi
+}
 
 recover_key() {
   local ENCRYPTED_PASSPHRASE_FILE=$1
@@ -113,8 +129,33 @@ gen_pass() {
    cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14; echo
 }
 
-## Save the LUKS password to TPM
 save_tpm() {
+  PASSPHRASE=$1
+  mkdir -p /initos/tpm
+  cd /initos/tpm
+  
+  # Can be called multiple times, same result
+  tpm2_createpolicy --policy-pcr -l sha256:8 -L policy.digest
+
+  tpm2_getcap handles-persistent | grep -q 0x81800001
+  if [ $? -ne 0 ]; then
+  fi
+
+  # On Chromebook, only -C p works. On another laptop - default only (owner), -C e also works .
+  tpm2_createprimary  -c primary.ctx --format=pem --output=primary_pub.pem
+  tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
+  tpm2_evictcontrol -c primary.ctx -o primary.tr -C p # persistent-handle: 0x8100...0
+  tpm2 print -t ESYS_TR primary.tr
+  # primary.tr or 0x81000000 - the eviccontrol handle
+  echo ${PASSPHRASE} | tpm2_create -u key.pub -r key.priv -C primary.tr -L policy.digest -i -
+
+  tpm2_evictcontrol -c primary.tr | true
+  # persistent-handle: 0x81000003
+
+}
+
+## Save the LUKS password to TPM
+save_tpm_dbg() {
   PASSPHRASE=$1
 
     # Key will be disabled if ...
@@ -175,7 +216,7 @@ save_tpm() {
 bootefi() {
   local dev=${1:-/dev/sda}
 
-   mount -t efivarfs none /sys/firmware/efi/efivars
+  mount -t efivarfs none /sys/firmware/efi/efivars
 
   efibootmgr --disk $dev --part 1 --create --label 'Initos' --load /EFI/boot/InitOS.efi --verbose
 
