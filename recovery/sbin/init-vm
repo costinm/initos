@@ -13,15 +13,8 @@ initramfs_init_vm() {
   # it for basic params related to setup.
   cmdline /proc/cmdline
 
-  # Run a command before mounting
-  # if [ -n "$KOPT_initos_cmd0"  ]; then
-  #   # Should be about 0.4
-  #   ${KOPT_initos_cmd0}
-  #   cat /proc/uptime
-  #   #poweroff -d 0 -f
-  # fi
+  # Should be about 0.4 sec at this point
   
-  # mount a tmpfs - will be moved to /sysroot
   mkdir /initos
   mount -t tmpfs root-tmpfs /initos
 
@@ -50,26 +43,20 @@ initramfs_init_vm() {
       #time modprobe btrfs
       #cat /proc/uptime
       mount -t ext4 $bootd /sysroot
-    else
+    else 
+      mount -o bind /initos/recovery /sysroot
+    fi
+  fi
+
+  if [ ! -e /sysroot/etc ]; then
       echo "No rootfs found"
       poweroff -f
-    fi
   fi
 
   if [ -n "$KOPT_initos_vx"  ]; then
     mkdir -p /x
     mount -t virtiofs /dev/root /x
   fi
-
-      # Adjust openrc
-  #     cd /sysroot/etc/init.d
-  #     ln -s agetty agetty.hvc0
-  #     cd /sysroot/etc/runlevels/default
-  #     ln -s ../../init.d/agetty.hvc0 agetty.hvc0
-  #     rm dropbear
-  # #    cd /sysroot/etc/runlevels/boot
-  # #    ln -s ../../init.d/agetty.hvc0 agetty.hvc0
-  #     rm /sysroot/etc/network/interfaces
 
     # Will get the link local IPv6 address 
     ifconfig eth0 up
@@ -89,7 +76,6 @@ initramfs_init_vm() {
 
     #busybox sh
     if [ -n "$KOPT_cmd"  ]; then
-      echo exec switch_root /sysroot "${KOPT_cmd}"
       exec switch_root /sysroot ${KOPT_cmd}
     fi
 

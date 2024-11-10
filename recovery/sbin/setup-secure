@@ -68,16 +68,16 @@ mkcrpyt() {
 
   echo -n $disk_dev > /boot/efi/ENCRYPTED_DISK_NAME
 
-  save_tpm $PASSPHRASE
+  save_tpm ${KEY}
 
   echo "Consider adding a recovery key"
 
   # Linux LUKS partition type is 8309
   # -v -c aes-xts-plain64 -s 512 --hash sha512 --pbkdf pbkdf2 \
   #   --iter-time 1000 --use-random
-  echo -n "$PASSPHRASE" | cryptsetup luksFormat --type luks2 ${disk_dev} -
+  echo -n "${KEY}" | cryptsetup luksFormat --type luks2 ${disk_dev} -
 
-  echo -n "$PASSPHRASE" | cryptsetup luksOpen ${disk_dev} c -
+  echo -n "${KEY}" | cryptsetup luksOpen ${disk_dev} c -
 
   mkfs.btrfs /dev/mapper/c
   # Doesn't really matter, visible after encyption unlock.
@@ -89,7 +89,15 @@ mkcrpyt() {
 
 # Add a key to the LUKS partition. This is a recovery key, not the main key - allows owner to open the disk 
 # without TPM.
-add_key() {
+luks_add_key() {
+  local disk_dev=$1
+
+  echo -n $KEY > /run/key 
+  cryptsetup luksAddKey $disk_dev /run/key
+  rm /run/key
+}
+
+luks_add_pass() {
   local disk_dev=$1
   local key_file=$2
 
@@ -99,23 +107,25 @@ add_key() {
 SECRETS=/run/secrets/luks
 
 init_pass() {
-  export PASSPHRASE=$(openssl rand -base64 32)
+  #export KEY=$(openssl rand -base64 32)
+  export KEY=$(genpass)
   mkdir -p $SECRETS
-  echo -n "$PASSPHRASE" > $SECRETS/passphrase
+  echo -n "${KEY}" > $SECRETS/passphrase
   if [ -f /boot/root.pem ]; then
-    echo -n "$PASSPHRASE" | openssl pkeyutl -encrypt \
+    echo -n "${KEY}" | openssl pkeyutl -encrypt \
          -pubin -inkey /boot/root.pem \
          -pkeyopt rsa_padding_mode:oaep \
          -pkeyopt rsa_oaep_md:sha256 \
          -out /boot/efi/DISK_RECOVERY_KEY
   fi
+  echo $KEY
 }
 
 recover_key() {
   local ENCRYPTED_PASSPHRASE_FILE=$1
   PRIVATE_KEY=$HOME/.ssh/id_ecdsa
 
-  PASSPHRASE=$(openssl pkeyutl -decrypt \
+  KEY=$(openssl pkeyutl -decrypt \
      -inkey $PRIVATE_KEY -in $ENCRYPTED_PASSPHRASE_FILE \
      -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256)
 }
@@ -129,34 +139,129 @@ gen_pass() {
    cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14; echo
 }
 
-save_tpm() {
-  PASSPHRASE=$1
+HANDLE=${HANDLE:-0x81000001}
+
+get_pass() {
+    KEY=$(tpm2_unseal -c ${HANDLE} -p pcr:sha256:7)
+    echo ${KEY}
+}
+
+get_pass8() {
+    KEY=$(tpm2_unseal -c 0x81000001 -p pcr:sha256:8)
+    echo ${KEY}
+}
+
+set_pass() { 
+  mkdir -p /initos/tpm
+  cd /initos/tpm
+  # Can be called multiple times, same result
+  tpm2_createpolicy --policy-pcr -l sha256:7 -L policy.digest
+
+  echo ${KEY} | tpm2_create -u key.pub -r key.priv -C 0x81000000 -L policy.digest -i -
+
+  tpm2_evictcontrol -c ${HANDLE}
+  tpm2_load -C 0x81000000 -u key.pub -r key.priv -c key.ctx -n key.name
+  tpm2_evictcontrol -c key.ctx
+}
+
+#PRIMARY=0x81800000
+#TPM_KIND="-C p"
+#HANDLE=0x81800001
+TPM_KIND=${TPM_KIND:-}
+PRIMARY=${PRIMARY:-0x81000000}
+HANDLE=${HANDLE:-0x81000001}
+
+create_primary() {
+  # On Chromebook, only -C p works. On another laptop - default only (owner), -C e also works .
+  tpm2_createprimary  -c primary.ctx --format=pem --output=primary_pub.pem ${TPM_KIND}
+  tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
+ 
+  tpm2_evictcontrol -c ${PRIMARY}
+  tpm2_evictcontrol -c primary.ctx -o primary.tr ${TPM_KIND} # persistent-handle: 0x8100...0
+  tpm2 print -t ESYS_TR primary.tr
+}
+
+list() {
+  tpm2_getcap handles-persistent
+
+}
+
+# save_tpm() {
+#   KEY=$1
+
+#   mkdir -p /initos/tpm
+#   cd /initos/tpm
+  
+#   # Can be called multiple times, same result
+#   tpm2_createpolicy --policy-pcr -l sha256:7 -L policy.digest
+
+#   #tpm2_getcap handles-persistent | grep -q 0x81800001
+#   # if [ $? -ne 0 ]; then
+#   # fi
+
+#   # primary.tr or 0x81000000 - the eviccontrol handle
+#   #echo ${KEY} | tpm2_create -u key.pub -r key.priv -C primary.tr -L policy.digest -i -
+#   echo ${KEY} | tpm2_create -u key.pub -r key.priv -C ${PRIMARY} -L policy.digest -i -
+
+#   # To delete:
+#   tpm2_evictcontrol -c ${HANDLE} || true
+
+#   #tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx -n key.name
+#   tpm2_load -C ${PRIMARY} -u key.pub -r key.priv -c key.ctx -n key.name
+#   tpm2_evictcontrol -c key.ctx ${TPM_KIND}
+
+#   tpm2_print -t TPMS_CONTEXT key.ctx # -> Handle: 0x80000000
+#   # persistent-handle: 0x81000001
+# }
+
+save_tpm_full() {
+  KEY=$1
   mkdir -p /initos/tpm
   cd /initos/tpm
   
   # Can be called multiple times, same result
-  tpm2_createpolicy --policy-pcr -l sha256:8 -L policy.digest
+  tpm2_createpolicy --policy-pcr -l sha256:7 -L policy.digest
 
   tpm2_getcap handles-persistent | grep -q 0x81800001
-  if [ $? -ne 0 ]; then
-  fi
+  # if [ $? -ne 0 ]; then
+  # fi
 
   # On Chromebook, only -C p works. On another laptop - default only (owner), -C e also works .
   tpm2_createprimary  -c primary.ctx --format=pem --output=primary_pub.pem
   tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
-  tpm2_evictcontrol -c primary.ctx -o primary.tr -C p # persistent-handle: 0x8100...0
+  
+  tpm2_evictcontrol -c primary.ctx -o primary.tr # -C p # persistent-handle: 0x8100...0
   tpm2 print -t ESYS_TR primary.tr
-  # primary.tr or 0x81000000 - the eviccontrol handle
-  echo ${PASSPHRASE} | tpm2_create -u key.pub -r key.priv -C primary.tr -L policy.digest -i -
+  
+  # To delete:
+  tpm2_evictcontrol -c 0x81000001
 
-  tpm2_evictcontrol -c primary.tr | true
-  # persistent-handle: 0x81000003
+  # primary.tr or 0x81000000 - the eviccontrol handle
+  #echo ${KEY} | tpm2_create -u key.pub -r key.priv -C primary.tr -L policy.digest -i -
+  echo ${KEY} | tpm2_create -u key.pub -r key.priv -C 0x81000000 -L policy.digest -i -
+
+  #tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx -n key.name
+  tpm2_load -C 0x81000000 -u key.pub -r key.priv -c key.ctx -n key.name
+  tpm2_evictcontrol -c key.ctx
+  tpm2_print -t TPMS_CONTEXT key.ctx # -> Handle: 0x80000000
+  # persistent-handle: 0x81000001
+}
+
+mok() {
+  mokutil --sb-state
+  mokutil --list-enrolled
+  mokutil --pk
+  mokutil --kek
+  mokutil --db
+  # Looks for /var/lib/sbctl/keys/db/db.key
+  # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
+
 
 }
 
 ## Save the LUKS password to TPM
 save_tpm_dbg() {
-  PASSPHRASE=$1
+  KEY=$1
 
     # Key will be disabled if ...
 
@@ -190,7 +295,7 @@ save_tpm_dbg() {
     # -u and -r seem to be used to allow the object to be moved to another TPM
     # -C context (parent object) - not sure how to list
     # -r and -u - where to store the output
-    echo ${PASSPHRASE} | tpm2_create -u key.pub -r key.priv -C 0x81800001 -L policy.digest -i -
+    echo ${KEY} | tpm2_create -u key.pub -r key.priv -C 0x81800001 -L policy.digest -i -
     # -C 0x81000000 also works as -C - from handles-persistent
     # -c key.ctx -> also load in the same step, but ChromeOS TPM doesn't support it
     # without -i creates an RSA public key

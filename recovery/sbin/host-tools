@@ -33,3 +33,19 @@ recovery() {
 find_installed_deb() {
   dpkg --get-selections | grep -v deinstall | cut -f1
 }
+
+get_firmware_info() {
+  # Get a list of all loaded modules
+  modules=$(lsmod | awk 'NR>1 {print $1}')
+
+  for module in $modules; do
+    modinfo_output=$(modinfo $module)
+
+    # Extract firmware information
+    firmware_lines=$(echo "$modinfo_output" | grep -i 'firmware:')
+
+    if [ -n "$firmware_lines" ]; then
+      echo $module "$firmware_lines"
+    fi
+  done
+}

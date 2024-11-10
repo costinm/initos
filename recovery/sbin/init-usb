@@ -21,25 +21,15 @@ export HASH_PREFIX=/boot/efi
 
 # Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
 # if we may skip that if the core modules are enough.
-initramfs_mods() {
+# 
+# Unlike 'init-secure', this also loads usb drivers - will look for USB recovery
+initramfs_mods_usb() {
   # For loading recovery from USB disk
   modprobe usbcore
   modprobe ehci-hcd
   modprobe ohci-hcd
   modprobe xhci-hcd
   modprobe usb-storage
-
-  modprobe scsi_mod
-  modprobe sd_mod
-
-  # for loading recovery
-  modprobe squashfs
-
-  # For veritysetup
-  modprobe loop
-  modprobe dm-verity
-
-  # btrfs, vfat are are normally present - but may be loaded if missing
 }
 
 
@@ -57,229 +47,121 @@ initramfs_mods() {
 # - recovery and boot partitions are mounted
 # -
 find_root() {
-  mkdir -p /sysroot
-
-  if [ -d /sysroot/sbin/etc ]; then
+  if [ -d /sysroot/etc ]; then
     return
   fi
+
 
   # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
   #  (opinionated partitioning, 1 is EFI)
   cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
   if [ -n "$cryptd" ]; then
-    # If 'c' - force manual unlock, otherwise go to recovery and wait for ssh to
-    # unlock
-    if [ "$MODE" = "c" ]; then
-      logv "Found LUKS device, not using TPM in insecure mode, console unlock: ${cryptd}"
-      cryptsetup luksOpen $cryptd c
-      if [ $? -eq 0 ]; then
-        mount_btrfs /dev/mapper/c
-        if [ $? -eq 0 ]; then
-          return
-        fi
-      fi
-    elif [ "$MODE" = "a" ]; then
-        echo "Before mount rootfs - exit the shell will mount recovery as rootfs if not mounted"
-        echo "Use /sbin/init-secure unlock_tpm ${cryptd} to use TPM"
-        busybox sh
-    else
-      unlock_tpm $cryptd
-      if [ $? -eq 0 ]; then
-        mount_btrfs /dev/mapper/c
-        if [ $? -eq 0 ]; then
-          logi "Rootfs mounted using TPM in insecure mode"
-          return
-        fi
-        logi "Failed to mount BTRFS root, fallback to recovery"
-      fi
-      logv "Found LUKS device, not using TPM in insecure mode: ${cryptd}"
-    fi
-  fi
+    mount_cryptd $crypted
+  else 
+    logi "No LUKS partition found - mounting plain text disk"
+    mkdir -p /x
+    mount -o bind /z /x
+    # This is called for LUKS after mounting /dev/mapper/c to /x
+    mount_rootfs
+  fi 
 
-
-  if [ -d /sysroot/sbin/etc ]; then
+  if [ -d /sysroot/etc ]; then
     echo "Using user mount sysroot."
     return
   fi
-
-  mount_recovery /boot/efi
-  if [ $? -eq 0 ]; then
-    return
-  fi
-}
-
-
-# Mount recovery using files in the EFI partition, mounted in /boot/efi
-#
-mount_recovery() {
-  dir=${1:-/boot/efi}
-
-  logi "Mounting recovery squash as rootfs"
-  mount -o bind /initos/recovery /sysroot
-
-  if [ -f ${dir}/local.tgz ]; then
-    tar -C /sysroot -xf ${dir}/local.tgz
-  fi
-
-  if [ -f ${dir}/wpa_supplicant.conf ]; then
-    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
-  fi
-  if [ -f ${dir}/interfaces ]; then
-    cp ${dir}/interfaces /sysroot/etc/network/interfaces
-  fi
-  if [ -f ${dir}/authorized_keys ]; then
-    # Bug in the sqfs TODO: remove
-    if [ -f /sysroot/root/.ssh ]; then
-      rm /sysroot/root/.ssh
-    fi
-    chown -R root /sysroot/root
-    mkdir -p /sysroot/root/.ssh
-    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
-  fi
-  if [ -d ${dir}/dropbear ]; then
-    cp -a ${dir}/dropbear /sysroot/etc
-  fi
-  if [ ! -f /sysroot/etc/resolv.conf ]; then
-    echo "nameserver 1.1.1.1" > /sysroot/etc/resolv.conf
-  fi
-
+  
+  # mount the recovery from the boot as rootfs
+  mount_recovery
+  
   chroot /sysroot passwd -d root
 
-  if [ "$MODE" = "s" ]; then
-    busybox sh
-  fi
+  echo "Done mounting recovery as sysroot "
 }
-
 
 # Main entry point - called by the init script
 initramfs_init() {
-  initramfs_1st
-  mount_proc
-
-  logi "Starting INITOS initramfs"
-
-  sysctl -w kernel.printk="2 4 1 7"
-
-  # Required on alpine kernel - without this there is no display
-  # Debian appears to have it compiled in the kernel.
-  modprobe -a simpledrm
-
-  # Save the current blkid - before loading the other modules
-  # This should show if any kernel modules are finding the root
-  logv ORIG_BLKID $(blkid)
-  logv ORIG_FS $(cat /proc/filesystems)
-
-  # Load a set of core modules we use
-  initramfs_mods
-
-  # Save the current blkid - before loading the other modules
-  logv Blocks after initramfs_mods $(blkid)
-
-  # Debug before searching for volumes
-  #busybox sh
-
-  # Attempt to find the root device - need to load modules and check blocks until
-  # we find the root we want.
-
-  udev_start
-
-  echo "Press 'r' for recovery (BTRFS_ROOT), 'a' for console. 'c' for manual LUKS. Default is LUKS if tpm2 is possible, recovery otherwise"
-  read -t 6 -n 1 key
-  export MODE=$key
-
-  udevadm settle
+  initramfs_common
 
   if [ "$MODE" = "a" ]; then
         busybox sh
         set -x
   fi
 
-  bootd=$(findfs LABEL=USB_BOOT)
+  #if [ "$MODE" = "u" ]; then
+    initramfs_mods_usb
+  #fi
+
+  bootd=$(findfs LABEL=USB_BOOT_BTRFS)
   if [ -n "$bootd" ]; then
-    # USB: images are under EFI partition
-    mount_disk $bootd vfat /boot/efi
-    mount_boot /boot/efi
-  else
-    # Separate boot and EFI partition on disk
+    mount_disk $bootd btrfs /z
+    mount_boot
+    logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
+  else 
+    # USB_BOOT disk not found - normal boot from hardware
     bootd=$(findfs LABEL=BOOT_BTRFS)
     if [ -n "$bootd" ]; then
-      mount_disk $bootd btrfs /boot
-      bootd=$(findfs LABEL=BOOT)
-      if [ -n "$bootd" ]; then
-        mount_disk $bootd vfat /boot/efi
-      fi
-      mount_boot /boot
+      mount_disk $bootd btrfs /z
+      mount_boot
+      logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
     else
-      # Only boot partition on disk - this case should be removed 
-      bootd=$(findfs LABEL=BOOT)
-      if [ -n "$bootd" ]; then
-        mount_disk $bootd vfat /boot/efi
-        mount_boot /boot/efi
-      fi
+      echo "BOOT_BTRFS partition not found"
+      busybox ash
+      return
     fi
   fi
 
-  # only in insecure mode - for secure it should be signed.
-  if [ -f /boot/efi/initos.env ]; then
-    . /boot/efi/initos.env
-  fi
-
-  echo "Boot, firmware, modules and recovery mounted"
-
-  mount
-  if [ "$MODE" = "a" ]; then
-    busybox ash
-  fi
-
-  udevadm trigger
+  echo "Boot, firmware, modules mounted"
 
   # this is normally done by sysinit - we want tpm2 to be loaded
   hwdrivers
 
+  logi "hwdrivers loaded" 
+
   udevadm trigger
   udevadm settle
 
-  echo "Drivers loaded - checking TPM and rootfs"
-  ls -l /dev/tpm*
-
-  host_files
-
-  # At this point we should have a tpm
-  find_root
+  if [ "${MODE}" = "r" ]; then
+    mount_recovery
+  else 
+    # At this point we should have a tpm
+    find_root
+  fi
 
   logi "Rootfs mounted, preparing to switch root"
-  mount
 
   # Only unsigned debug image
   if [ "$MODE" = "r" ] || [ "$MODE" = "a" ]; then
     logi "Run additional setup before - root is in /sysroot"
+    chroot /sysroot passwd -d root
     /bin/busybox sh
   fi
 
+  # Will be started again in sysroot
   udevadm control --exit || true
 
-  # In memory, not disk
   edump /sysroot/x/initos/log/boot
-
 
   move_mounted_to_sysroot
 
   logi "Switching root"
 
-  if [ "$key" = "s" ]; then
+  if [ "$MODE" = "s" ]; then
     exec switch_root /sysroot /bin/sh
-#  elif [ -f /sysroot/sbin/openrc-init ]; then
-#    # If .dockerenv is present - openrc will not run the 'sysinit' stage
-#    exec switch_root /sysroot /sbin/openrc-init
+  elif [ "$MODE" = "r" ]; then
+    logi "Start recovery image"
+    exec switch_root /sysroot /sbin/init-pod host
+  elif [ -f /sysroot/init ]; then
+    logi "Preparing to switch root - custom init"
+    exec switch_root /sysroot /init
   else
     exec switch_root /sysroot /sbin/init
   fi
+  lfatal "Failed to switch root"
 }
 
 if [ "$$" = "1" ]; then
   initramfs_init
 else
-  # Running as a script - from shell.
   $*
 fi
 

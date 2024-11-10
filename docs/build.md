@@ -25,6 +25,16 @@ image, and can be replicated in a container or host.
 
 ```
 
+Modern Dockerfiles allows caching - so full reproduction between 2 runs is not guaranteed anymore, and 
+it was wasteful anyways - a clean build (in a different volume) provides the same benefits. 
+
+A Dockerfile contains multiple 'stages', a stage can copy or mount files from a previous stage.
+Instead, each stage is a standalone 'run' operation, with mounted volumes.
+Instead of Dockerfile syntax, regular shell is used (or any other language).
+Images are pushed and manipulated with 'crane'.
+
+
+
 # Signing the EFI and adding root certs
 
 Best done on a separate, secure host capable of running docker:
@@ -36,7 +46,10 @@ The build is using containers and not using 'priviledged', but there are still r
 
 # Container-based
 
-Alternatively, step-by-step build by running the same scripts in a container/pod/VM/host:
+Alternatively, step-by-step build by running the same scripts in a container/pod/VM/host.
+
+I realized that I 'reinvented' buildah, but using docker for execution. I think this would also work with kubectl/Pods - and planning to 
+move to using actual buildah (but keep the wrappers and allow docker/k8s execution).
 
 ```shell
 
@@ -82,5 +95,20 @@ and containers - it also works with chroots for the most part, or any other cont
 `start-docker drun CMD` will run an ephemeral container for one build command - equivalent to a RUN in
 dockerfiles.
 
+# Buildah 
+
+Same model that I re-discovered. Using shell (or anything else) to start a container, copy 
+or mount files into the container, run commands and exporting images.
+
+More efficient and controllable than Dockerfiles, fewer layers - but in theory less isolation (same isolation if you choose to skip optimizations or do a clean build).
+
+Syntax is:
+
+- `buildah from --pull --name NAME -v VOL:MOUNT IMAGE`
+- `buildah commit --rm NAME [--squash] IMAGE`
+- buildah containers, images - list active
+- `buildah config --cmd CMD --entrypoint EP  -e KEY=VALUE -v VOLUME ... NAME`
+- `buildah copy NAME --from OTHERNAME src dst`
+-  `buildah mount` - mount the container to host
 
 

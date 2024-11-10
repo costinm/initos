@@ -7,7 +7,9 @@ SRCDIR=${SRCDIR:-/ws/initos}
 # When running in docker, this will be cached to /var/cache/apk/[INDEX] - which is a mounted dir.
 # /etc/apk/cache will cache the actual files
 
-install_recovery() {
+# Same as install, but will copy the current files from /ws/initos (SRCDIR) - 
+# suitable for running in container
+recovery() {
   cp -a ${SRCDIR}/recovery/sbin/* /sbin/
   cp -a ${SRCDIR}/recovery/etc/* /etc/
 #  cp -a ${SRCDIR}/recovery/home /
@@ -16,6 +18,7 @@ install_recovery() {
   install
 }
 
+# Default target for recovery in docker
 install() {
   alpine_add_common
   alpine_add_base
@@ -25,8 +28,7 @@ install() {
   #apk add openrc-init
 
   # Add the config files
-  cp -a -f ${SRCDIR}/recovery/etc/* /etc/
-
+  
   (cd /etc/init.d && ln -s agetty agetty.tty1)
   (cd /etc/init.d && ln -s agetty agetty.tty2)
   # Using busybox init
@@ -70,9 +72,10 @@ install() {
   rc-update add bootmisc boot
   rc-update add syslog boot
   rc-update add hwclock boot
-  rc-update add networking boot
 
-  rc-update add dropbear default
+  rc-update add networking default
+  rc-update add sshd default
+  #rc-update add dropbear default
   rc-update add udev-postmount default
 
 
@@ -114,14 +117,15 @@ alpine_add_common() {
 
 }
 
-# If starting with an alpine distro, add the packages we need.
+# Packages for building EFI, setting TPM2, syncing, install, etc.
 alpine_add_recovery() {
 
   apk add rsync
 
   apk add busybox-openrc
 
-  apk add dropbear dropbear-openrc
+  apk add openssh
+  # Alternative: dropbear dropbear-openrc
   apk add openssh-keygen
   # fsverity CLI
   #apk add fsverity-utils
@@ -275,26 +279,33 @@ alpine_add_base() {
   # Enable a system user to use login:
   #passwd -u build
   # Remove password: -d
-
 }
 
-ui() {
-  apk add bash bash-completion
-
-  apk add firefox-esr
+wui() {
   #  apk add mesa-dri-gallium
   setup-desktop sway
-  apk add kitty
   apk add rofi-wayland rofi-pass rofi-top
-  apk add chromium
 
+  # As root: start seatd
+  # make sure video, input groups match
   apk add seatd
+  apk add kitty
+}
 
+ui2() {
+  apk add bash bash-completion
 
-  #apk add i3wm dbus-x11
-  #apk add tint2 rofi alttab i3status
-  #apk add xorg-server
-  #apk add xinit
+  #apk add firefox-esr
+
+  apk add chromium
+}
+
+xui_alpine() {
+  apk add i3wm dbus-x11
+  apk add tint2 rofi alttab i3status
+  apk add xorg-server
+  apk add xinit
+  apk add kitty
 #  apk add xset
 #  apk add xrandr
 #  apk add xmodmap
@@ -302,5 +313,44 @@ ui() {
 #  apk add xhost
 #  apk add xkill
 }
+
+wui_start_root() {
+  chroot /x/alpine-ui
+  seatd &
+}
+
+# Downloads the linux (alpine).
+#
+# Very slow, installs a lot of firmware.
+# The kernel will be packed into the UKI by a separate step.
+#
+# Expects /lib/firmware, /lib/modules and /boot to be mounted to either a work dir
+# or /x/initos subvolumes
+#
+# The /boot dir on the container or real hosts will not have any of the files - they
+# are used to build the UKI in the EFI partition and modules/firmware go to different
+# subvolumes.
+linux_alpine() {
+  apk add linux-lts
+  apk add intel-ucode amd-ucode
+
+  KERNEL_VERSION=$(cat /usr/share/kernel/lts/kernel.release)
+
+  # This is the version that will be used in the UKI (can be changed)
+  # echo $KERNEL_VERSION > /boot/version
+
+  # Versioned name, matching the modules dir.
+  mv /boot/vmlinuz-lts /boot/vmlinuz-${KERNEL_VERSION}
+  ln -s /boot/vmlinuz-${KERNEL_VERSION}  /boot/vmlinuz
+
+  # For a VM using alpine kernel: 'linux-virt' package.
+
+  du -sh /lib/firmware
+  # Decompress all zst files.
+  (cd /lib/firmware; find . -name "*.zst" -exec zstd -d --rm -f {} \;  || true) 2>/dev/null
+  echo "Expanded zst"
+  du -sh /lib/firmware
+}
+
 
 $*

@@ -11,6 +11,8 @@ export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 # using EFI + Grub + Dracut/systemd
 
 ## First step - expand busybox and mount the basic filesystems
+# TODO: add timer to check if it's faster than having a volume
+# that already has the links created.
 initramfs_1st() {
 
   # No kernel options processed - we build intitramfs and cmdline in the same efi.
@@ -31,6 +33,8 @@ initramfs_1st() {
   # Spread out busybox symlinks and make them available without full path
   # This appears slightly faster than having the initramfs include all symlinks ?
   /bin/busybox --install -s
+
+  mkdir -p /sysroot /z /x /initos
 
   # Make sure /dev/null is a device node. If /dev/null does not exist yet, the command
   # mounting the devtmpfs will create it implicitly as an file with the "2>" redirection.
@@ -75,6 +79,42 @@ mount_proc() {
   mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
 }
 
+initramfs_common() {
+  initramfs_1st
+  mount_proc
+  cmdline /proc/cmdline
+
+  logi "Starting INITOS initramfs $(uname -r)"
+
+  sysctl -w kernel.printk="2 4 1 7"
+
+  # Required on alpine kernel - without this there is no display
+  # Debian appears to have it compiled in the kernel.
+  modprobe -a simpledrm
+
+  # Load a set of core modules we use
+  initramfs_mods
+
+  host_files
+
+  # Attempt to find the root device - need to load modules and check blocks until
+  # we find the root we want.
+  udev_start
+
+  echo "Press 'r' for recovery (BTRFS_ROOT)"
+  echo "      'c' for manual LUKS" 
+  echo "      'u' for using USB disk (USB_BTRFS_ROOT) for recovery" 
+  # Also: "a" for admin boot - will enable shells during init
+  # "s" for starting a shell in the rootfs. Both only in insecure mode.
+  read -t 4 -n 1 key
+  export MODE=$key
+
+  udevadm settle
+
+}
+
+# Mount a partition to a destination, creating the dir. For vfat also run a fsck
+# and remove remaining FSCK files after.
 mount_disk() {
   bootd=${1}
   boott=${2:-vfat}
@@ -91,24 +131,72 @@ mount_disk() {
     lfatal "Failed to mount $bootd partition"
   fi
   
-  rm ${dst}/FSCK*.REC || true
+  if [ "$boott" == "vfat" ] ; then
+    rm ${dst}/FSCK*.REC || true
+  fi
 }
 
-# Mount a boot disk - with recovery, firmware, modules, etc.
+
+# Load modules we may need - modules are also loaded if we get to udev
+# or nlplug-findfs, but we may skip that if the core modules are enough.
+initramfs_mods() {
+  # Not including USB drivers.
+
+  modprobe scsi_mod
+  # Support scsi disks - needed for sata ?
+  modprobe sd_mod
+
+  # nvme appears to be linked in both deb and alpine
+
+  # for loading recovery, modules, firmware
+  modprobe squashfs
+  modprobe loop
+  modprobe dm-verity
+  # btrfs, vfat are are normally present - but may be loaded if missing
+
+}
+
+# Mount the boot disk - with recovery, firmware, modules, etc.
 # Each component is a separate unionfs.
 mount_boot() {
-  local dir=${1:-/boot/efi}
+  local dir=${1:-/z/initos/img}
+
   # It would be tempting to add persistent overlay here and make the root
   # modifiable - but that breaks the security model, we can't verify the overlay.
   # For any configs, certs, etc - we can add them to the UKI or rebuild.
-  mkdir /initos
+  mkdir -p /initos /z/initos/log
   mount -t tmpfs root-tmpfs /initos
 
-  # From alpine original script
   mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
   logi "Mounting boot partition, signatures"
 
-  mount_verity recovery /initos/recovery ${dir}
+  #mount_verity recovery /initos/recovery ${dir}
+
+  if [ -f ${dir}/firmware.sqfs ]; then
+    mkdir -p /lib/firmware
+    mount_verity firmware /lib/firmware ${dir}
+  fi
+
+  ver=$(uname -r)
+  if [ -f ${dir}/modules-${ver}.sqfs ]; then
+    mkdir -p /lib/modules/${ver}
+    mount_verity modules-${ver} /lib/modules/${ver} ${dir}
+  fi
+}
+
+mount_boot_persistent() {
+  local dir=${1:-/z/initos/img}
+
+  # It would be tempting to add persistent overlay here and make the root
+  # modifiable - but that breaks the security model, we can't verify the overlay.
+  # For any configs, certs, etc - we can add them to the UKI or rebuild.
+  mkdir -p /initos /z/initos/log
+  mount -o bind /z/initos /initos
+
+  mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
+  logi "Mounting persistent boot partition"
+
+  #mount_verity recovery /initos/recovery ${dir}
 
   if [ -f ${dir}/firmware.sqfs ]; then
     mkdir -p /lib/firmware
@@ -123,6 +211,39 @@ mount_boot() {
 }
 
 
+# Mount recovery using the signed image
+# Few untrusted files will be added for networking, from the non-encrypted disk.
+# Keep the ssh keys separate from the ones in the encrypted disk.
+mount_recovery() {
+  dir=${1:-/z/initos/insecure}
+
+  logi "Mounting recovery squash as rootfs"
+  mount_verity recovery /sysroot /z/initos/img
+  #mount -o bind /initos/recovery /sysroot
+
+  if [ -f ${dir}/interfaces ]; then
+    cp ${dir}/interfaces /sysroot/etc/network/interfaces
+  fi
+  if [ -d ${dir}/ssh ]; then
+    cp -a ${dir}/ssh /sysroot/etc
+  fi
+
+  rm -f /sysroot/.dockerenv
+  
+  # TODO: from boot partition !
+  if [ -f ${dir}/authorized_keys ]; then
+    mkdir -p /sysroot/root/.ssh
+    chown -R root /sysroot/root
+
+    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
+  fi
+  if [ -f ${dir}/wpa_supplicant.conf ]; then
+    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
+  fi
+  if [ ! -f /sysroot/etc/resolv.conf ]; then
+    echo "nameserver 1.1.1.1" > /sysroot/etc/resolv.conf
+  fi
+}
 
 # All remaining mounted dirs will be moved under same dir in /sysroot,
 # ready to switch_root
@@ -147,7 +268,7 @@ logi() {
 	last_emsg="$*"
 	echo "INITOS: $last_emsg..." > /dev/kmsg
 
-	echo -n "$last_emsg"
+	echo "$last_emsg\n"
 }
 
 # Verbose log - saved but not shown on console
@@ -163,7 +284,7 @@ lfatal() {
   edump
 
   if [ "${INIT_OS}" = "secure" ]; then
-    sleep 5
+    sleep 10
     reboot -f
   fi
   busybox ash
@@ -174,20 +295,20 @@ lfatal() {
 # install state will be saved on the USB disk.
 # Log destinations:
 # - before 'boot' is mounted: in memory, console on failure to mount boot
-# - after 'boot' is mounted: /boot/efi/TMPDIR on failure, recovery /var/log/boot
+# - after 'boot' is mounted: /z/initos/log on failure, recovery /var/log/boot
 # - after 'rootfs' is mounted, on tmpfs if it works, /boot/efi if not.
 #
 # All 'fatal' logs go to /boot/efi if it is mounted.
 edump() {
-  local dst=${1:-/boot/efi}
+  local dst=${1:-/z/initos/log/${MAC}}
 
-  if [ ! -d /boot/efi/EFI ]; then
-    echo $LOG_V
+  if [ ! -e /z/initos ]; then
+    echo "Boot disk not found"
     return
   fi
 
   # current date and time
-  export LOG_DIR=${dst}/logs/$(date +"%Y-%m-%d-%H-%M-%S")
+  export LOG_DIR=${dst}/$(date +"%Y-%m-%d-%H-%M-%S")
   mkdir -p ${LOG_DIR}
 
   echo $LOG_V > ${LOG_DIR}/logv
@@ -216,7 +337,7 @@ unlock_tpm() {
   fi
 
   # Arch recommends: 1,2,5,7 ( firmware, firmware options, GPT layout, secure boot status)
-  PCRS="0,1,7"
+  #PCRS="0,1,7"
   # 2 = pluggable executable code
   # 3 = pluggable firmware data
   # 4 = boot manager code
@@ -228,8 +349,29 @@ unlock_tpm() {
   # list nv persistent and try all.
 
   #export TPM2TOOLS_TCTI="device:/dev/tpm0"
-  PASSPHRASE=$(tpm2_unseal -c 0x81800000 -p pcr:sha256:0,1,2,3)
-  PASSPHRASE2=$(tpm2_unseal -c 0x81800002 -p pcr:sha256:8)
+  HANDLES=$(tpm2_getcap handles-persistent)
+  logi "Persistent handles $HANDLES" 
+
+  handle=0x81000001
+  if [ -f /z/initos/luks.handle ]; then
+    handle=$(cat /z/initos/luks.handle)
+  fi
+  
+  set +x
+  PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7)
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle:7 failed, try L8" 
+    PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8)
+  fi 
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle:8 failed, try 8100..2" 
+    PASSPHRASE=$(tpm2_unseal -c 0x81000002 -p pcr:sha256:7)
+  fi 
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle:8 failed, try 8100..2" 
+    PASSPHRASE=$(tpm2_unseal -c 0x81800001 -p pcr:sha256:7)
+  fi 
+  
   echo -n "$PASSPHRASE" | cryptsetup open $part c -
 }
 
@@ -240,15 +382,19 @@ unlock_tpm() {
 mount_verity() {
   local name=$1
   local dst=$2
-  local dir=${3:-/boot/efi}
+  local dir=${3:-/z/initos/img}
 
+  # TODO: move it all to /var/lib/initos/ and /opt/initos
   mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name}
 
+  # TODO: the hash should be in same dir with the file, but also 
+  # add a signature. And make it hidden.
   HASH_DIR=${HASH_DIR:-${dir}}
   
   # For SECURE, use /boot/hash.${name} which is signed. For insecure - it is only
   # used to verify integrity, not authenticity.
-  veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity $(cat ${HASH_DIR}/hash.${name})
+  veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity \
+      $(cat ${HASH_DIR}/hash.${name})
   if [ $? -ne 0 ]; then
      logi "Error: Failed to mount ${name} - verity integrity or missing files"
      lfatal "Error: Failed to mount ${name}"
@@ -282,6 +428,39 @@ mount_overlay() {
   fi
 }
 
+# Unlock a LUKS partition.
+# This may need to be changed to unlock multiple partitions, and do a btrfs 
+# scan to find fs that span multiple disks
+mount_cryptd() {
+  local crypted=$1
+  
+  echo "Found LUKS device: ${cryptd}"
+  
+  unlock_tpm $cryptd
+  if [ $? -eq 0 ]; then
+    logi "TPM unlocked, mounting btrfs on /x"
+    mount_btrfs /dev/mapper/c
+    if [ $? -eq 0 ]; then
+        logi "BTRFS mounted"
+        return
+    fi
+  fi
+
+  if [ "$MODE" = "c" ]; then
+    logi "Found LUKS device, TPM failed, console unlock: ${cryptd}"
+    cryptsetup luksOpen $cryptd c
+    if [ $? -eq 0 ]; then
+      logi "Manual LUKS worked, mounting" 
+      mount_btrfs /dev/mapper/c
+      if [ $? -eq 0 ]; then
+        logi "BTRFS mounted using user key"
+        return
+      fi
+    fi
+  fi
+  logi "Can't open or mount LUKS, will fallback to recovery"
+}
+
 
 # Mount a BTRFS subvolume as /sysroot - ready for the switch root
 #
@@ -292,14 +471,17 @@ mount_btrfs() {
 
   # Mount the root device. It is expected that modules, firmware are present and updated.
   mkdir -p /sysroot /x
+
   mount -t btrfs "${root_device}" /x
   if [ $? -ne 0 ]; then
       logi "Error: Failed to mount BTRFS partition"
       return 1
-    fi
+  fi
+  mount_rootfs
+}
 
-  INITOS_ROOT=${INITOS_ROOT:-initos/recovery}
-
+mount_rootfs() {
+  root_device=${1:-/dev/mapper/c}
   if [ ! -d /x/vol ]; then
     btrfs subvol create /x/vol
   fi
@@ -315,7 +497,9 @@ mount_btrfs() {
 
   if [ -f /x/initos/initos.env ]; then
     . /x/initos/initos.env
-  else
+  fi
+
+  if [ -z $INITOS_ROOT ]; then
     if [ -d "/x/@" ]; then
       INITOS_ROOT="@"
     fi
@@ -487,14 +671,6 @@ host_files() {
 
   MAC=${MAC//:/-}
 
-  mkdir -p /boot/efi/${MAC}
-  if [ -f /boot/efi/${MAC}/initos.env ]; then
-    . /boot/efi/${MAC}/initos.env
-  fi
-
-  if [ -f /boot/efi/${MAC}/hostname ]; then
-    hostname $(cat /boot/efi/${MAC}/hostname)
-  fi
 }
 
 # Verify the signature of a file using a public key.

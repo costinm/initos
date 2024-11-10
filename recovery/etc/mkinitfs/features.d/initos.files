@@ -1,4 +1,4 @@
-/sbin/setup-initios
+/sbin/setup-initos
 /sbin/init-*
 /sbin/initos-*
 /boot/hash*

@@ -1,19 +1,16 @@
 #!/bin/bash
 
 # Functions to run various things at 'pod' startup ( or docker image, VM)
-# Expects tini (for zombies).
+# Expects tini (for zombies) and checks for different apps presence in the image.
 #
 # For 'dev' pods, detects if vncserver is installed - and starts it if it is. Same for CRD.
 # Pods are expected to use debian or ubuntu rootfs.
 
 APPS_DIR=/x/sync/app
+USERNAME=${USERNAME:-build}
 
 set -eo pipefail
-
 # set -u is for unbound variables 
-
-USERNAME=${USERNAME:-build}
-export REMOTE_DESKTOP=${REMOTE_DESKTOP:-crd}
 
 function start_x() {
   if [ -f /etc/init.d/dbus ]; then
@@ -30,7 +27,7 @@ function start_x() {
     /etc/init.d/chrome-remote-desktop start
   elif [ -f /usr/bin/kasmvncserver ]; then
     if [ -f /dev/dri/renderD128  ] ; then
-     sudo -u ${USERNAME} vncserver -hw3d -drinode /dev/dri/renderD128
+      sudo -u ${USERNAME} vncserver -hw3d -drinode /dev/dri/renderD128
     else
       sudo -u ${USERNAME} vncserver
     fi 
@@ -142,6 +139,11 @@ function start_as_root() {
 
   # Base image should have build user, as UID 1000
   id ${USERNAME} ||     add_main_user
+
+  #sudo chmod 4755 /opt/google/chrome/chrome-sandbox || true
+  # usermod -G chrome-remote-desktop ${u} || true
+  # # If the base image has docker
+  # usermod -G docker ${u} || true
   
   if [ -f /var/run/docker.sock ]; then
     echo Detected host docker - adding user
@@ -199,13 +201,32 @@ function pod() {
   exec sleep infinity
 }
 
-# Startup script for a VM - at this point the init has loaded the modules, pivot root.
+# Startup script for a VM - at this point the init has loaded the modules, 
+# pivot root has been called.
 # 
 function vm() {
   hostname $(cat /etc/hostname)
   ifup -a
   /etc/init.d/ssh start
   pod
+}
+
+function host() {
+    /sbin/openrc sysinit
+    /sbin/openrc boot
+    # Normall init starts this with 'wait'
+    /sbin/openrc default
+
+    ifconfig -a
+    echo /etc/ssh/*.pub
+    # TODO: REMOVE BEFORE RELEASE 
+    busybox ash
+
+    tini -s sleep -- infinity &
+
+    busybox ash
+    sleep -- infinity
+
 }
 
 if [ -z ${1+x} ] ; then

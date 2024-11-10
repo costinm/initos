@@ -1,19 +1,15 @@
 #!/bin/sh
 
-# Start a docker container, with a set of mounted volumes for development, build or to run services.
-# This provides an alternative to Dockerfile - with more flexibility and performance, but without the
-# 'remote execution' features.
+# Start a docker container, with a set of mounted volumes for development, build 
+# or to run services.
 # 
-# Modern Dockerfiles allows caching - so full reproduction between 2 runs is not guaranteed anymore, and 
-# it was wasteful anyways - a clean build (in a different volume) provides the same benefits. 
+# This is an 'opinionated' wrapper:
+# - containers in /x/vol/NAME
+# - a simpler config - start.env, /x/initos/conf/start.env
+# - if ./rootfs/ is present - ???
 # 
-# A Dockerfile contains multiple 'stages', a stage can copy or mount files from a previous stage.
-# Instead, each stage is a standalone 'run' operation, with mounted volumes.
-# Instead of Dockerfile syntax, regular shell is used (or any other language).
-# Images are pushed and manipulated with 'crane'.
-#
 # Environment:
-#   NAME - pod name - defaults to current working directory basename.
+#   NAME - pod name - defaults to working directory basename.
 #   TAG - defaults to 'latest'
 #   REPO - base repository, NAME:TAG will be added
 #   IMAGE - final image, defaults to REPO/NAME:TAG
@@ -32,10 +28,12 @@
 # For clean build - remove the container and work directory.
 # Different builds can run in parallel, with different work dirs and containers.
 #
-# Using 2 modes: dstart is running like a pod, followed by dexec
-# This mode is very flexible and also works with pods and VMs.
+# Using 2 modes: start is running like a pod, followed by exec
+# or 'run'. This mode is very flexible and also works with 
+# pods and VMs.
 #
-# drun is running an ephemeral container for each command and removes it after.
+# drun is running an ephemeral container for each command.
+# (removes it after).
 # It is less flexibile but simpler.
 
 

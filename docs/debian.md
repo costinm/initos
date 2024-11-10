@@ -18,7 +18,7 @@ Also useful: remove journamd, use busybox syslogd with circular buffer.
 
 Wifi:
 systemctl enable wpa_supplicant@wlan0.service
-
+cp /z/initos/insecure/wpa_supplicant.conf wpa_supplicant-wlan0.conf
 
 # In a VM
 

@@ -4,35 +4,15 @@
 # - look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
 # - fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
 
-
+# Override settings in init-common
 export INIT_OS=secure
 export HASH_PREFIX=/boot
 
 . /sbin/init-common.sh
 
-
-# Load modules we may need - modules are also loaded if we get to udev
-# or nlplug-findfs, but we may skip that if the core modules are enough.
-initramfs_mods() {
-  # Not including USB drivers.
-
-  modprobe scsi_mod
-  # Support scsi disks - needed for sata ?
-  modprobe sd_mod
-
-  # for loading recovery
-  modprobe squashfs
-
-  modprobe loop
-  modprobe dm-verity
-  #v "$(lsmod)"
-}
-
 # Logic to find an mount the root device.
 # For secure mode, expect a LUKS device.
-find_and_mount_root() {
-  mkdir -p /sysroot
-
+find_root() {
   if [ -d /sysroot/etc ]; then
     return
   fi
@@ -41,144 +21,70 @@ find_and_mount_root() {
   #  (opinionated partitioning, 1 is EFI)
   cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
   if [ -n "$cryptd" ]; then
-    echo "Found LUKS device: ${cryptd}"
-    unlock_tpm $cryptd
-    if [ $? -eq 0 ]; then
-      mount_btrfs /dev/mapper/c
-      if [ $? -eq 0 ]; then
-          return
-      fi
-      logi "Failed to mount BTRFS root, fallback to recovery"
-      busybox ash
-    fi
-    logi "Failed to unlock encrypted disk with TPM, fallback to recovery"
-    logi " cryptsetup open ${cryptd} c"
-    logi " /init mount_btrfs"
-    busybox ash
-  else
-    if [ "$MODE" = "c" ]; then
-      logv "Found LUKS device, TPM failed, console unlock: ${cryptd}"
-      cryptsetup luksOpen $cryptd c
-      if [ $? -eq 0 ]; then
-        mount_btrfs /dev/mapper/c
-        if [ $? -eq 0 ]; then
-          return
-        fi
-    fi
-    logi "No LUKS volume found, fallback to recovery"
-    #busybox ash
+    logi Attempting to mount LUKS $cryptd
+    mount_cryptd $cryptd
+  else 
+    logi "No LUKS partition found - mounting plain text disk"
+    mkdir -p /x /sysroot
+    mount -o bind /z /x
+    # This is called for LUKS after mounting /dev/mapper/c to /x
+    mount_rootfs
   fi
 
-  # No point to have an option to ask for console key - we'll boot to recovery
-  # and wait for SSH or login and enter the key.
-}
+  if [ -d /sysroot/etc ]; then
+    return
+  fi  
+  
+  logi "Failed to open existing disk,fallback to recovery (secure)"
 
-recovery_rootfs() {
-  echo RECOVERY ROOT
-  #busybox ash
-  mount_recovery /boot
+  mount_recovery
   if [ $? -eq 0 ]; then
+    logi "Recovery mounted"
+    export MODE=r
+    # TODO: REMOVE BEFORE RELEASE 
+    #busybox ash
     return
   fi
   lfatal "Failed to mount recovery"
 }
 
 
-# Mount recovery using files in the EFI partition, mounted in /boot/efi
-#
-mount_recovery() {
-  dir=${1:-/boot}
-
-  logi "Mounting recovery squash as rootfs"
-  mount -o bind /initos/recovery /sysroot
-
-  if [ -f ${dir}/interfaces ]; then
-    cp ${dir}/interfaces /sysroot/etc/network/interfaces
-  fi
-  if [ -d ${dir}/dropbear ]; then
-    cp -a ${dir}/dropbear /sysroot/etc
-  fi
-
-  # TODO: from boot partition !
-  if [ -f ${dir}/authorized_keys ]; then
-    mkdir -p /sysroot/root/.ssh
-    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
-  fi
-  if [ -f ${dir}/wpa_supplicant.conf ]; then
-    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
-  fi
-}
-
 # Main entry point - called by the init script
 initramfs_init() {
-  initramfs_1st
-  mount_proc
-
-  logi "Starting INITOS initramfs secure $(uname -r)"
-
-  # TODO: wrong location - for some reason doesn't show up in boot
-  logv "Files on boot: " $(ls -l /boot)
-
-  # Required - without this there is no display
-  modprobe -a simpledrm
-
-  # Save the current blkid - before loading the other modules
-  # This should show if any kernel modules are finding the root
-  logv BLKID at boot: $(blkid)
-  logv FS at boot: $(cat /proc/filesystems)
-
-
-  # Load a set of core modules we use
-  initramfs_mods
-
-  # Save the current blkid - before loading the other modules
-  logv BLKID after initramfs mods: $(blkid)
-
-  # Attempt to find the root device - need to load modules and check blocks until
-  # we find the root we want.
-  udev_start
-
-  echo "Press 'r' for recovery (BTRFS_ROOT), 'c' for manual LUKS. Default is LUKS if tpm2 is possible, recovery otherwise"
-  read -t 3 -n 1 key
-
-  udevadm settle
-
-  set -x # For debugging - may be removed later, but useful to see what is happening.
+  initramfs_common
 
   bootd=$(findfs LABEL=BOOT_BTRFS)
   if [ -n "$bootd" ]; then
-    mount_disk $bootd btrfs /boot
-    mount_boot /boot
-
-    bootd=$(findfs LABEL=BOOT)
-    if [ -n "$bootd" ]; then
-      mount_disk $bootd vfat /boot/efi
-    fi
+    mount_disk $bootd btrfs /z
+    mount_boot
+    logi "Boot BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
   else 
-    # Will go away - only use the NVME.
-    bootd=$(findfs LABEL=BOOT)
-    if [ -n "$bootd" ]; then
-      mount_disk $bootd vfat /boot/efi
-    fi
-    mount_boot /boot/efi
+    lfatal "BOOT_BTRFS partition not found"
   fi
 
-  logi "Recovery,modules,firmware mounted $(cat /proc/uptime)"
+  logi "modules & firmware mounted"
 
   # this is normally done by sysinit - we want tpm2 to be loaded
   # Needs to happen after full firmware and modules are in place
-  hwdrivers
+  hwdrivers > /z/initos/log/hwdrivers.log 2>&1
+
+  logi "hwdrivers loaded" 
 
   udevadm trigger
   udevadm settle
+  
+  hwdrivers  /hwdrivers2.log 2>&1 # TPM seems to need some time to init
 
-  logv BLKID after hwdrivers $(blkid)
-
-  find_and_mount_root
-
-  if [ ! -d /sysroot/etc ]; then
-    recovery_rootfs
+  if [ "${MODE}" = "r" ]; then
+    mount_recovery
+  else 
+    # At this point we should have a tpm
+    find_root
   fi
+
+  logi "Rootfs mounted"
+
+  #set -x # For debugging - may be removed later, but useful to see what is happening.
 
   udevadm control --exit || true
 
@@ -187,11 +93,15 @@ initramfs_init() {
 
   move_mounted_to_sysroot
 
-  logi "Root mounted $(cat /proc/uptime)"
-
-  if [ -f /sysroot/sbin/openrc-init ]; then
-    exec switch_root /sysroot /sbin/openrc-init
+  if [ "$MODE" = "r" ]; then
+    logi "Start recovery image"
+    #busybox ash
+    exec switch_root /sysroot /sbin/init-pod host
+  elif [ -f /sysroot/init ]; then
+    logi "Preparing to switch root - custom init"
+    exec switch_root /sysroot /init
   else
+    logi "Preparing to switch root"
     exec switch_root /sysroot /sbin/init
   fi
   lfatal "Failed to switch root"

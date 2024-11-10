@@ -12,7 +12,6 @@
 # That means downloading the release into /opt/APP or 
 # /x/sync/app/bin (also mounted to /opt/bin )
 
-APPS_DIR=/x/sync/app
 
 set -euo pipefail
 
@@ -20,37 +19,32 @@ set -euo pipefail
 # running as a custom username.
 USERNAME=${USERNAME:-build}
 
-export REMOTE_DESKTOP=${REMOTE_DESKTOP:-kasm}
-
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
 
-# Run inside a docker image, installing the stages specified via command line.
-function docker_build() {
-  
-  apt update
-# Template home directory.
-   mkdir -p /home/log
-   mkdir -p /work
-   mkdir -p /x
+# Users built into the docker image. 
+add_base_users() {
+  local u=${USERNAME:-build}
+  local h=${USER_HOME:-/x/home/${u}}
 
-  # Iterate over the command line parameters
-  for stage in "$@"; do
-    echo Stage: $stage
-#    df > /home/log/df-before-${stage}.log
-#    dpkg -l > /home/log/pkg-before-${stage}.log
-#
-     $stage
-#
-#    df > /home/log/df-after-${stage}.log
-#    dpkg -l > /home/log/dpkg-after-${stage}.log
-  done
+  # Template home directory.
+  mkdir -p /home/log
+  mkdir -p /work
+  mkdir -p /x/home
 
-  apt clean
+  # For ubuntu based images - there is a default user with 1000
+  (userdel ubuntu || true)
+
+  useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
+         -d ${h} ${USERNAME}
+  mkdir -p ${h}
+  chown ${u} ${h}
+
+  usermod -p '*' ${USERNAME}
 }
 
+stage() {
 
-function docker_run_install() {
   local stage=$1
   mkdir -p /home/log
 
@@ -61,24 +55,18 @@ function docker_run_install() {
   echo Stage: $stage
 
   $stage
+  
   apt clean
 
   df > /home/log/df-after-${stage}.log
   dpkg -l > /home/log/dpkg-after-${stage}.log
 }
 
-
 function add_tools() {
-  echo "Adding common debug tools and home"
-  
   local u=${USERNAME:-build}
 
-  # Template home directory.
-   mkdir -p /home/log
-   mkdir -p /work
-   mkdir -p /x
-
-  add_base_users
+  echo "Adding common debug tools and home"
+  
 
   # fuser3, sshfs: to mount remote sshd volumes with FUSE (And others)
   # dnsutils, net-tools, tcpdump, iptables, iproute2, netcad-openbsd - network debugging
@@ -106,7 +94,7 @@ function add_tools() {
 
    # Gnupg - 19M, required for installing CRD
    # mc - 2M
-    $APTINSTALL \
+  $APTINSTALL \
           net-tools \
           lsof \
          tcpdump \
@@ -115,6 +103,10 @@ function add_tools() {
 
     echo Y | $APTINSTALL sudo
 
+    # SECURITY: sudo without password, for the admin or 'main' user.
+    # Image runs in containers, with the user accessed using SSH keys.
+    # We need a way to run commands as root - this is better than setting 
+    # a root password or running stuff as root directly.
 
     echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
      
@@ -128,18 +120,18 @@ function add_tools() {
     $APTINSTALL    ca-certificates
 
 
-    mkdir -p /opt/busybox/bin
-    $APTINSTALL   busybox
+  mkdir -p /opt/busybox/bin
+  $APTINSTALL   busybox
 
-   busybox --install /opt/busybox/bin
-   # Problems with chrome remote desktop
-   rm -f /usr/local/bin/run-parts || true 
-   rm -f /usr/local/bin/dpkg || true 
+  busybox --install /opt/busybox/bin
+  # Problems with chrome remote desktop
+  rm -f /usr/local/bin/run-parts || true 
+  rm -f /usr/local/bin/dpkg || true 
 
-    $APTINSTALL       openssh-server
-    # That's why deb/rpm is really bad for containers (and more) - 
-    # there is an install script that creates keys that would be distributed.
-    rm /etc/ssh/ssh_host_*
+  $APTINSTALL       openssh-server
+  # That's why deb/rpm is really bad for containers (and more) - 
+  # there is an install script that creates keys that would be distributed.
+  rm /etc/ssh/ssh_host_*
 
   echo Y | apt remove git || true
   # Istio base image has git messed up
@@ -156,119 +148,6 @@ function add_tools() {
 
   # TODO: have an admin user installed ? 
   # admin, UID=99, sudoers  
-
-}
-
-
-function add_ui() {
-  # i3 based UI.
-  # Alternatives: openbox, sway
-
-  # 219M on top of istio image. Includes x11-common but not xorg
-  $APTINSTALL  \
-           i3 dbus-x11 desktop-base libdbus-glib-1-2 \
-          kitty i3status rofi tint2 alttab
-
-  echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
-
-}
-
-
-function add_cinnamon() {
-# 496M
-  DEBIAN_FRONTEND=noninteractive \
-  apt install --assume-yes --no-install-recommends \
-     cinnamon-core dbus-x11 desktop-base xterm && \
-     apt-get clean && \
-      bash -c 'echo "exec /etc/X11/Xsession /usr/bin/cinnamon-session-cinnamon2d" > /etc/chrome-remote-desktop-session'
-
-}
-
-# Kasm 
-function add_kasm_ubuntu() {
-  add_kasm jammy
-}
-
-function add_kasm() {
-  KASM_VER=${KASM_VER:-1.3.1}
-
-  local DIST=${1:-bookworm}
-
-  # 220M
-  curl -fsSL -o /tmp/kasmvnc.deb \
-    https://github.com/kasmtech/KasmVNC/releases/download/v${KASM_VER}/kasmvncserver_${DIST}_${KASM_VER}_amd64.deb
-
-  $APTINSTALL /tmp/kasmvnc.deb
-  $APTINSTALL libdatetime-perl  
-  rm /tmp/kasmvnc.deb
-
-  # last release: 2010
-  # openbox
-  $APTINSTALL   i3 dbus-x11 desktop-base libdbus-glib-1-2 \
-          kitty i3status rofi tint2
-  
-  # For code: 
-  # 12M gtk
-  $APTINSTALL libnss3 libatk1.0-0 libatk-bridge2.0-0
-  # Not in ubuntu libgtk3-0
-  
-  # obconf: +65M
-  # obkey - key config 
-
-  # tint2
-
-  # fluxbox is similar - 2015 last release
-  # i3 +10M
-
-  # eterm: 1.3M, but can't find font
-  # xfce4-terminal: +74M
-  # kitty: 16M
-   
-}
-
-function add_crd() {
-  # i3 based UI.
-  # Alternatives: openbox, sway
-
-  # 219M on top of istio image. Includes x11-common but not xorg
-  DEBIAN_FRONTEND=noninteractive \
-        apt install --assume-yes --no-install-recommends \
-           i3 dbus-x11 desktop-base libdbus-glib-1-2 \
-          kitty i3status rofi tint2
-  # org.gnome.Mutter.DisplayConfig is also used - to get current display configuration
-  
-  echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
-
-   curl  https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb -o crd.deb
-   # 47M on top of UI, includes xserver-xorg-video-dummy, xvfb
-   DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends ./crd.deb
-
-    rm crd.deb
-
-    # gsettings-desktop-schemas: required by chrome remote desktop
-    DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
-       gsettings-desktop-schemas
-}
-
-
-##### Dev tools #####
-
-function add_android() {
-  GRADLE_VERSION=2.9
-  cd /usr/local/ && curl -L -O http://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-all.zip \
-    && unzip -o gradle-${GRADLE_VERSION}-all.zip && rm /usr/local/gradle-${GRADLE_VERSION}-all.zip
-
-
-#  # Environment variables
-#  #ENV ANDROID_NDK_HOME /usr/local/android-ndk-r9b
-#  ENV ANT_HOME /usr/local/apache-ant-${ANT_VERSION}
-#  # ENV MAVEN_HOME /usr/local/apache-maven-3.1.1
-#  ENV GRADLE_HOME /usr/local/gradle-${GRADLE_VERSION}
-#  #ENV PATH $PATH:$ANDROID_NDK_HOME
-#  ENV PATH $PATH:$ANT_HOME/bin
-#  # ENV PATH $PATH:$MAVEN_HOME/bin
-#  ENV PATH $PATH:$GRADLE_HOME/bin
-
 }
 
 function add_firefox() {
@@ -308,8 +187,113 @@ function add_code() {
   apt-get install --assume-yes --no-install-recommends    code
 }
 
+
+function add_ui() {
+  # i3 based UI.
+  # Alternatives: openbox, sway
+
+  # last release: 2010: openbox
+  # fluxbox is similar - 2015 last release
+  
+  # obconf: +65M
+  # obkey - key config 
+
+  # i3 +10M
+
+  # eterm: 1.3M, but can't find font
+  # xfce4-terminal: +74M
+  # kitty: 16M
+
+  # 219M on top of istio image. Includes x11-common but not xorg
+  $APTINSTALL  \
+           i3 dbus-x11 desktop-base libdbus-glib-1-2 \
+          kitty i3status rofi tint2 alttab
+  # For code: 
+  # 12M gtk
+  $APTINSTALL libnss3 libatk1.0-0 libatk-bridge2.0-0
+
+  echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+}
+
+
+# function add_cinnamon() {
+# # 496M
+#   DEBIAN_FRONTEND=noninteractive \
+#   apt install --assume-yes --no-install-recommends \
+#      cinnamon-core dbus-x11 desktop-base && \
+#      apt-get clean && \
+#       bash -c 'echo "exec /etc/X11/Xsession /usr/bin/cinnamon-session-cinnamon2d" > /etc/chrome-remote-desktop-session'
+# }
+
+# Kasm 
+# function add_kasm_ubuntu() {
+#   add_kasm jammy
+# }
+
+function add_kasm() {
+  KASM_VER=${KASM_VER:-1.3.3}
+
+  local DIST=${1:-bookworm}
+
+  # 220M
+  curl -fsSL -o /tmp/kasmvnc.deb \
+    https://github.com/kasmtech/KasmVNC/releases/download/v${KASM_VER}/kasmvncserver_${DIST}_${KASM_VER}_amd64.deb
+
+  $APTINSTALL /tmp/kasmvnc.deb
+  $APTINSTALL libdatetime-perl  
+  rm /tmp/kasmvnc.deb
+
+  add_ui   
+}
+
+# function add_crd() {
+#   # i3 based UI.
+#   # Alternatives: openbox, sway
+
+#   # 219M on top of istio image. Includes x11-common but not xorg
+#   DEBIAN_FRONTEND=noninteractive \
+#         apt install --assume-yes --no-install-recommends \
+#            i3 dbus-x11 desktop-base libdbus-glib-1-2 \
+#           kitty i3status rofi tint2
+#   # org.gnome.Mutter.DisplayConfig is also used - to get current display configuration
+  
+#   echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+
+#    curl  https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb -o crd.deb
+#    # 47M on top of UI, includes xserver-xorg-video-dummy, xvfb
+#    DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends ./crd.deb
+
+#     rm crd.deb
+
+#     # gsettings-desktop-schemas: required by chrome remote desktop
+#     DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+#        gsettings-desktop-schemas
+# }
+
+
+##### Dev tools #####
+
+function add_android() {
+  GRADLE_VERSION=2.9
+  cd /usr/local/ && curl -L -O http://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-all.zip \
+    && unzip -o gradle-${GRADLE_VERSION}-all.zip && rm /usr/local/gradle-${GRADLE_VERSION}-all.zip
+
+
+#  # Environment variables
+#  #ENV ANDROID_NDK_HOME /usr/local/android-ndk-r9b
+#  ENV ANT_HOME /usr/local/apache-ant-${ANT_VERSION}
+#  # ENV MAVEN_HOME /usr/local/apache-maven-3.1.1
+#  ENV GRADLE_HOME /usr/local/gradle-${GRADLE_VERSION}
+#  #ENV PATH $PATH:$ANDROID_NDK_HOME
+#  ENV PATH $PATH:$ANT_HOME/bin
+#  # ENV PATH $PATH:$MAVEN_HOME/bin
+#  ENV PATH $PATH:$GRADLE_HOME/bin
+
+}
+
 add_codew() {
   local d=/x/sync/app/codew
+  VERSION=3.12.0
 
   mkdir -p $d/lib $d/bin
   #mkdir -p ~/.local/lib ~/.local/bin
@@ -426,7 +410,7 @@ function add_docker() {
 function add_tinygo() {
   TINYGO_RELEASE=0.28.1
   wget https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_RELEASE}/tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz && \
-      tar xf tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz -C ${APPS_DIR} && \
+      tar xf tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz -C /opt && \
       rm tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz
 }
 
@@ -440,27 +424,45 @@ function add_golang() {
   	&& rm golang.tar.gz
 }
 
-# Users built into the docker image. 
-function add_base_users() {
-  local u=${USERNAME:-build}
-  local h=${USER_HOME:-/x/home/${u}}
+# Adds Kernel, firmware, Nvidia driver.
+# Builds the initrd images for intel/amd uCode.
+add_kernel() {
+    echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
 
-  # For ubuntu based images - there is a default user with 1000
-  (userdel ubuntu || true)
+  apt update
+  export INITRD=No
+  apt install -y --no-install-recommends \
+   linux-image-amd64 nvidia-driver firmware-misc-nonfree \
+     firmware-linux-free \
+       firmware-misc-nonfree \
+       firmware-realtek \
+       firmware-iwlwifi firmware-atheros \
+       amd64-microcode intel-microcode
 
-  useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
-         -d ${h} ${USERNAME}
-  mkdir -p ${h}
-  chown ${u} ${h}
-
-  usermod -p '*' ${USERNAME}
-
-  usermod -G chrome-remote-desktop ${u} || true
-  # If the base image has docker
-  usermod -G docker ${u} || true
-
-
-  #sudo chmod 4755 /x/sync/app/chrome/chrome-sandbox || true
+  TMPDIR=/tmp/initrd
+  rm -rf $TMPDIR     
+  mkdir $TMPDIR
+  cd $TMPDIR
+  mkdir -p kernel/x86/microcode
+       
+  if [ -d /lib/firmware/amd-ucode ]; then
+    cat /lib/firmware/amd-ucode/microcode_amd*.bin > kernel/x86/microcode/AuthenticAMD.bin
+  fi
+       
+  find . | cpio -o -H newc >/boot/amd-ucode.img
+  rm -rf kernel
+  mkdir -p kernel/x86/microcode
+  if [ -d /lib/firmware/intel-ucode ]; then
+   cat /lib/firmware/intel-ucode/* > kernel/x86/microcode/GenuineIntel.bin
+  fi
+  find . | cpio -o -H newc >/boot/intel-ucode.img
+       
+  ver=$(ls /lib/modules)
+  echo -n ${ver} > /boot/version
+            
+  # Require agreement, breaks:    firmware-ipw2x00 
+  # Can't stop the creation - but not used. Just need the kernel and modules.
+  rm /boot/initrd.img*
 }
 
 C=${1}
