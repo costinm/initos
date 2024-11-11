@@ -13,10 +13,6 @@ export HASH_PREFIX=/boot
 # Logic to find an mount the root device.
 # For secure mode, expect a LUKS device.
 find_root() {
-  if [ -d /sysroot/etc ]; then
-    return
-  fi
-
   # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
   #  (opinionated partitioning, 1 is EFI)
   cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
@@ -62,40 +58,23 @@ initramfs_init() {
     lfatal "BOOT_BTRFS partition not found"
   fi
 
-  logi "modules & firmware mounted"
-
-  # this is normally done by sysinit - we want tpm2 to be loaded
-  # Needs to happen after full firmware and modules are in place
-  hwdrivers > /z/initos/log/hwdrivers.log 2>&1
-
-  logi "hwdrivers loaded" 
-
-  udevadm trigger
-  udevadm settle
   
-  hwdrivers  /hwdrivers2.log 2>&1 # TPM seems to need some time to init
-
   if [ "${MODE}" = "r" ]; then
     mount_recovery
+    logi "Recovery requested and mounted"
   else 
+    load_tpm
     # At this point we should have a tpm
     find_root
+    logi "Rootfs mounted"
   fi
 
-  logi "Rootfs mounted"
-
-  #set -x # For debugging - may be removed later, but useful to see what is happening.
-
-  udevadm control --exit || true
-
-  # In memory, not disk
-  edump /sysroot/x/initos/log/boot
+  root_conf
 
   move_mounted_to_sysroot
 
   if [ "$MODE" = "r" ]; then
-    logi "Start recovery image"
-    #busybox ash
+    logi "Start recovery image (insecure config)"
     exec switch_root /sysroot /sbin/init-pod host
   elif [ -f /sysroot/init ]; then
     logi "Preparing to switch root - custom init"

@@ -7,6 +7,9 @@
 # 
 # 
 
+# Where to store the luks key during setup (some commands require a file)
+SECRETS=/run/secrets/luks
+
 # Unlike ignition (which runs in Dracut initramfs), this script runs on a full alpine OS
 # with networking and the usual tools. It is not designed to wipe the disk or be declarative -
 # just to configure the minimum required for the machine to boot with the signed UKI image
@@ -104,8 +107,6 @@ luks_add_pass() {
   cat $SECRETS/passphrase | cryptsetup luksAddKey $disk_dev
 }
 
-SECRETS=/run/secrets/luks
-
 init_pass() {
   #export KEY=$(openssl rand -base64 32)
   export KEY=$(genpass)
@@ -185,6 +186,57 @@ list() {
   tpm2_getcap handles-persistent
 
 }
+
+seed() {
+  # Disk is read only - but allows adding a new disk, where the writes will go.
+  # This can be useful with VMs, sharing a RO base.
+  btrfstune -S 1 ${dev}
+}
+
+# Check all files and meeta checksums. Reports go to /var/lib/btrfs.
+# Docs recommend monthly, from cron. Will use 80% of bw.
+scrub() {
+  btrfs scrub start -B /x
+  btrfs filesystem defrag -v -r -f -t 32M /x
+  duperemove -dhr /x
+  btrfs balance start -m /x
+}
+
+ext4btrfs() {
+  local disk=$1
+
+  e2fsck -fvy ${disk}
+  btrfs-convert ${disk}
+
+  # btrfs subvolume delete /x/ext2_saved
+}
+
+# Run a command in a recovery chroot
+recovery() {
+  /initos/recovery/usr/bin/arch-chroot /initos/recovery $*
+}
+
+# On debian, find the explicitly installed packages
+find_installed_deb() {
+  dpkg --get-selections | grep -v deinstall | cut -f1
+}
+
+get_firmware_info() {
+  # Get a list of all loaded modules
+  modules=$(lsmod | awk 'NR>1 {print $1}')
+
+  for module in $modules; do
+    modinfo_output=$(modinfo $module)
+
+    # Extract firmware information
+    firmware_lines=$(echo "$modinfo_output" | grep -i 'firmware:')
+
+    if [ -n "$firmware_lines" ]; then
+      echo $module "$firmware_lines"
+    fi
+  done
+}
+
 
 # save_tpm() {
 #   KEY=$1

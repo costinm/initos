@@ -424,6 +424,35 @@ function add_golang() {
   	&& rm golang.tar.gz
 }
 
+add_vm() {
+  wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/ch-remote \
+    -O /usr/local/bin/ch-remote
+  chmod +x /usr/local/bin/ch-remote
+
+  wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/cloud-hypervisor-static \
+     -O /usr/local/bin/cloud-hypervisor
+  chmod +x /usr/local/bin/cloud-hypervisor
+
+  wget -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish \
+     -O /tmp/virtiofsd.zip
+  unzip /tmp/virtiofsd.zip -d /tmp
+  mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd /usr/local/bin
+}
+
+add_vkernel() {
+  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
+
+  apt update
+
+  apt install -y --no-install-recommends \
+    linux-image-cloud-amd64
+
+  ver=$(ls /lib/modules)
+  echo -n ${ver} > /boot/version-virt
+  rm -rf /boot/initrd.img* /tmp/* || true
+
+}
+
 # Adds Kernel, firmware, Nvidia driver.
 # Builds the initrd images for intel/amd uCode.
 add_kernel() {
@@ -438,6 +467,9 @@ add_kernel() {
        firmware-realtek \
        firmware-iwlwifi firmware-atheros \
        amd64-microcode intel-microcode
+
+  # Add other 'host' tools
+  $APTINSTALL tpm2-tools
 
   TMPDIR=/tmp/initrd
   rm -rf $TMPDIR     
@@ -462,7 +494,7 @@ add_kernel() {
             
   # Require agreement, breaks:    firmware-ipw2x00 
   # Can't stop the creation - but not used. Just need the kernel and modules.
-  rm /boot/initrd.img*
+  rm -rf /boot/initrd.img* /tpm/* || true
 }
 
 C=${1}

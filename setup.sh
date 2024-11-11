@@ -26,10 +26,14 @@ sign() {
   # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
   VOLS="$VOLS -v ${OUT}:/x/initos"
 
-  mkdir -p ${HOME}/.ssh/initos/uefi-keys
+  SECRET=${HOME}/.ssh/initos
+  mkdir -p ${SECRET}/uefi-keys
 
-  DOMAIN=${DOMAIN:-webinf.info}
-
+  if [ ! -f ${SECRET}/domain ]; then
+    echo -n initos.mesh.internal. > ${SECRET}/domain
+  fi
+  DOMAIN=$(cat ${SECRET}/domain)
+  
   # Inside the host or container - initos files will be under /initos (for now)
   docker run -it --rm -e DOMAIN=${DOMAIN} \
       ${VOLS} \
@@ -76,6 +80,29 @@ push() {
   # /z/initos/boot/efi to be the 'canary' EFI partition.
   rsync -avuz ${OUT}/ ${host}:/z/initos/ \
      --exclude virt/ --exclude boot/ --exclude work/
+}
+
+test() {
+  local host=${1:-host8}
+  set -e
+
+  sign
+  push
+
+  ssh ${host} "sync && reboot -f &"
+}
+
+testall() {
+  local host=${1:-host8}
+  set -e
+  ./dbuild.sh all
+  ./dbuild.sh deb
+  sudo rm -rf ${OUT}/img
+  images
+  sign
+  push
+
+  ssh ${host} "sync && reboot -f &"
 }
 
 if [ $# -eq 0 ]; then

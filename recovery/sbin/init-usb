@@ -19,20 +19,6 @@ export HASH_PREFIX=/boot/efi
 
 . /sbin/init-common.sh
 
-# Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
-# if we may skip that if the core modules are enough.
-# 
-# Unlike 'init-secure', this also loads usb drivers - will look for USB recovery
-initramfs_mods_usb() {
-  # For loading recovery from USB disk
-  modprobe usbcore
-  modprobe ehci-hcd
-  modprobe ohci-hcd
-  modprobe xhci-hcd
-  modprobe usb-storage
-}
-
-
 # Logic to find an mount the root device.
 #
 # To properly mount we also need to find the modules/firmware, and will also mount
@@ -47,11 +33,6 @@ initramfs_mods_usb() {
 # - recovery and boot partitions are mounted
 # -
 find_root() {
-  if [ -d /sysroot/etc ]; then
-    return
-  fi
-
-
   # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
   #  (opinionated partitioning, 1 is EFI)
   cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
@@ -72,9 +53,6 @@ find_root() {
   
   # mount the recovery from the boot as rootfs
   mount_recovery
-  
-  chroot /sysroot passwd -d root
-
   echo "Done mounting recovery as sysroot "
 }
 
@@ -87,16 +65,17 @@ initramfs_init() {
         set -x
   fi
 
-  #if [ "$MODE" = "u" ]; then
+  if [ "$MODE" = "u" ]; then
     initramfs_mods_usb
-  #fi
+    bootd=$(findfs LABEL=USB_BOOT_BTRFS)
+    if [ -n "$bootd" ]; then
+      mount_disk $bootd btrfs /z
+      mount_boot
+      logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
+    fi
+  fi
 
-  bootd=$(findfs LABEL=USB_BOOT_BTRFS)
-  if [ -n "$bootd" ]; then
-    mount_disk $bootd btrfs /z
-    mount_boot
-    logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
-  else 
+  if [ ! -d /z/initos ]; then 
     # USB_BOOT disk not found - normal boot from hardware
     bootd=$(findfs LABEL=BOOT_BTRFS)
     if [ -n "$bootd" ]; then
@@ -104,30 +83,20 @@ initramfs_init() {
       mount_boot
       logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
     else
-      echo "BOOT_BTRFS partition not found"
-      busybox ash
-      return
+      lfatal "BOOT_BTRFS partition not found"
     fi
   fi
 
-  echo "Boot, firmware, modules mounted"
-
-  # this is normally done by sysinit - we want tpm2 to be loaded
-  hwdrivers
-
-  logi "hwdrivers loaded" 
-
-  udevadm trigger
-  udevadm settle
 
   if [ "${MODE}" = "r" ]; then
     mount_recovery
+    logi "Recovery requested and mounted"
   else 
     # At this point we should have a tpm
+    load_tpm
     find_root
+    logi "Rootfs mounted"
   fi
-
-  logi "Rootfs mounted, preparing to switch root"
 
   # Only unsigned debug image
   if [ "$MODE" = "r" ] || [ "$MODE" = "a" ]; then
@@ -136,19 +105,14 @@ initramfs_init() {
     /bin/busybox sh
   fi
 
-  # Will be started again in sysroot
-  udevadm control --exit || true
-
-  edump /sysroot/x/initos/log/boot
+  root_conf
 
   move_mounted_to_sysroot
-
-  logi "Switching root"
 
   if [ "$MODE" = "s" ]; then
     exec switch_root /sysroot /bin/sh
   elif [ "$MODE" = "r" ]; then
-    logi "Start recovery image"
+    logi "Start recovery image (insecure config)"
     exec switch_root /sysroot /sbin/init-pod host
   elif [ -f /sysroot/init ]; then
     logi "Preparing to switch root - custom init"

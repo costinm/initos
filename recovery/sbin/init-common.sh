@@ -156,6 +156,20 @@ initramfs_mods() {
 
 }
 
+# Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
+# if we may skip that if the core modules are enough.
+# 
+# Unlike 'init-secure', this also loads usb drivers - will look for USB recovery
+initramfs_mods_usb() {
+  # For loading recovery from USB disk
+  modprobe usbcore
+  modprobe ehci-hcd
+  modprobe ohci-hcd
+  modprobe xhci-hcd
+  modprobe usb-storage
+}
+
+
 # Mount the boot disk - with recovery, firmware, modules, etc.
 # Each component is a separate unionfs.
 mount_boot() {
@@ -210,6 +224,18 @@ mount_boot_persistent() {
   fi
 }
 
+# Configure the sysroot with files from the signed image (for secure)
+# or unsecure image (if LUKS failed).
+root_conf() {
+  mkdir -p /sysroot/boot
+  cp /boot/root.pem /sysroot/boot/root.pem
+  # Just in case
+  rm -f /sysroot/.dockerenv
+
+  if [ -d /x/initos ]; then
+    edump /sysroot/x/initos/log/boot
+  fi
+}
 
 # Mount recovery using the signed image
 # Few untrusted files will be added for networking, from the non-encrypted disk.
@@ -227,8 +253,6 @@ mount_recovery() {
   if [ -d ${dir}/ssh ]; then
     cp -a ${dir}/ssh /sysroot/etc
   fi
-
-  rm -f /sysroot/.dockerenv
   
   # TODO: from boot partition !
   if [ -f ${dir}/authorized_keys ]; then
@@ -245,9 +269,24 @@ mount_recovery() {
   fi
 }
 
+load_tpm() {
+    # this is normally done by sysinit - we want tpm2 to be loaded
+  # Needs to happen after full firmware and modules are in place
+  hwdrivers > /z/initos/log/hwdrivers.log 2>&1
+  logi "hwdrivers loaded $(ls -l /dev/tpm*)"
+  udevadm trigger
+  udevadm settle
+  logi "udevadm settle $(ls -l /dev/tpm*)"
+  hwdrivers  /z/initos/log/hwdrivers2.log 2>&1 # TPM seems to need some time to init
+  logi "hwdrivers2 $(ls -l /dev/tpm*)"
+}
+
 # All remaining mounted dirs will be moved under same dir in /sysroot,
 # ready to switch_root
 move_mounted_to_sysroot() {
+  # Will be started again in sysroot
+  udevadm control --exit || true
+
   # From original alpine init
   cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
     if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
@@ -516,7 +555,6 @@ mount_rootfs() {
         return 1
     fi
   fi
-
 
   mkdir -p /lib/modules /lib/firmware /home /var/log /var/cache
   #mount -o bind /x/initos/modules /lib/modules

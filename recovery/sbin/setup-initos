@@ -28,9 +28,8 @@ mkdir -p ${WORK}/img ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
 # vinit updates the initramfs for the virt kernel
 vinit() {
   VER=${1:-$(cat /boot/version-virt)}
-
-  if [ -n ${VER} ]; then
-    VER=$(ls /lib/modules)
+  if [ -z ${VER} ]; then
+    return
   fi
 
   mkinitfs -k  -i /sbin/init-vm \
@@ -116,7 +115,7 @@ efi() {
 sign_init() {
   local u=${DOMAIN:-webinf.info}
 
-  efi-mkkeys -s ${u}
+  efi-mkkeys -s ${u} -o /etc/uefi-keys
     
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
      -out /etc/uefi-keys/root.key
@@ -242,6 +241,7 @@ firmware_sqfs() {
 # Source should be in /x/initos/modules/${version} or /lib/modules/${version}
 mod_sqfs() {
   ver=${1:-$(cat /boot/version)}
+  DST=${2:-/x/initos/img}
 
   if [ -f /x/initos/img/modules-${ver}.sqfs ]; then
     echo "Modules already exist for ${ver}"
@@ -262,11 +262,11 @@ mod_sqfs() {
     return
   fi
 
-  mksquashfs . /x/initos/img/modules-${ver}.sqfs
+  mksquashfs . ${DST}/modules-${ver}.sqfs
   veritysetup format \
-     --root-hash-file=/x/initos/img/hash.modules-${ver} \
-     /x/initos/img/modules-${ver}.sqfs \
-     /x/initos/img/modules-${ver}.sqfs.verity
+     --root-hash-file=${DST}/hash.modules-${ver} \
+     ${DST}/modules-${ver}.sqfs \
+     ${DST}/modules-${ver}.sqfs.verity
 }
 
 recovery_sqfs() {
@@ -293,16 +293,30 @@ recovery_sqfs() {
 
 # Create the BOOT disk files. 
 dist() {
-  mods_sqfs 
-  firmware_sqfs 
   recovery_sqfs
+  firmware_sqfs 
+
+  mkdir -p /x/initos/boot
+
+  vvirt=$(cat /boot/version-virt)
+  if [ -n ${vvirt} ]; then
+    vinit ${vvirt}
+    if [ ! -f /x/initios/img/modules-${vvirt}.sqfs ]; then
+      mod_sqfs ${vvirt} /x/initos/img
+    fi 
+  fi
 
   # Create the initrd and copy the boot files
-  ver=$(ls /lib/modules)
-  echo -n ${ver} > /boot/version
-
-  if [ ! -f x/initos/boot/initos-${ver}.img ]; then
-    /sbin/setup-initos build_initrd ${ver} /boot/initos-${ver}.img
+  ver=${1:-$(cat /boot/version)}
+  if [ -z ${ver} ]; then
+    ver=$(ls /lib/modules)
+    echo -n ${ver} > /boot/version
+  fi
+  mod_sqfs ${ver} 
+    
+  if [ ! -f /x/initos/boot/initos-${ver}.img ]; then
+    build_initrd ${ver} /boot/initos-${ver}.img
+    cp /boot/initos-${ver}.img /x/initos/boot/initos-${ver}.img
   fi
 
   mkdir -p /x/initos/boot/

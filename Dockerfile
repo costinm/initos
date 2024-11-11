@@ -36,23 +36,12 @@ RUN --mount=target=/var/lib/cache,id=apt,type=cache <<EOF
 EOF
 
 ######## For the cloud kernel.
-FROM debian:bookworm as vdeb
+FROM debian:bookworm-slim as vdeb
+
+COPY ./recovery/sbin/setup-deb /sbin/setup-deb
 
 RUN --mount=target=/var/lib/cache,id=apt,type=cache <<EOF
-  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
-
-  apt update
-
-  apt install -y --no-install-recommends \
-    linux-image-cloud-amd64
-
-  ver=$(ls /lib/modules)
-  echo -n ${ver} > /boot/version-virt
-
-  # During recovery setup:
-  #DST=/x/initos/virt /sbin/setup-initos mods_sqfs
-  #/sbin/setup-initos vinit
-
+  setup-deb stage add_vkernel
 EOF
 
 
@@ -70,6 +59,12 @@ EOF
 ENTRYPOINT ["/sbin/init-pod"]
 CMD ["pod"]
 
+######## TODO: Arch
+# Arch 
+#FROM arch:latest as arch
+#
+#RUN pacman -Syu linux linux-firmware
+
 ######## Alpine firmware.
 # No longer used - debian firmware is smaller and less complete, but 
 # too complex to deal with the mix and get nvidia working.
@@ -78,7 +73,7 @@ CMD ["pod"]
 # FROM  recoverybase as alpine-firmware
 
 # RUN --mount=target=/etc/apk/cache,id=apk,type=cache <<EOF
-#   /sbin/setup-recovery linux_alpine
+#   /sbin/setup-alpine linux_alpine
 # EOF
 
 ######## This is the real recovery - with the additional scripts.
@@ -94,11 +89,11 @@ ENV LANG C.UTF-8
 ENV PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/initos/bin
 
 # Rest of the files added in the last step (to avoid rebuilds)
-COPY ./recovery/sbin/setup-recovery /sbin/setup-recovery
+COPY ./recovery/sbin/setup-alpine /sbin/setup-alpine
 
 # Cache the APKs
 RUN  --mount=target=/etc/apk/cache,id=apk,type=cache \
-    /sbin/setup-recovery install
+    /sbin/setup-alpine install
 ################
 # Used for building the initrd
 FROM recoverybase as recovery
@@ -107,6 +102,17 @@ FROM recoverybase as recovery
 COPY ./recovery/ /
 
 ################
+# Same as setup.sh script - less caching.
+FROM full as out
+
+RUN <<EOF
+  setup-initos dist
+EOF
+
+### Generate the binary images - can be used with the basic recovery 
+# to sign and generate the USB
+FROM scratch as out
+COPY --link --from=setup-out /x/initos ./
 
 ########  Build the full image - can directly sign and generate usb, 
 # includes the VM kernel/initrd as well (42M).

@@ -211,21 +211,28 @@ function vm() {
   pod
 }
 
-function host() {
-    /sbin/openrc sysinit
-    /sbin/openrc boot
-    # Normall init starts this with 'wait'
-    /sbin/openrc default
+# Host runs when starting a real machine, not a container.
+# It is called by initrd or directly by the kernel.
+host() {
+  # Not using init 
+  /sbin/openrc sysinit
+  /sbin/openrc boot
+  
+  # Normall init starts this with 'wait'
+  /sbin/openrc default
 
-    ifconfig -a
-    echo /etc/ssh/*.pub
-    # TODO: REMOVE BEFORE RELEASE 
-    busybox ash
+  # Show the interfaces
+  ifconfig -a
+  cat /etc/ssh/*.pub
+  
+  # TODO: REMOVE BEFORE RELEASE 
+  busybox ash
 
-    tini -s sleep -- infinity &
+  # Takes care of zombies
+  tini -s sleep -- infinity & 
 
-    busybox ash
-    sleep -- infinity
+  
+  busybox ash
 
 }
 

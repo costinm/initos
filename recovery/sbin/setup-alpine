@@ -314,11 +314,6 @@ xui_alpine() {
 #  apk add xkill
 }
 
-wui_start_root() {
-  chroot /x/alpine-ui
-  seatd &
-}
-
 # Downloads the linux (alpine).
 #
 # Very slow, installs a lot of firmware.
