@@ -81,9 +81,16 @@ commit() {
 pushimg() {
   #buildah push ${REPO}/recovery:latest oci:-
 
+  ver=$(buildah unshare -m A=alpinehost -- \
+   sh -c 'cat ${A}/boot/version')
+
+  buildah unshare -m A=debhost -- \
+   sh -c 'tar -cf - -C ${A} .' | \
+    sqfstar ${WORK}/img/debhost-${ver}.sqfs -e .dockerenv
+  
   buildah unshare -m A=alpinehost -- \
    sh -c 'tar -cf - -C ${A} .' | \
-    sqfstar ${WORK}/img/alpinehost.sqfs -e .dockerenv
+    sqfstar ${WORK}/img/alpinehost-${ver}.sqfs -e .dockerenv
 
 }
 

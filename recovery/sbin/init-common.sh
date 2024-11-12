@@ -186,12 +186,22 @@ mount_boot() {
 
   #mount_verity recovery /initos/recovery ${dir}
 
+  ver=$(uname -r)
+
+  if [ -f ${dir}/alpinehost-${ver}.sqfs ]; then
+    mkdir -p /lib/firmware
+    mkdir -p /lib/modules/${ver}
+    mount_verity alpinehost-${ver} /z/initos/alpinehost ${dir}
+    mount -o bind /z/initos/alpinehost/lib/firmware /lib/firmware
+    mount -o bind /z/initos/alpinehost/lib/modules/${ver} /lib/modules/${ver}
+    return
+  fi
+
   if [ -f ${dir}/firmware.sqfs ]; then
     mkdir -p /lib/firmware
     mount_verity firmware /lib/firmware ${dir}
   fi
 
-  ver=$(uname -r)
   if [ -f ${dir}/modules-${ver}.sqfs ]; then
     mkdir -p /lib/modules/${ver}
     mount_verity modules-${ver} /lib/modules/${ver} ${dir}
@@ -243,9 +253,12 @@ root_conf() {
 mount_recovery() {
   dir=${1:-/z/initos/insecure}
 
-  logi "Mounting recovery squash as rootfs"
-  mount_verity recovery /sysroot /z/initos/img
-  #mount -o bind /initos/recovery /sysroot
+  if [ -d /z/initos/alpinehost/etc ] ; then 
+    mount -o bind /z/initos/alpinehost /sysroot
+  else   
+    logi "Mounting recovery squash as rootfs"
+    mount_verity recovery /sysroot /z/initos/img
+  fi
 
   if [ -f ${dir}/interfaces ]; then
     cp ${dir}/interfaces /sysroot/etc/network/interfaces
