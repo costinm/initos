@@ -187,6 +187,16 @@ function add_code() {
   apt-get install --assume-yes --no-install-recommends    code
 }
 
+add_host_ui() {
+  # wofi: d-menu (rofi-wayland not yet available)
+  # waybar - bar, requires the font
+  # mako - notifications
+  $APTINSTALL sway swayidle swaylock \
+     mako-notifier wofi \
+     fonts-font-awesome waybar xwayland \
+  # bemenu grim slurp
+}
+
 
 function add_ui() {
   # i3 based UI.

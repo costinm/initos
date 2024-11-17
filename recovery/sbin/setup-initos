@@ -26,29 +26,46 @@ SRCDIR=${SRCDIR:-/ws/initos}
 mkdir -p ${WORK}/img ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
 
 # vinit updates the initramfs for the virt kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version-virt to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the ligher musl binaries.
 vinit() {
   VER=${1:-$(cat /boot/version-virt)}
   if [ -z ${VER} ]; then
     return
   fi
 
+  # btrfs is pretty slow for a VM - the rootfs may have all the modules
+  # and load it as needed.
+  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
+  # or on virtio.
   mkinitfs -k  -i /sbin/init-vm \
      -F "base btrfs squashfs virtio initos" \
-     -o /x/initos/virt/initramfs-${VER} ${VER}
+     -o /x/initos/img/initramfs-${VER} ${VER}
   
   cp /boot/vmlinuz-${VER} /x/initos/virt
 }
 
+
+# Build the initramfs for the real kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the ligher musl binaries.
 build_initrd() {
-  local KERNEL_VERSION=$1
+  local VER=${1:-$(cat /boot/version-virt)}
+  if [ -z ${VER} ]; then
+    return
+  fi
+  local KERNEL_VERSION=$VER
   local img=$2
 
   echo "Built initramfs ${img} for ${KERNEL_VERSION}"
 
-  local KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-  [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && return
-
-  [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules" && return
+  [ ! -f /lib/modules/${VER}/modules.dep ] && echo "Missing modules" && return
 
     # Uses mkinitfs.conf added from file in the docker image.
     # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
@@ -63,9 +80,12 @@ build_initrd() {
     cp /etc/passwd /usr/share/mkinitfs/passwd
     cp /etc/group /usr/share/mkinitfs/group
 
+    # clevis ? 
     #rm -rf ${WORK}/initfs.host
     # -t ${WORK}/initfs.host
-    mkinitfs -k  -i /sbin/init-usb -o ${img}  $KERNEL_VERSION
+    mkinitfs -k  -i /sbin/init-usb \
+      -F "ata mmc nvme scsi usb base btrfs keymap cryptsetup squashfs tpm2 initos eudev" \
+      -o ${img}  $VER
 }
 
 # Generate an unsigned efi image, based on alpine with a custom init script.

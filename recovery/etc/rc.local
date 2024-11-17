@@ -1,5 +1,5 @@
 #!/bin/sh
 
 # Fix docker - if 'rooter' is detect it'll disable accept.
-iptables -I DOCKER-USER -j ACCEPT
-
+#iptables -I DOCKER-USER -j ACCEPT
+iptables -P FORWARD ACCEPT
