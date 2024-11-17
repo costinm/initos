@@ -1,0 +1,5 @@
+/sbin/setup-initos
+/sbin/init-*
+/sbin/initos-*
+/boot/hash*
+/sbin/fsck.vfat
