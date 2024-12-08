@@ -47,7 +47,7 @@ set -e
 
 # Generate recovery.sqfs - on the EFI disk it will be mounted.
 # This runs in docker (and anything with d prefix).
-dbuild_recovery() {
+recovery() {
   docker rm -f initos-recovery || true
 
   # Start a container based on alpine:edge, named initos-recovery
@@ -163,20 +163,50 @@ mkdisk() {
 
 
 }
+run_virtiofsd() {
+  # Faster than virtio-9p or regular 9p/nfs
+  # FUSE messages over vhost-user socket
+  # DAX (using host buffers) not enabled.
+  ${WORK}/virtiofsd \
+      --socket-path=/tmp/virtiofs \
+      --shared-dir=$WORK \
+      --cache=never \
+      --allow-mmap \
+      --allow-direct-io \
+      --thread-pool-size=2 &
+
+#       --log-level debug \
+}
+
 test_vm() {
   if [ ! -f ${WORK}/cloud-hypervisor-static ]; then
     wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/cloud-hypervisor-static -O ${WORK}/cloud-hypervisor-static
-    chmod +x ${WORK}/cloud-hypervisor-static
+    wget -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish -O ${WORK}/virtiofsd.zip
+      chmod +x ${WORK}/cloud-hypervisor-static
   fi
 
-  # Alpine kernel includes no filesystem
+  if [ ! -f ${WORK}/disk.img ] ; then
+    mkdisk
+  fi
 
-  ${WORK}/cloud-hypervisor-static --kernel ${WORK}/vmlinuz-virt --initramfs ${WORK}/initramfs-virt \
-    --serial tty --console off --cmdline "console=ttyS0" \
-    --disk path=${WORK}/disk.img \
-    --net tap=br-lan,ip=192.168.1.23,mask=255.255.128.0
+  # Alpine kernel includes no filesystem - virtiofs is a module
 
-    #--fs tag=work,${WORK}
+  # memory shared needed for fs
+  #
+  sudo rm /tmp/virtiofs*
+  run_virtiofsd
+  sleep 1
+
+  ${WORK}/cloud-hypervisor-static \
+    --kernel ${WORK}/virt/vmlinuz-virt \
+    --initramfs ${WORK}/virt/initramfs \
+    --memory size=1G,shared=on \
+    --serial tty --console off --cmdline "console=ttyS0 ip=192.168.1.23 trace_clock=global" \
+    --disk path=${WORK}/dist/recovery.sqfs path=${WORK}/virt/modloop.sqfs path=${WORK}/disk.img \
+    --net tap=vm1,ip=172.17.1.23,mask=255.255.128.0 \
+    --fs tag=myfs,socket=/tmp/virtiofs,num_queues=1,queue_size=512
+
+  # mount -t virtiofs  myfs /mnt
 
 }
 

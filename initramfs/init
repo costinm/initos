@@ -1,14 +1,14 @@
 #!/bin/sh
 
 # Based on Alpine mkinitrd, but with different init script:
-# - modified to look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
-# - otherwise load recovery.btrfs
-# - removed all networking or alpine-specific init.
+# - 'secure mode': look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
+# - 'secure mode': fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
+# - various checks to detect an BTRFS rootfs in 'insecure' mode, fallback to recovery subvol or sqfs
+# - removed all networking or alpine-specific init - only job is to load a rootfs
 #
-# This allows using the very simple initrd - to just mount a verified root and
-# nothing else.
-
-# some helpers from alpine init
+# This allows using the simpler initrd, with a number of small specialized functions.
+# It is also usable for VM - when the kernel lacks some drivers (btrfs, etc), to allow kernel+fixed initrd without
+# using EFI + Grub + Dracut/systemd
 
 # ebegin will record the start of a command in /dev/kmsg and console
 ebegin() {
@@ -18,6 +18,7 @@ ebegin() {
 }
 
 # eend will record the status of the previous command.
+# Unlike alpline - doesn't drop to shell (secure mode can't allow root shell)
 eend() {
 	if [ "$1" = 0 ] || [ $# -lt 1 ] ; then
 		echo "$last_emsg: ok." > /dev/kmsg
@@ -25,7 +26,9 @@ eend() {
 		shift
 		echo "$last_emsg: failed. $*" > /dev/kmsg
 		echo "failed. $*"
-    # TODO: save all info to EFI partition if possible.
+
+    # save all info to EFI partition if possible.
+    edump "failed: $*"
 
     # Not running an emergency shell - insecure. 
     sleep 10
@@ -33,7 +36,8 @@ eend() {
 }
 
 # dump info to the EFI partition (which exists if we managed to get the
-#  kernel running).
+#  kernel running). One goal is to support machines without display/keyboard, 
+# install state will be saved on the USB disk.
 edump() {
   local msg="$*"
   if [ ! -d /boot/efi ]; then
@@ -41,14 +45,18 @@ edump() {
   fi
 
   echo $msg >> /boot/efi/initos.log
+
   echo "BLKID:" >> /boot/efi/initos.log
   blkid >> /boot/efi/initos.log
   echo "ORIG_BLKID: $START_BLKID" >> /boot/efi/initos.log
   echo "MOD_BLKID: $MODS_BLKID" >> /boot/efi/initos.log
+  
   echo "Mounts:" >> /boot/efi/initos.log
   mount >> /boot/efi/initos.log
+  
   echo "Mods:" >> /boot/efi/initos.log
   lsmod >> /boot/efi/initos.log
+
   echo "dmesg:" >> /boot/efi/initos.log
   dmesg >> /boot/efi/initos.log
 
@@ -86,7 +94,7 @@ initramfs_1st() {
   mount_proc
 }
 
-# Part of the first step - mount proc, sys, etc
+# mount proc, sys, etc
 mount_proc() {
   if [ -e /proc/cmdline ]; then
     return
@@ -101,8 +109,6 @@ mount_proc() {
   # earlyprintk kernel option to monitor early init progress. As above, the -c check
   # prevents an error if the device node has already been seeded.
   [ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
-
-  ebegin "Mounting core filesystems"
 
   mount -t proc -o noexec,nosuid,nodev proc /proc
 
@@ -137,15 +143,6 @@ eudev_start()
 
 	[ -d /etc/udev/rules.d ] || mkdir -p /etc/udev/rules.d
 
-#	local file dest
-#	for file in /run/udev/tmp-rules--*; do
-#		dest=${file##*tmp-rules--}
-#		[ "$dest" = '*' ] && break
-#		type=${dest##70-persistent-}
-#		type=${type%%.rules}
-#		cat "$file" >> /etc/udev/rules.d/"$dest" && rm -f "$file"
-#	done
-
 	udevadm hwdb --update
 
 	# Populating /dev with existing devices through uevents
@@ -155,7 +152,7 @@ eudev_start()
 }
 
 
-# retry function
+# retry function. Not used right now, will be used for LVM open
 retry() {
   retries=$1
   shift
@@ -175,15 +172,10 @@ retry() {
   done
 }
 
-# Second step: Load the modules from /etc/modules and keymaps
+# Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
+# if we may skip that if the core modules are enough.
 initramfs_mods() {
-  if [ -f /etc/modules ] ; then
-    sed 's/\#.*//g' < /etc/modules |
-    while read module args; do
-      modprobe -q $module $args
-    done
-  fi
-
+  # For loading recovery from USB disk
   modprobe usbcore
   modprobe ehci-hcd
   modprobe ohci-hcd
@@ -191,11 +183,16 @@ initramfs_mods() {
   modprobe usb-storage
   modprobe scsi_mod
   modprobe sd_mod
+
+  # for loading recovery
   modprobe squashfs
+
+  # Not loaded in alpine virt kernel - it will allow identifying the disk 
+  modprobe virtio_blk
+
+  # btrfs, vfat are are normally present - but may be loaded if missing
 }
 
-# The root is a btrfs unencrypted volume. (dm-verity or btrfs signing will be used
-# instead for verification if the machine is locked).
 find_and_mount_root() {
 
   # Create a mount point for the new root
@@ -205,15 +202,19 @@ find_and_mount_root() {
     return
   fi
 
-  # Normal path - find a cryptsetup disk - that's where we expect the root to be.
-  # This won't work if we have multiple LUKS partitions...
-  # TODO: save the root in a file (can be signed - or just rely on the fact it won't open
-  # unless it has the right key).
-
+  # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc (opinionated partitioning, 1 is EFI)
   cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
   if [ -n "$cryptd" ]; then
     echo "Found LUKS device: ${cryptd}"
     unlock_c $cryptd
+    if [ $? -eq 0 ]; then
+      return
+    fi
+  fi
+
+  usbd=$(findfs LABEL=ROOT)
+  if [ -n "$usbd" ]; then
+    mount_root $usbd
     if [ $? -eq 0 ]; then
       return
     fi
@@ -286,14 +287,18 @@ mount_recovery_dir() {
   # For any configs, certs, etc - we can add them to the UKI or rebuild.
 
   # From alpine original script
-  mkdir -p /media/root-ro /media/root-rw /sysroot/media/root-ro /sysroot/media/root-rw
+  mkdir -p /media/root-ro
 
   mount -o loop,ro -t squashfs ${dir}/recovery.sqfs /media/root-ro
   if [ $? -ne 0 ]; then
     echo "Error: Failed to mount recovery"
     return 1
   fi
+  mount_overlay
+}
 
+mount_overlay() {
+  mkdir -p /media/root-rw /sysroot/media/root-ro /sysroot/media/root-rw
 #  mkdir -p /lib/modules /.modloop
 #  mount -o loop -t squashfs ${dir}/boot/modloop-lts /.modloop
 
@@ -356,22 +361,20 @@ verify() {
 initramfs_init() {
   set -x # For debugging - may be removed later, but useful to see what is happening.
 
+
+  initramfs_1st
+
   echo "Starting initramfs"
 
   modprobe -a simpledrm
 
   echo "Loaded simple DRM, console should be visible"
 
-  initramfs_1st
-
-  echo "base init - proc, etc"
-
   # Save the current blkid - before loading the other modules
+  # This should show if any kernel modules are finding the root
   export ORIG_BLKID=$(blkid)
 
   [ -f /etc/initos.conf ] && . /etc/initos.conf
-
-  env
 
   # Load a set of core modules we use
   initramfs_mods
@@ -379,30 +382,42 @@ initramfs_init() {
   # Save the current blkid - before loading the other modules
   export MODS_BLKID=$(blkid)
 
-  busybox sh
+  #busybox sh
 
-  # nlplug-findfs looks for the root device - it includes the crytpsetup mounting
-  # capabilities, is aware of lvm, zpool, mdadm.
-  # It does the 'read pass' itself and has cryptsetup linked - lvm/zpool/mdadm are
-  # exec. Not useful with the 'opinionated' btrfs root and TPM2
-  #
-  # It scans /sys/bus, /sys/class generating uevents.
-  # .boot_repository is used to mark root devices
-  # As a side-effect, it loads all relevant modules !
-  # This will force loading the modules
-  # If /tmp/apkovls and .boot_repository - they are mounted. Normal alpine has
-  # additiona loading for them - we don't use since it's not signed.
-  #
-  # Devices that contain what looks like apk overlay are mounted under /media/xxx
-  # USB may not show up
-  nlplug-findfs -p /sbin/mdev -t 5000 -a /tmp/apkovls -b /tmp/repositories LABEL=BOOT &
+  if [ ! -e /dev/vda ] ; then
+    # nlplug-findfs looks for the root device - it includes the crytpsetup mounting
+    # capabilities, is aware of lvm, zpool, mdadm.
+    # It does the 'read pass' itself and has cryptsetup linked - lvm/zpool/mdadm are
+    # exec. Not useful with the 'opinionated' btrfs root and TPM2
+    #
+    # It scans /sys/bus, /sys/class generating uevents.
+    # .boot_repository is used to mark root devices
+    # As a side-effect, it loads all relevant modules !
+    # This will force loading the modules
+    # If /tmp/apkovls and .boot_repository - they are mounted. Normal alpine has
+    # additiona loading for them - we don't use since it's not signed.
+    #
+    # Devices that contain what looks like apk overlay are mounted under /media/xxx
+    # USB may not show up
+    nlplug-findfs -p /sbin/mdev -t 5000 -a /tmp/apkovls -b /tmp/repositories LABEL=BOOT &
 
-  read -t 6 -n 1 key
-  if [ "$key" = 'u' ]; then
-    echo "Key 'u' pressed."
-    export USB_BOOT=1
+    read -t 6 -n 1 key
+    if [ "$key" = 'u' ]; then
+      echo "Key 'u' pressed."
+      export USB_BOOT=1
+    else
+      echo "Timeout or different key pressed."
+    fi
+
   else
-    echo "Timeout or different key pressed."
+    # When used with VM, expect vda to be the recovery squashfs
+    mkdir -p /media/root-ro
+
+    mount -t squashfs /dev/vda /media/root-ro
+    mkdir -p /.modloop
+    mkdir -p /lib/modules/$(uname -r)
+    mount -t squashfs /dev/vdb /lib/modules/$(uname -r)
+    mount_overlay
   fi
 
   # TODO: check if a key is pressed on keyboard (with timeout)

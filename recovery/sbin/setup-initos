@@ -39,34 +39,24 @@ SRCDIR=${SRCDIR:-/ws/initos}
 #
 # See the Dockerfile.debian for an example of creating a debian-based kernel.
 # This is using alpine kernel corresponding to the base.
-squash_linux() {
+linux_virt() {
   # Set shell to exit on error
   set -e
 
-  if [ -f ${DIST}/boot/modloop-lts ]; then
-    echo "Detecting existing squashed modules - using Alpine dist or other dist"
-
-    KERNEL_VERSION=$(ls ${DIST}/boot/config* | sed -e 's,/boot/config-,,')
-    if [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ]; then
-      unsquashfs -f -d ${WORK} ${DIST}/boot/modloop-lts
-      echo "Expanding modules $(ls /lib/modules/${KERNEL_VERSION})"
-      chmod -R 755 /lib/modules/
-    fi
-
-    return
-  fi
-
   # Create the modloop-tls
-  apk add linux-lts
+  apk add linux-virt
 
-  KERNEL_VERSION=$(ls ${DIST}/boot/config* | sed -e 's,/boot/config-,,')
+  KERNEL_VERSION=$(ls /boot/config* | sed -e 's,/boot/config-,,')
 
-  rm -f ${DIST}/boot/modloop-lts
-  mksquashfs /lib/firmware /lib/modules/${KERNEL_VERSION} ${DIST}/boot/modloop-lts
+  mkdir -p ${WORK}/virt
+  cp /boot/vmlinuz-virt ${WORK}/virt/
+  cp /boot/config-* ${WORK}/virt
+  cp /boot/System.map-* ${WORK}/virt/
 
-  cp /boot/vmlinuz-lts ${DIST}/boot/vmlinuz-lts
-  cp /boot/config-* ${DIST}/boot/
-  cp /boot/System.map-* ${DIST}/boot/
+  mkinitfs  -i $SRCDIR/initramfs/init -F "base btrfs squashfs virtio" -o ${WORK}/virt/initramfs $KERNEL_VERSION
+  if [ ! -f $WORK/virt/modloop.sqfs ]; then
+    mksquashfs /lib/modules/${KERNEL_VERSION} $WORK/virt/modloop.sqfs
+  fi
 }
 
 # Very slow, installs a lot of firmware
@@ -231,7 +221,7 @@ squash_recovery() {
   rm -f ${DIST}/recovery.sqfs
   mksquashfs  . ${DIST}/recovery.sqfs \
     -regex -e "x/.*" -e "lib/modules/.*" -e "lib/firmware/.*" -e "boot/.*" \
-     -e "proc/.*" -e "sys/.*" -e "run/.*"
+     -e "proc/.*" -e "sys/.*" -e "run/.*" -e "work/.*" -e "ws/.*" -e "etc/apk/cache.*"
 }
 
 
@@ -270,8 +260,10 @@ sign_image() {
 
 install_recovery() {
   mkdir -p /initos
-  cp -a ${SRCDIR}/bin/* /usr/bin/
-  cp -a ${SRCDIR}/etc/* /etc/
+  cp -a ${SRCDIR}/recovery/sbin/* /sbin/
+  cp -a -f ${SRCDIR}/recovery/etc/* /etc/
+  cp -a ${SRCDIR}/recovery/home /
+  cp -a ${SRCDIR}/recovery/root /
 
   alpine_add_common
   alpine_add_base
@@ -284,7 +276,8 @@ alpine_add_common() {
     apk add alpine-base alpine-conf
     apk add openrc
 
-    apk add busybox-mdev busybox-mdev-openrc busybox-suid busybox-binsh
+    # busybox-mdev busybox-mdev-openrc
+    apk add   busybox-suid busybox-binsh
     apk add iw ifupdown-ng ifupdown-ng-wifi
     apk add ca-certificates-bundle
     apk add mdev-conf
@@ -382,6 +375,17 @@ alpine_add_recovery() {
     smartmontools \
     sudo strace util-linux bridge 
 
+  apk add cloud-hypervisor virtiofsd
+
+  # similar to ujail and others - no server.
+  # nsjail can listen on a port and start container on connection
+  # supports macvlan
+  # can act as an init (restart on exit)
+  apk add nsjail
+
+  # init with a single process. Can reap even if not running as PID1.
+  apk add tini
+
   #apk add secureboot-hook
 
   # Others that may be useful but not required:
@@ -400,7 +404,7 @@ alpine_add_recovery() {
   #e2fsprogs
 
   # apk add lvm2
-
+  apk add wpa_supplicant wpa_supplicant-openrc
 
   rc-update add networking default
   rc-update add dropbear default
@@ -417,7 +421,7 @@ alpine_add_recovery() {
   rc-update add cgroups sysinit
   rc-update add ntpd boot
 
-  rc-update add wpa-supplicant boot
+  rc-update add wpa_supplicant boot
   rc-update add dropbear default
   rc-update add udev sysinit
   rc-update add udev-settle sysinit
@@ -443,10 +447,10 @@ alpine_add_base() {
   mkdir -p /mnt/usb
 
   addgroup -g 1000 build
-  addgroup -g 999 admin
+  addgroup -g 1001 admin
 
   adduser -G build -g "Builder" build -u 1000 -D -s /bin/bash -h /x/build
-  adduser -G admin -g "Admin" admin -u 999 -D -s /bin/bash -h /x/build
+  adduser -G admin -g "Admin" admin -u 1001 -D -s /bin/bash -h /x/build
 
   # Disable IPv6 for now - seems to be broken in some cases. Can be enabled in rootfs.
   echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.conf
