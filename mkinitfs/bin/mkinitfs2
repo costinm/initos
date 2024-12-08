@@ -39,6 +39,7 @@ feature_files() {
 	done
 }
 
+# Copy files and their lddtree dependencies to tmpdir.
 initfs_base() {
 	local i= dirs= glob= file=
 	for i in dev proc sys sbin bin run .modloop lib/modules media/cdrom \
@@ -69,6 +70,9 @@ initfs_base() {
 	cd "$oldpwd"
 }
 
+# Helper to determine the kernel module dependencies.
+# Stdin is a list of kernel modules, stdout a list of modules
+# including the deps.
 find_kmod_deps() {
 	awk -v prepend="/lib/modules/$kernel/" -v modulesdep="${basedir}lib/modules/$kernel/modules.dep" '
 function recursedeps(k,		j, dep) {
@@ -104,6 +108,7 @@ END {
 }'
 }
 
+# Expand the list of modules to include deps.
 find_kmods() {
 	local oldpwd="$PWD"
 	cd "$kerneldir" || return 1
@@ -113,6 +118,7 @@ find_kmods() {
 	cd "$oldpwd"
 }
 
+# Copy all kerne modules and their deps to the tmpdir
 initfs_kmods() {
 	[ -z "$nokernel" ] || return 0
 	local glob= file= files= dirs=
@@ -179,7 +185,7 @@ list_firmware() {
 # }
 
 initfs_custom_files() {
-        # shellcheck disable=SC2086 # word splitting is required
+    # shellcheck disable=SC2086 # word splitting is required
 	for file in $custom_files; do
 		if [ -f "$basedir"/$file ]; then
 			mkdir -p "$tmpdir"/${file%/*}
