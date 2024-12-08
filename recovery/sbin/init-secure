@@ -1,0 +1,95 @@
+#!/bin/sh
+
+# A separate script is used for 'secure' mode:
+# - look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
+# - fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
+
+# Override settings in init-common
+export INIT_OS=secure
+export HASH_PREFIX=/boot
+
+. /sbin/init-common.sh
+
+# Logic to find an mount the root device.
+# For secure mode, expect a LUKS device.
+find_root() {
+  # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
+  #  (opinionated partitioning, 1 is EFI)
+  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  if [ -n "$cryptd" ]; then
+    logi Attempting to mount LUKS $cryptd
+    mount_cryptd $cryptd
+  else 
+    logi "No LUKS partition found - mounting plain text disk"
+    mkdir -p /x /sysroot
+    mount -o bind /z /x
+    # This is called for LUKS after mounting /dev/mapper/c to /x
+    mount_rootfs
+  fi
+
+  if [ -d /sysroot/etc ]; then
+    return
+  fi  
+  
+  logi "Failed to open existing disk,fallback to recovery (secure)"
+
+  mount_recovery
+  if [ $? -eq 0 ]; then
+    logi "Recovery mounted"
+    export MODE=r
+    # TODO: REMOVE BEFORE RELEASE 
+    #busybox ash
+    return
+  fi
+  lfatal "Failed to mount recovery"
+}
+
+
+# Main entry point - called by the init script
+initramfs_init() {
+  initramfs_common
+
+  bootd=$(findfs LABEL=BOOT_BTRFS)
+  if [ -n "$bootd" ]; then
+    mount_disk $bootd btrfs /z
+    mount_boot
+    logi "Boot BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
+  else 
+    lfatal "BOOT_BTRFS partition not found"
+  fi
+
+  
+  if [ "${MODE}" = "r" ]; then
+    mount_recovery
+    logi "Recovery requested and mounted"
+  else 
+    load_tpm
+    # At this point we should have a tpm
+    find_root
+    logi "Rootfs mounted"
+  fi
+
+  root_conf
+
+  move_mounted_to_sysroot
+
+  if [ "$MODE" = "r" ]; then
+    logi "Start recovery image (insecure config)"
+    exec switch_root /sysroot /sbin/init-pod host
+  elif [ -f /sysroot/init ]; then
+    logi "Preparing to switch root - custom init"
+    exec switch_root /sysroot /init
+  else
+    logi "Preparing to switch root"
+    exec switch_root /sysroot /sbin/init
+  fi
+  lfatal "Failed to switch root"
+}
+
+## When running a PID 1 - run a initramfs init, depending on environment.
+if [ "$$" = "1" ]; then
+  initramfs_init
+else
+  $*
+fi
+

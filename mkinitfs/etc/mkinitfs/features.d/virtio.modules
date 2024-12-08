@@ -1,0 +1,10 @@
+kernel/drivers/iommu/*
+kernel/fs/fuse/virtiofs*
+kernel/drivers/dnvdimm/virtio*
+kernel/drivers/virtio
+kernel/drivers/block/virtio*
+kernel/drivers/net/virtio_*
+kernel/drivers/char/virtio_*
+kernel/drivers/gpu/drm/virtio
+kernel/drivers/gpu/drm/virtio
+kernel/drivers/scsi/virtio*

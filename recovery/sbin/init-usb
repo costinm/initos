@@ -1,0 +1,131 @@
+#!/bin/sh
+
+# Init script for USB and 'debug' boot - will NOT be used with signed UKI images since
+# it provides root shell access.
+#
+# Use for installing to signed UKI - followed by enabling secure boot.
+# In case of problems - disable secure boot and use this image.
+#
+# This does not attempt to unlock LUKS or use TPM2 - it should not be available.
+
+# Issue: on first boot into secure mode, LUKS will not be unlocked since we changed
+# the parameters. So first time requires a ssh access from the 'control plane' to
+# save the key into TPM2. The control plane has the root key to unlock the LUKS recovery.
+
+# For insecure mode - load the hash from the EFI (not the one locked on the init), the
+# image may change. Still use dm-verity to provide checking the hash for corruption,
+# but it is insecure anyways.
+export HASH_PREFIX=/boot/efi
+
+. /sbin/init-common.sh
+
+# Logic to find an mount the root device.
+#
+# To properly mount we also need to find the modules/firmware, and will also mount
+# the recovery image which can be used as a container/chroot.
+#
+# - in 'dev' mode - wait for a key for 6 seconds.
+#    - 'r' will use the recovery image on USB (by label)
+#    - 'a' will use the recovery image on USB (by label), open a shell
+#    - 'c' will mount the LUKS with user-input
+#    - default - will try to mount LUKS with TPM2, fallback to recovery
+# - in 'secure' mode - will attempt to boot LUKS with TPM2, fallback to recovery
+# - recovery and boot partitions are mounted
+# -
+find_root() {
+  # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
+  #  (opinionated partitioning, 1 is EFI)
+  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  if [ -n "$cryptd" ]; then
+    mount_cryptd $crypted
+  else 
+    logi "No LUKS partition found - mounting plain text disk"
+    mkdir -p /x
+    mount -o bind /z /x
+    # This is called for LUKS after mounting /dev/mapper/c to /x
+    mount_rootfs
+  fi 
+
+  if [ -d /sysroot/etc ]; then
+    echo "Using user mount sysroot."
+    return
+  fi
+  
+  # mount the recovery from the boot as rootfs
+  mount_recovery
+  echo "Done mounting recovery as sysroot "
+}
+
+# Main entry point - called by the init script
+initramfs_init() {
+  initramfs_common
+
+  if [ "$MODE" = "a" ]; then
+        busybox sh
+        set -x
+  fi
+
+  if [ "$MODE" = "u" ]; then
+    initramfs_mods_usb
+    bootd=$(findfs LABEL=USB_BOOT_BTRFS)
+    if [ -n "$bootd" ]; then
+      mount_disk $bootd btrfs /z
+      mount_boot
+      logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
+    fi
+  fi
+
+  if [ ! -d /z/initos ]; then 
+    # USB_BOOT disk not found - normal boot from hardware
+    bootd=$(findfs LABEL=BOOT_BTRFS)
+    if [ -n "$bootd" ]; then
+      mount_disk $bootd btrfs /z
+      mount_boot
+      logi "Boot USB_BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
+    else
+      lfatal "BOOT_BTRFS partition not found"
+    fi
+  fi
+
+
+  if [ "${MODE}" = "r" ]; then
+    mount_recovery
+    logi "Recovery requested and mounted"
+  else 
+    # At this point we should have a tpm
+    load_tpm
+    find_root
+    logi "Rootfs mounted"
+  fi
+
+  # Only unsigned debug image
+  if [ "$MODE" = "r" ] || [ "$MODE" = "a" ]; then
+    logi "Run additional setup before - root is in /sysroot"
+    chroot /sysroot passwd -d root
+    /bin/busybox sh
+  fi
+
+  root_conf
+
+  move_mounted_to_sysroot
+
+  if [ "$MODE" = "s" ]; then
+    exec switch_root /sysroot /bin/sh
+  elif [ "$MODE" = "r" ]; then
+    logi "Start recovery image (insecure config)"
+    exec switch_root /sysroot /sbin/init-pod host
+  elif [ -f /sysroot/init ]; then
+    logi "Preparing to switch root - custom init"
+    exec switch_root /sysroot /init
+  else
+    exec switch_root /sysroot /sbin/init
+  fi
+  lfatal "Failed to switch root"
+}
+
+if [ "$$" = "1" ]; then
+  initramfs_init
+else
+  $*
+fi
+

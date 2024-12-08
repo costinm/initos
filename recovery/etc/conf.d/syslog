@@ -1,0 +1,5 @@
+# Use a circular buffer, no need to write.
+# Sending to a remote server for saving is also possible - but local files
+# are not very useful.
+SYSLOGD_OPTS="-t -C1000"
+

@@ -1,0 +1,113 @@
+#!/bin/sh
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+. /sbin/init-common.sh
+
+# Main function after modules loaded and system mounted.
+# Expects /dev/vda to be the recovery squashfs,
+# /dev/vdb modules corresponsing to the kernel.
+# /dev/vdc is the real root, expected to be btrfs.
+initramfs_init_vm() {
+  # Unlike real machine where cmdline is only for kernel, using
+  # it for basic params related to setup.
+  cmdline /proc/cmdline
+
+  # Should be about 0.4 sec at this point
+  
+  mkdir /initos
+  mount -t tmpfs root-tmpfs /initos
+
+  # When used with VM, expect vda to be the recovery/init squashfs
+  # and vdb to the the matching modules file.
+  if [ -e /dev/vdb ]; then
+    mount_overlay $(uname -r) /lib/modules/$(uname -r) /dev/vdb squashfs
+  fi
+  
+  mount_overlay recovery /initos/recovery /dev/vda squashfs
+  
+  mkdir -p /sysroot
+  
+  if [ -n "$KOPT_initos_vrw"  ]; then
+    mount -t virtiofs /dev/root /sysroot
+    if [ -e /dev/vdc ]; then
+      mkdir -p /x
+      mount -t btrfs /dev/vdc /x
+    fi
+  else 
+    bootd=$(findfs LABEL=rootfs)
+    if [ -n "$bootd" ]; then
+      # This takes a long time
+      #echo Loading btfs module
+      #cat /proc/uptime
+      #time modprobe btrfs
+      #cat /proc/uptime
+      mount -t ext4 $bootd /sysroot
+    else 
+      mount -o bind /initos/recovery /sysroot
+    fi
+  fi
+
+  if [ ! -e /sysroot/etc ]; then
+      echo "No rootfs found"
+      poweroff -f
+  fi
+
+  if [ -n "$KOPT_initos_vx"  ]; then
+    mkdir -p /x
+    mount -t virtiofs /dev/root /x
+  fi
+
+    # Will get the link local IPv6 address 
+    ifconfig eth0 up
+    ifconfig lo up
+
+    #chroot /sysroot passwd -d root
+
+    #echo "Before chroot"
+    #busybox sh
+    # Test the time to do a start, init, cmd, poweroff
+    if [ -n "$KOPT_cmd1"  ]; then
+      ${KOPT_cmd1}
+      poweroff -d 0 -f
+    fi
+    set -x
+    move_mounted_to_sysroot
+
+    #busybox sh
+    if [ -n "$KOPT_cmd"  ]; then
+      exec switch_root /sysroot ${KOPT_cmd}
+    fi
+
+    exec switch_root /sysroot /sbin/init
+}
+
+core_mods() {
+  # Required for debian
+  modprobe virtio_console
+  modprobe virtio_pci
+
+  # Not present on debian
+  #modprobe virtio_iommu
+
+  modprobe virtio_net
+  modprobe squashfs
+  modprobe virtio_blk
+}
+
+initramfs_init() {
+  initramfs_1st
+  mount_proc
+  # At this point - no filesystems, only md, mdp, blkext block devices.
+  core_mods
+
+  initramfs_init_vm
+}
+
+
+if [ "$$" = "1" ]; then
+  initramfs_init
+else
+  # Running as a script - from shell.
+  $*
+fi
