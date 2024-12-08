@@ -4,14 +4,15 @@
 # Testing if it works on debian or can be simplified.
 
 VERSION=3.10.2-r1
-sysconfdir="${SYSCONFDIR:-/etc/mkinitfs}"
-datadir="${DATADIR:-/usr/share/mkinitfs}"
+# Both in the same location, outside of the rootfs.
+sysconfdir="${SYSCONFDIR:-/opt/mkinitfs/etc/mkinitfs}"
+datadir="${DATADIR:-/opt/mkinitfs}"
 
 config="$sysconfdir"/mkinitfs.conf
-init="$datadir"/initramfs-init
-fstab="$datadir"/fstab
-passwd="$datadir"/passwd
-group="$datadir"/group
+init="$datadir"/bin/init
+fstab="$datadir"/etc/fstab
+passwd="$datadir"/etc/passwd
+group="$datadir"/etc/group
 
 startdir=$PWD
 
@@ -55,16 +56,16 @@ initfs_base() {
 		| cpio --quiet -pdm "$tmpdir" || return 1
 
 	# copy init
-	cd "$startdir"
-	install -m755 "$init" "$tmpdir"/init || return 1
-	# copy modloop signature
-	if [ -n "$modloop_sig" ]; then
-		install -Dm644 "$modloop_sig" \
-			"$tmpdir"/var/cache/misc/${modloop_sig##*/}
-	fi
-	for i in "$fstab" "$passwd" "$group"; do
-		install -Dm644 "$i" "$tmpdir"/etc/${i##*/} || return 1
-	done
+	# cd "$startdir"
+	# install -m755 "$init" "$tmpdir"/init || return 1
+	# # copy modloop signature
+	# if [ -n "$modloop_sig" ]; then
+	# 	install -Dm644 "$modloop_sig" \
+	# 		"$tmpdir"/var/cache/misc/${modloop_sig##*/}
+	# fi
+	# for i in "$fstab" "$passwd" "$group"; do
+	# 	install -Dm644 "$i" "$tmpdir"/etc/${i##*/} || return 1
+	# done
 	cd "$oldpwd"
 }
 
@@ -154,13 +155,28 @@ initfs_firmware() {
 	return 0
 }
 
-initfs_apk_keys() {
-	mkdir -p "$tmpdir"/etc/apk/keys
-	[ "$hostkeys" ] && cp "/etc/apk/keys/"* "$tmpdir"/etc/apk/keys/
-	if [ -d "${basedir}etc/apk/keys" ]; then
-		cp "${basedir}etc/apk/keys/"* "$tmpdir"/etc/apk/keys/
-	fi
+# list_firmware will iterate over .ko files in $tmpdir/lib/modules and
+# use 'modinfo' command to list firmware.
+list_firmware() {
+	[ -z "$nokernel" ] || return 0
+	rm -rf "$tmpdir"/lib/firmware
+	mkdir -p "$tmpdir"/lib/firmware
+	# Verify if there are initfs modules
+	_modules=`find "$tmpdir"/lib/modules -type f -name "*.ko*" -print -quit`
+	[ -n "$_modules" ] || return 0
+	find "$tmpdir"/lib/modules -type f -name "*.ko*" | xargs modinfo -k $kernel -F firmware | sort -u | while read FW; do
+		echo $fname
+	done
+	return 0
 }
+
+# initfs_apk_keys() {
+# 	mkdir -p "$tmpdir"/etc/apk/keys
+# 	[ "$hostkeys" ] && cp "/etc/apk/keys/"* "$tmpdir"/etc/apk/keys/
+# 	if [ -d "${basedir}etc/apk/keys" ]; then
+# 		cp "${basedir}etc/apk/keys/"* "$tmpdir"/etc/apk/keys/
+# 	fi
+# }
 
 initfs_custom_files() {
         # shellcheck disable=SC2086 # word splitting is required
@@ -326,7 +342,6 @@ esac
 initfs_base \
 	&& initfs_kmods \
 	&& initfs_firmware \
-	&& initfs_apk_keys \
 	&& initfs_custom_files \
 	&& initfs_cpio
 rc=$?

@@ -36,11 +36,18 @@ add_base_users() {
   (userdel ubuntu || true)
 
   useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
-         -d ${h} ${USERNAME}
+         -d ${h} ${u}
+  usermod -p '*' ${u}
+
+  groupadd -g 2000 restic
+  useradd -u 2000 -g restic -G restic -s /bin/bash \
+         -d /x/backup restic
+  # -p takes an encrypted pass - so this disables pass login
+  usermod -p '*' restic
+
   mkdir -p ${h}
   chown ${u} ${h}
 
-  usermod -p '*' ${USERNAME}
 }
 
 stage() {

@@ -1,0 +1,2 @@
+kernel/drivers/char/tpm/
+kernel/drivers/i2c/

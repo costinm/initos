@@ -307,8 +307,6 @@ mok() {
   mokutil --db
   # Looks for /var/lib/sbctl/keys/db/db.key
   # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
-
-
 }
 
 ## Save the LUKS password to TPM
@@ -380,8 +378,6 @@ bootefi() {
 }
 
 efibackup() {
-  mkdir -p /etc/uefi-keys/vendor
-  cd /etc/uefi-keys/vendor
   for i in PK KEK db dbx; do efi-readvar -v $i -o $i.esl; done
 
   # Installing keys:
