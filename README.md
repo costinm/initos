@@ -1,25 +1,50 @@
 # OS initialization
 
-This project primary goal is to simplify and secure the startup, replacing Grub and usual Initrd(dracut, etc) with 
-a signed UKI EFI file that will directly boot.
+The goal is to simplify and secure the physical machine startup, replacing Grub and usual Initrd(dracut, etc) with a signed UKI EFI file that will directly boot.
 
-Target is a modern machine with TPM2 and EFI support. 
+Target is a modern machine with TPM2 and EFI secure boot support. 
 
 Unlike typical distros, the kernel, initrd and UKI are build and signed on a separate trusted machine. A normal host will not mess with the kernel/initrd or signing keys. 
 
-Once the keys are loaded and secure boot is enabled, the small
-initrd included in the EFI will:
-- use dm-verity to mount modules/firmware from a sqfs file.
+The control plane will also manage the upgrade process
+for the kernel/modules/boot environment.
+
+The small initrd included in the UKI will have minimal
+responsibilities:
+
+- use dm-verity to mount modules/firmware from a sqfs file (which also includes recovery/install image).
 - attempt to use TPM2 to unlock the primary LUKS volume
-- it expects a btrfs FS (can be swapped but I'm happy with it)
-- on the encrypted volume it can mount a subvolume, based on a config or defaults (@)
+- it expects a btrfs FS (can be swapped but I'm happy with it - main reason is 'reflink' and mountable subvols)
+- based on a config on the encrypted disk, mount a subvol as root filesystem and pass control to it.
+
+The initrd SHOULD NOT provide root shell - the bootloader is expected to be locked. All admin, 
+recovery or install should be done by the control plane, over ssh.
+
+Most operating systems that work in containers will
+also work here - like containers, the kernel and 
+modules are 'external'.
 
 # OS installation
 
-With a pair of ~200M EFI partitions taking care of kernel/initrd, the next goal is to make it easier to install the OS.
+A special USB build of InitOS is intended for install.
 
-The expectation is that the rootfs will be created using docker
-or equivalent tools, as a OCI image.
+The main change is that it does not mount the btrfs
+and it has a root shell and may run a script that doees
+unatended install or recovery. 
+
+## Partitions
+
+- 2 500M EFI partitions (for A/B). 1 is possible too with recovery from USB.
+- 1 LUKS partition for the system. 
+
+For systems with 2 or more disks, each disk should have
+an EFI and 1 LUKS for the rootfs.
+
+
+
+With a pair of ~500M EFI partitions taking care of kernel/initrd, the next goal is to make it easier to install the OS.
+
+The expectation is that the rootfs will be created using docker or equivalent tools, as a OCI image.
 
 InitOS includes helpers to pull an OCI image and copy it to a
 btrfs subvolume. Multiple such volumes can be created - and one is selected as host root, while the others can be used in

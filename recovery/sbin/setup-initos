@@ -25,45 +25,16 @@ SRCDIR=${SRCDIR:-/ws/initos}
 
 mkdir -p ${WORK}/img ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
 
-# vinit updates the initramfs for the virt kernel
-# Expectes /boot, /lib/modules, /lib/firmware to have the right
-# mounts and /boot/version-virt to hold the desired kernel version.
-# 
-# This runs in an alpine container (for now) - the init will be based
-# on the ligher musl binaries.
-vinit() {
-  VER=${1:-$(cat /boot/version-virt)}
-  if [ -z ${VER} ]; then
-    return
-  fi
-
-  # btrfs is pretty slow for a VM - the rootfs may have all the modules
-  # and load it as needed.
-  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
-  # or on virtio.
-  mkinitfs -k  -i /sbin/init-vm \
-     -F "base btrfs squashfs virtio initos" \
-     -o /x/initos/img/initramfs-${VER} ${VER}
-  
-  cp /boot/vmlinuz-${VER} /x/initos/virt
-}
-
 
 # Build the initramfs for the real kernel
 # Expectes /boot, /lib/modules, /lib/firmware to have the right
 # mounts and /boot/version to hold the desired kernel version.
 # 
 # This runs in an alpine container (for now) - the init will be based
-# on the ligher musl binaries.
+# on the lighter musl binaries.
 build_initrd() {
-  local VER=${1:-$(cat /boot/version-virt)}
-  if [ -z ${VER} ]; then
-    return
-  fi
-  local KERNEL_VERSION=$VER
-  local img=$2
-
-  echo "Built initramfs ${img} for ${KERNEL_VERSION}"
+  local VER=${1:-$(cat /boot/version)}
+  local img=${2:-/boot/initos-initrd.img}
 
   [ ! -f /lib/modules/${VER}/modules.dep ] && echo "Missing modules" && return
 
@@ -76,7 +47,9 @@ build_initrd() {
     #rm -rf ${WORK}/initrd
     # -k -t ${WORK}/initrd
 
-    echo "features=\"ata base btrfs keymap mmc nvme scsi usb cryptsetup squashfs tpm2 clevis initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
+    # Technically cryptsetup, tpm, btrfs could be loaded from recovery
+    # image, with a double pivot.
+    echo "features=\"ata base btrfs keymap mmc nvme scsi usb cryptsetup squashfs tpm2 initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
     cp /etc/passwd /usr/share/mkinitfs/passwd
     cp /etc/group /usr/share/mkinitfs/group
 
@@ -86,7 +59,35 @@ build_initrd() {
     mkinitfs -k  -i /sbin/init-usb \
       -F "ata mmc nvme scsi usb base btrfs keymap cryptsetup squashfs tpm2 initos eudev" \
       -o ${img}  $VER
+
+    # Add -k to keep and inspect
+    # Currently 90M, 54M in modules.
+
+    #rm -rf /tmp/*  
 }
+
+# vinit updates the initramfs for the virt kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version-virt to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the ligher musl binaries.
+vinit() {
+  VER=${1:-$(cat /boot/version-virt)}
+  if [ -z ${VER} ]; then
+    return
+  fi
+  mkdir -p ${WORK}/vimg/
+
+  # btrfs is pretty slow for a VM - the rootfs may have all the modules
+  # and load it as needed.
+  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
+  # or on virtio.
+  mkinitfs -k  -i /sbin/init-vm \
+     -F "base btrfs squashfs virtio initos" \
+     -o /boot/initos-vinitrd.img ${VER}
+}
+
 
 # Generate an unsigned efi image, based on alpine with a custom init script.
 # alpine_initrd is run in an alpine container, rescue or chroot.
@@ -104,31 +105,6 @@ build_initrd() {
 # The '@firmware' and '@modules' subvolumes must also be created
 # if using separate volumes - for now they're in @recovery rootfs.
 
-efi() {
-  # Expects that the modloop is already created, and the cache under ${WORK}/modules may
-  # exist.
-  mkdir -p ${WORK}/boot
-
-  # For each kernel we have a module for, create an EFI image
-  for KERNEL_VERSION in $(ls /lib/modules) ; do
-    KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-    [ ! -f ${KERNEL} ] && echo "Missing kernel ${KERNEL}" && continue
-
-    [ ! -f /lib/modules/${KERNEL_VERSION}/modules.dep ] && echo "Missing modules for $KERNEL_VERSION" && continue
-
-    local img=${WORK}/boot/initos-${KERNEL_VERSION}.img
-
-    build_initrd ${KERNEL_VERSION} ${img}
-
-    echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init iomem=relaxed" > /boot/cmdline
-
-    efi-mkuki \
-      -c /boot/cmdline \
-      -o ${WORK}/boot/InitOS-${KERNEL_VERSION}.EFI \
-        ${KERNEL} /boot/intel-ucode.img /boot/amd-ucode.img ${img}
-  done
-}
-
 # Generate the key pairs for signing the kernel and the disk image.
 # This is done before install - as a separate step/process - the rest can be automated easily,
 # but signing must be done on a secure machine and is specific to each user.
@@ -143,44 +119,46 @@ sign_init() {
      /etc/uefi-keys/root.pem
   ssh-keygen -y -f /etc/uefi-keys/root.key > \
      /etc/uefi-keys/authorized_keys
+
 }
 
-# sign creates a signed UKI.
-# The initramfs is different - the additional file will disable shell and trigger verification.
-sign() {
+sign2() {
+  # Build the initrd and EFI images.
+  ver=${1:-$(cat /boot/version)}
+  DEST=${2:-/x/initos}
   set -e
-  DEST=${DEST:-${WORK}}
 
   # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
   if [ ! -f /etc/uefi-keys/db.crt ]; then
     sign_init
   fi
 
-  mkdir -p ${DEST}/usb/EFI/BOOT/ ${DEST}/efi/EFI/BOOT \
-     ${DEST}/efi/KEYS
+  mkdir -p ${DEST}/usb/EFI/BOOT/ \
+     ${DEST}/secure/EFI/BOOT \
+     ${DEST}/usb/EFI/KEYS ${DEST}/img
 
-  cp /etc/uefi-keys/*.auth ${DEST}/efi/KEYS
-  cp /etc/uefi-keys/*.crt ${DEST}/efi/KEYS
-  cp /etc/uefi-keys/*.cer ${DEST}/efi/KEYS
-
+  cp /etc/uefi-keys/*.auth ${DEST}/usb/EFI/KEYS
+  cp /etc/uefi-keys/*.crt ${DEST}/usb/EFI/KEYS
+  cp /etc/uefi-keys/*.cer ${DEST}/usb/EFI/KEYS
+  
   cp /etc/uefi-keys/authorized_keys /boot/
-
-  # The hash must be on the signed initrd - not on the efi disk (which is mounted)
-  cp /x/initos/img/hash* /boot/
   cp /etc/uefi-keys/root.pem /boot/
 
-  chmod -R 755 ${DEST}/efi/KEYS
+  # TODO: if hash is missing, use verity to sign it now
+  if [ ! -f /boot/hash.recovery ]; then
+    veritysetup format \
+    --root-hash-file=/boot/hash.recovery \
+    /boot/recovery.sqfs \
+    /boot/recovery.sqfs.verity
+  fi
 
-  # For each hashfile, compute the signture
-  for hashfile in /boot/hash*; do
-    sigfile=${hashfile}.sig
-    cat $hashfile | xxd -r -p | openssl dgst \
-      -sha256 -sign /etc/uefi-keys/root.key \
-      -out root_hash.sig
-  done
+  # workaround for docker - mount this directory to get the latest
+  # not required.
+  if [ -d /opt/initos/sbin ]; then
+    cp /opt/initos/sbin/* /sbin
+  fi
 
-  cp /opt/initos/bin/init* /sbin/
-
+  # Additional cpio files - keys, current init
   (find /boot/hash* \
         /boot/root.pem \
         /sbin/init* \
@@ -189,159 +167,81 @@ sign() {
    | cpio --quiet --renumber-inodes -o -H newc \
    | gzip) > /tmp/initos-hashes.cpio.gz
 
-  # TODO: add authorized_keys and root.pem
-  echo "loglevel=6 console=ttyS0 console=tty1 net.ifnames=0 panic=5 debug_init rdinit=/sbin/init-usb iomem=relaxed" > /boot/cmdline
-  echo "loglevel=0 quiet console=ttyS0 console=tty1 net.ifnames=0 panic=5 rdinit=/sbin/init-secure initos.secure" > /boot/cmdline.secure
+  local cmd="console=ttyS0 console=tty1 net.ifnames=0 panic=5"
+  echo "$cmd loglevel=6 debug_init rdinit=/sbin/init-usb iomem=relaxed" > /boot/cmdline
 
-  # for each initrd
-  #for k in $(ls /boot/vmlinuz-*) ; do
-    #KERNEL_VERSION=${k##*vmlinuz-}
-    KERNEL_VERSION=$(cat /x/initos/boot/version)
-    KERNEL=/boot/vmlinuz-${KERNEL_VERSION}
-    # [ -f /boot/initos/initrd-${KERNEL_VERSION}.img ] || continue
+  echo "$cmd loglevel=0 quiet rdinit=/sbin/init-secure" > /boot/cmdline.secure
 
-    efi-mkuki \
-        -c /boot/cmdline \
-        -o ${WORK}/usb/EFI/BOOT/BOOTx64.EFI \
-          ${KERNEL} \
-          /boot/intel-ucode.img /boot/amd-ucode.img \
-          /x/initos/boot/initos-${KERNEL_VERSION}.img \
-          /tmp/initos-hashes.cpio.gz
+  KERNEL=/boot/vmlinuz-${ver}
 
-    efi-mkuki \
-      -c /boot/cmdline.secure \
-      -o /tmp/${KERNEL_VERSION}.EFI \
+  efi-mkuki \
+      -c /boot/cmdline \
+      -o ${DEST}/usb/EFI/BOOT/BOOTx64.EFI \
         ${KERNEL} \
         /boot/intel-ucode.img /boot/amd-ucode.img \
-        /x/initos/boot/initos-${KERNEL_VERSION}.img \
+        /boot/initos-initrd.img \
         /tmp/initos-hashes.cpio.gz
 
-    sbsign --cert /etc/uefi-keys/db.crt \
-      --key /etc/uefi-keys/db.key \
-      --output /x/initos/efi/EFI/BOOT/BOOTx64.EFI \
-      /tmp/${KERNEL_VERSION}.EFI
+  efi-mkuki \
+    -c /boot/cmdline.secure \
+    -o /tmp/tmp.EFI \
+      ${KERNEL} \
+      /boot/intel-ucode.img /boot/amd-ucode.img \
+      /boot/initos-initrd.img \
+      /tmp/initos-hashes.cpio.gz
 
-    rm /tmp/${KERNEL_VERSION}.EFI
-    echo Signed: $KERNEL_VERSION
+  sbsign --cert /etc/uefi-keys/db.crt \
+    --key /etc/uefi-keys/db.key \
+    --output ${DEST}/secure/EFI/BOOT/BOOTx64.EFI \
+    /tmp/tmp.EFI
 
+  rm /tmp/tmp.EFI
+
+  if [ ! -f ${DEST}/img/recovery.sqfs.img ]; then
+    cp /boot/recovery* ${DEST}/img
+  fi
+  ls -l /boot/hash*
   chmod -R 755 /x/initos
-  #done
 }
 
-# Create module sqfs files for all available modules
-mods_sqfs() {
-  for version in $(ls /lib/modules) ; do
-    mod_sqfs $version
-  done
-}
+#    sigfile=${hashfile}.sig
+#    cat $hashfile | xxd -r -p | openssl dgst \
+#      -sha256 -sign /etc/uefi-keys/root.key \
+#      -out root_hash.sig
 
-# firmware_sqfs builds /efi/firmware.sqfs using /x/initos/firmware or /lib/firmware
-firmware_sqfs() {
-
-  if [ -f /x/initos/img/firmware.sqfs ]; then
-    echo "Firmware already exists"
-    return
-  fi
-
-  if [ -d /lib/firmware ]; then
-    cd /lib/firmware
-  else
-    echo "No firmware found"
-    return
-  fi
-
-  mksquashfs . /x/initos/img/firmware.sqfs
-  veritysetup format \
-    --root-hash-file=/x/initos/img/hash.firmware \
-    /x/initos/img/firmware.sqfs \
-    /x/initos/img/firmware.sqfs.verity
-}
-
-# mod_sqfs builds /efi/modules-${version}.sqfs
-# Source should be in /x/initos/modules/${version} or /lib/modules/${version}
-mod_sqfs() {
-  ver=${1:-$(cat /boot/version)}
-  DST=${2:-/x/initos/img}
-
-  if [ -f /x/initos/img/modules-${ver}.sqfs ]; then
-    echo "Modules already exist for ${ver}"
-    return
-  fi
-
-  if [ -z "$ver" ]; then
-    echo "No version specified"
-    return
-  fi
-
-  if [ -d ${WORK}/modules/${ver} ]; then
-    cd ${WORK}/modules/${ver}
-  elif [ -d /lib/modules/${ver} ]; then
-    cd /lib/modules/${ver}
-  else
-    echo "No modules found for ${ver}"
-    return
-  fi
-
-  mksquashfs . ${DST}/modules-${ver}.sqfs
-  veritysetup format \
-     --root-hash-file=${DST}/hash.modules-${ver} \
-     ${DST}/modules-${ver}.sqfs \
-     ${DST}/modules-${ver}.sqfs.verity
-}
 
 recovery_sqfs() {
+  local name=${1:-recovery}
+  local DIR=${2:-/x/initos/img}
+
   # -one-file-system also works on the host - but not so well in a container.
   cd /
-  if [ -f /x/initos/img/recovery.sqfs ]; then 
-    echo "Recovery already exists - remove output dir for clean build"
-    return
-  fi
-  mksquashfs . /x/initos/img/recovery.sqfs -regex \
+  mkdir -p ${DIR}
+  rm -f ${DIR}/${name}.sqfs
+
+  # buildah unshare -m A=debui -- \
+  #  sh -c 'tar -cf - -C ${A} .' | \
+  #   sqfstar ${WORK}/vimg/virt.sqfs -e .dockerenv
+
+  mksquashfs . ${DIR}/${name}.sqfs \
+     -regex \
      -e "x/.*" \
      -e ".dockerenv" \
-     -e "lib/modules/.*" \
-     -e "lib/firmware/.*" \
      -e "boot/.*" \
-     -e "proc/.*" -e "sys/.*" -e "run/.*" \
-     -e "work/.*" -e "ws/.*" -e "etc/apk/cache.*"
+     -e "proc/.*" \
+     -e "sys/.*" \
+     -e "run/.*" \
+     -e "work/.*" \
+     -e "ws/.*" \
+     -e "tmp/.*" \
+     -e "etc/apk/cache.*"
 
   veritysetup format \
-    --root-hash-file=/x/initos/img/hash.recovery \
-    /x/initos/img/recovery.sqfs \
-    /x/initos/img/recovery.sqfs.verity
+    --root-hash-file=${DIR}/hash.${name} \
+    ${DIR}/${name}.sqfs \
+    ${DIR}/${name}.sqfs.verity
 }
 
-# Create the BOOT disk files. 
-dist() {
-  recovery_sqfs
-  firmware_sqfs 
-
-  mkdir -p /x/initos/boot
-
-  vvirt=$(cat /boot/version-virt)
-  if [ -n ${vvirt} ]; then
-    vinit ${vvirt}
-    if [ ! -f /x/initios/img/modules-${vvirt}.sqfs ]; then
-      mod_sqfs ${vvirt} /x/initos/img
-    fi 
-  fi
-
-  # Create the initrd and copy the boot files
-  ver=${1:-$(cat /boot/version)}
-  if [ -z ${ver} ]; then
-    ver=$(ls /lib/modules)
-    echo -n ${ver} > /boot/version
-  fi
-  mod_sqfs ${ver} 
-    
-  if [ ! -f /x/initos/boot/initos-${ver}.img ]; then
-    build_initrd ${ver} /boot/initos-${ver}.img
-    cp /boot/initos-${ver}.img /x/initos/boot/initos-${ver}.img
-  fi
-
-  mkdir -p /x/initos/boot/
-  cp -r /boot/* /x/initos/boot/
-}
 
 chk_firmware() {
   set +x
@@ -373,18 +273,81 @@ alpine_clear() {
 
 # Add the Alpine ISO image to the boot disk (expanded to EFI instead of ISO)
 # This is useful for recovery if recovery fails. 
-efi_alpine_installer() {
-  set -e
-  mkdir -p ${DIST} ${WORK}/boot
+# efi_alpine_installer() {
+#   set -e
+#   mkdir -p ${DIST} ${WORK}/boot
 
-    if [ ! -f ${WORK}/alpine.iso ]; then
-      curl -Lo ${WORK}/alpine.iso https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso
-    fi
-    cd ${WORK}/dist
-    bsdtar xf ${WORK}/alpine.iso
-    cfgf=$(ls ${DIST}/boot/config-*)
+#     if [ ! -f ${WORK}/alpine.iso ]; then
+#       curl -Lo ${WORK}/alpine.iso https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso
+#     fi
+#     cd ${WORK}/dist
+#     bsdtar xf ${WORK}/alpine.iso
+#     cfgf=$(ls ${DIST}/boot/config-*)
 
+# }
+
+export DEBIAN_FRONTEND=noninteractive
+APTINSTALL="apt install --assume-yes --no-install-recommends "
+
+# Adds Kernel, firmware, Nvidia driver.
+# Builds the initrd images for intel/amd uCode.
+# This adds X
+add_deb_kernel_nvidia() {
+
+  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
+
+  apt update
+  export INITRD=No
+  apt install -y --no-install-recommends \
+    nvidia-driver
 }
 
+# Adds Kernel, firmware, Nvidia driver.
+# Builds the initrd images for intel/amd uCode.
+add_deb_kernel() {
+  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
+
+  apt update
+  export INITRD=No
+  apt install -y --no-install-recommends \
+   linux-image-amd64 firmware-misc-nonfree \
+     firmware-linux-free \
+       firmware-realtek \
+       firmware-iwlwifi firmware-atheros \
+       amd64-microcode intel-microcode
+
+  TMPDIR=/tmp/initrd
+  rm -rf $TMPDIR
+  mkdir $TMPDIR
+
+  cd $TMPDIR
+  mkdir -p kernel/x86/microcode
+
+  if [ -d /lib/firmware/amd-ucode ]; then
+    cat /lib/firmware/amd-ucode/microcode_amd*.bin > kernel/x86/microcode/AuthenticAMD.bin
+  fi
+  find . | cpio -o -H newc >/boot/amd-ucode.img
+  
+  rm -rf kernel
+  mkdir -p kernel/x86/microcode
+  if [ -d /lib/firmware/intel-ucode ]; then
+   cat /lib/firmware/intel-ucode/* > kernel/x86/microcode/GenuineIntel.bin
+  fi
+
+  find . | cpio -o -H newc >/boot/intel-ucode.img
+
+  ver=$(ls /lib/modules)
+  echo -n ${ver} > /boot/version
+
+  # Can't stop the creation - but not used. Just need the kernel and modules.
+  rm -rf /boot/initrd.img* /tpm/* || true
+}
+
+
+# debootstrap_kernel() {
+#   mkdir /tmp/deb
+#   debootstrap --variant=minbase --print-debs sid  /tmp/deb
+
+# }
 
 $*

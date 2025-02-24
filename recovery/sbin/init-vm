@@ -9,24 +9,7 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 # /dev/vdb modules corresponsing to the kernel.
 # /dev/vdc is the real root, expected to be btrfs.
 initramfs_init_vm() {
-  # Unlike real machine where cmdline is only for kernel, using
-  # it for basic params related to setup.
-  cmdline /proc/cmdline
-
   # Should be about 0.4 sec at this point
-  
-  mkdir /initos
-  mount -t tmpfs root-tmpfs /initos
-
-  # When used with VM, expect vda to be the recovery/init squashfs
-  # and vdb to the the matching modules file.
-  if [ -e /dev/vdb ]; then
-    mount_overlay $(uname -r) /lib/modules/$(uname -r) /dev/vdb squashfs
-  fi
-  
-  mount_overlay recovery /initos/recovery /dev/vda squashfs
-  
-  mkdir -p /sysroot
   
   if [ -n "$KOPT_initos_vrw"  ]; then
     mount -t virtiofs /dev/root /sysroot
@@ -44,8 +27,15 @@ initramfs_init_vm() {
       #cat /proc/uptime
       mount -t ext4 $bootd /sysroot
     else 
+      mount -t tmpfs root-tmpfs /initos
+      # TODO: convery to ext4, faster.
+      mount_overlay recovery /initos/recovery /dev/vda squashfs
       mount -o bind /initos/recovery /sysroot
     fi
+  fi
+  if [ -n "$KOPT_initos_vx"  ]; then
+    mkdir -p /x
+    mount -t virtiofs /dev/root /x
   fi
 
   if [ ! -e /sysroot/etc ]; then
@@ -53,33 +43,27 @@ initramfs_init_vm() {
       poweroff -f
   fi
 
-  if [ -n "$KOPT_initos_vx"  ]; then
-    mkdir -p /x
-    mount -t virtiofs /dev/root /x
+
+  # Will get the link local IPv6 address 
+  ifconfig eth0 up
+  ifconfig lo up
+
+  #chroot /sysroot passwd -d root
+
+  # Test the time to do a start, init, cmd, poweroff
+  if [ -n "$KOPT_cmd1"  ]; then
+    ${KOPT_cmd1}
+    poweroff -d 0 -f
   fi
 
-    # Will get the link local IPv6 address 
-    ifconfig eth0 up
-    ifconfig lo up
+  set -x
+  move_mounted_to_sysroot
 
-    #chroot /sysroot passwd -d root
-
-    #echo "Before chroot"
-    #busybox sh
-    # Test the time to do a start, init, cmd, poweroff
-    if [ -n "$KOPT_cmd1"  ]; then
-      ${KOPT_cmd1}
-      poweroff -d 0 -f
-    fi
-    set -x
-    move_mounted_to_sysroot
-
-    #busybox sh
-    if [ -n "$KOPT_cmd"  ]; then
+  if [ -n "$KOPT_cmd"  ]; then
       exec switch_root /sysroot ${KOPT_cmd}
-    fi
+  fi
 
-    exec switch_root /sysroot /sbin/init
+  exec switch_root /sysroot /sbin/init
 }
 
 core_mods() {
@@ -98,6 +82,9 @@ core_mods() {
 initramfs_init() {
   initramfs_1st
   mount_proc
+
+  cmdline /proc/cmdline
+
   # At this point - no filesystems, only md, mdp, blkext block devices.
   core_mods
 

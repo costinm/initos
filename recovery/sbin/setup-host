@@ -61,17 +61,48 @@ wipe_disk() {
   mkfs.vfat ${disk_dev}${suffix}1 -n BOOT
 }
 
+mkLUKS() {
+  local disk_dev=$1
+  local key=$2
+
+  # Linux LUKS partition type is 8309
+  # -v -c aes-xts-plain64 -s 512 --hash sha512 --pbkdf pbkdf2 \
+  #   --iter-time 1000 --use-random
+  echo -n "${KEY}" | cryptsetup luksFormat --type luks2 ${disk_dev} -
+
+  echo -n "${KEY}" | cryptsetup luksOpen ${disk_dev} c -
+
+  mkfs.btrfs /dev/mapper/c
+  # Doesn't really matter, visible after encyption unlock.
+  btrfs filesystem label /dev/mapper/c "ROOT"
+
+  # TODO: encrypt the PASSPRASE with the root public key, save it to USB for recovery.
+  # TODO: if tpm present, save it to TPM
+}
+
+xinit() {
+    btrfs subvol create /x/vol
+    btrfs subvol create /x/@home
+    btrfs subvol create /x/@cache
+    btrfs subvol create /x/@log
+    btrfs subvol create /x/@recovery
+    mkdir /x/@recovery/rw
+
+    # Subvolume for large images (no copy on write)
+    mkdir -p /x/vol/images
+    chattr +C /x/vol/images
+
+}
+
 # Create a LUKS encrypted filesystem, with a btrtf volume on top.
 # The password is random and saved to TPM and in 'escrow' using the /boot/root.pem public key
 # (that means the mesh owner can recover the passoword)
-mkcrpyt() {
+mkcrypt() {
   local disk_dev=$1
 
   init_pass
 
-  echo -n $disk_dev > /boot/efi/ENCRYPTED_DISK_NAME
-
-  save_tpm ${KEY}
+  save_tpm_full ${KEY}
 
   echo "Consider adding a recovery key"
 
@@ -90,6 +121,7 @@ mkcrpyt() {
   # TODO: if tpm present, save it to TPM
 }
 
+
 # Add a key to the LUKS partition. This is a recovery key, not the main key - allows owner to open the disk 
 # without TPM.
 luks_add_key() {
@@ -105,6 +137,12 @@ luks_add_pass() {
   local key_file=$2
 
   cat $SECRETS/passphrase | cryptsetup luksAddKey $disk_dev
+}
+
+genpass() {
+  cat /dev/urandom | \
+     tr -dc a-zA-Z0-9 | \
+     head -c14; echo
 }
 
 init_pass() {

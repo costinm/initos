@@ -5,8 +5,10 @@
 
 VERSION=3.10.2-r1
 # Both in the same location, outside of the rootfs.
-sysconfdir="${SYSCONFDIR:-/opt/mkinitfs/etc/mkinitfs}"
-datadir="${DATADIR:-/opt/mkinitfs}"
+sysconfdir="${SYSCONFDIR:-/ws/initos/mkinitfs/etc/mkinitfs}"
+datadir="${DATADIR:-/ws/initos/mkinitfs}"
+#sysconfdir="${SYSCONFDIR:-/opt/mkinitfs/etc/mkinitfs}"
+#datadir="${DATADIR:-/opt/mkinitfs}"
 
 config="$sysconfdir"/mkinitfs.conf
 init="$datadir"/bin/init

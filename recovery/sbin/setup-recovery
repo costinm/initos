@@ -1,0 +1,250 @@
+#!/bin/sh
+
+
+### Alpine specific packages for the recovery image.
+# Not using "--no-cache" - the cache dir should be mounted
+# to /var/cache/apk/[INDEX] and /etc/apk/cache 
+
+# Default target for recovery in docker
+install() {
+  alpine_add_common
+  alpine_add_base
+  alpine_add_recovery
+
+  # Add the config files
+  
+  (cd /etc/init.d && ln -s agetty agetty.tty1)
+  (cd /etc/init.d && ln -s agetty agetty.tty2)
+  # Using busybox init
+  #rc-update add agetty.tty1 boot
+  #rc-update add agetty.tty2 default
+#  rc-update add agetty.ttyS0 boot
+#  rc-update add agetty.hvc0 boot
+
+  rc-update add devfs sysinit
+  rc-update add dmesg sysinit
+
+  # Those 3 can be used instead of udev
+  # This is the busybox mdev
+  # apk add busybox-mdev-openrc
+  # busybox-mdev busybox-mdev-openrc
+  #apk add mdev-conf
+  #rc-update add hwdrivers sysinit
+  #rc-update add mdev sysinit
+
+  # apk add --quiet mdevd mdevd-openrc
+  #rc-update add hwdrivers sysinit
+  #rc-update add mdevd-init sysinit
+  #rc-update add mdevd sysinit
+
+  # modloop will load after dev-mount, read KOPT_modoop and KOPT_modloop_verify
+  # checks using openssl using public key under /etc/apk/keys/*.pub
+  # Modules are loaded as overlay (so more can be added)
+  #rc-update del modloop sysinit
+  rc-update add udev sysinit
+  rc-update add udev-trigger sysinit
+  rc-update add udev-settle sysinit
+  rc-update add cgroups sysinit
+
+  #  rc-update add connman boot
+  rc-update add acpid boot
+  rc-update add ntpd boot
+  rc-update add wpa_supplicant boot
+  rc-update add modules boot
+  rc-update add sysctl boot
+  rc-update add hostname boot
+  rc-update add bootmisc boot
+  rc-update add syslog boot
+  rc-update add hwclock boot
+
+  rc-update add networking default
+  rc-update add sshd default
+  #rc-update add dropbear default
+  rc-update add udev-postmount default
+
+
+  rc-update add mount-ro shutdown
+  rc-update add killprocs shutdown
+  #rc-update add savecache shutdown
+
+  rc-update --update
+
+  mkdir -p /opt/initos 
+  rm -rf /tmp/*
+}
+
+alpine_add_common() {
+    echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
+    apk -U --no-progress update
+
+    #apk list -I
+
+    #apk add alpine-base # Installs openrc
+    apk add ifupdown-ng libcap2  openrc \
+     alpine-conf  alpine-release  busybox-openrc \
+     busybox-suid
+
+    
+    #setup-devd udev
+
+    # Will add busybox-mdev as baseline
+    apk add   busybox-suid busybox-binsh
+    
+  apk add ca-certificates-bundle
+    
+  apk add openssh
+  # Alternative: dropbear dropbear-openrc
+  apk add openssh-keygen
+  apk add bridge
+  apk add openssh-sftp-server
+
+  apk add curl
+
+  apk add rsync
+
+    # Using it for few things - minisign can probably be used instead.
+    # 765k bin + 5M lib
+    # apk add openssl
+    # apk add ssl_client
+    
+    
+  # from karios - not sure we need it
+  apk add  findutils findmnt \
+    htop haveged \
+    iproute2 \
+    sudo strace util-linux bridge \
+    socat tcpdump iputils procps
+  
+  # init with a single process. Can reap even if not running as PID1.
+  apk add tini
+
+  # arch-chroot works great with other OSes
+  apk add arch-install-scripts
+
+  # Recovery or host utils
+  apk add eudev eudev-hwids udev-init-scripts \
+      udev-init-scripts-openrc
+  apk del busybox-mdev-openrc mdev-conf || true
+
+  apk add iw ifupdown-ng ifupdown-ng-wifi
+  
+  apk add lsblk
+  apk add btrfs-progs
+
+  # sgdisk gptfdisk
+  apk add  parted
+  # fsck, etc
+  apk add dosfstools
+
+  apk add wpa_supplicant wpa_supplicant-openrc
+
+  apk add tpm2-tools tpm2-tss-tcti-device \
+      tpm2-tss-tcti-cmd tpm2-tss
+
+  apk add   lsscsi \
+    lvm2 \
+    irqbalance \
+    lm-sensors \
+    mdadm \
+    smartmontools 
+
+  # Others that may be useful but not required:
+
+  # apk add kmod lddtree kmod-libs
+  #  apk add iproute2 tcpdump procps
+
+  # Can also encrypt/decrypt - 3.7M + 2M for keygen
+  #apk add age
+
+  #e2fsprogs
+
+  # apk add lvm2
+}
+
+# Packages for building EFI
+alpine_add_recovery() {
+
+  # fsverity CLI
+  #apk add fsverity-utils
+
+  # To build the UKI
+  apk add binutils
+
+  apk add cryptsetup uuidgen
+
+  # clevis adds bash, jose, cacklib
+  # apk add clevis
+
+  # 400k
+  apk add minisign
+
+  apk add mkinitfs
+  echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
+
+
+  # 104 packages, 1.1G under lib/firmware
+  # /lib/modules, /boot/vmlinuz-lts (plus config, system map)
+  apk add gummiboot
+
+  # To modify keys, control efi
+  apk add efibootmgr mokutil
+
+  apk add squashfs-tools
+
+  # To decompress firmware in zstd format (debian doesn't load it)
+  apk add zstd
+
+  # troubleshooting
+  #apk add pcituils
+
+  apk add efi-mkuki
+  apk add efi-mkkeys
+  apk add sbsigntool
+
+  apk add dmidecode
+
+
+  #apk add secureboot-hook
+
+}
+
+# Base users, groups, packages.
+alpine_add_base() {
+  [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
+  mkdir -p /boot/efi
+  mkdir -p /lib/modules
+  mkdir -p /lib/firmware
+  mkdir -p /mnt/usb
+
+  addgroup -g 1000 build
+  addgroup -g 1001 admin
+  #addgroup -g 1002 tss
+
+  adduser -G build -g "Builder" build -u 1000 -D -s /bin/sh -h /home/build
+  adduser -G admin -g "Admin" admin -u 1001 -D -s /bin/sh -h /home/admin
+  #adduser -G tss -g "Builder" tss -u 1002
+
+  # Add the user to the sudoers group
+  addgroup admin wheel
+  addgroup admin kvm
+  addgroup build users # otherwise swayunlock fails, /etc/shaddow permissions
+  addgroup build video
+  addgroup build audio
+
+  # Disable IPv6 for now - seems to be broken in some cases. Can be enabled in rootfs.
+  #echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.conf
+
+  chown root /root
+
+# -H: don't create home
+# -D: no pass
+# -S - system user - nologin (i.e. /bin/login and passwd access will be disabled - ssh ok)
+# -g - 'gecos' or name
+  # Enable a system user to use login:
+  #passwd -u build
+  # Remove password: -d
+}
+
+
+$*

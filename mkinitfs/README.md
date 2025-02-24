@@ -15,3 +15,6 @@ and their dependencies (detected with lddtree)
 - initfs_kmods - copy modules and their deps.
 - initfs_firmware - for each module in the destination dir, copy the required firmware. This tool also works for a rootfs.
 - initfs_cpio - create a initrd cpio based on the current dir.
+
+
+lddtree - in pax-utils, but different CLI

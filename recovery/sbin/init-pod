@@ -12,7 +12,7 @@ USERNAME=${USERNAME:-build}
 set -eo pipefail
 # set -u is for unbound variables 
 
-function start_x() {
+start_x() {
   if [ -f /etc/init.d/dbus ]; then
     /etc/init.d/dbus start
   fi
@@ -22,75 +22,15 @@ function start_x() {
 
   rm -f /tmp/.X11-unix/* || true
 
-  if [ -f /etc/init.d/chrome-remote-desktop ]; then
-    usermod -a -G chrome-remote-desktop ${USERNAME} || true
-    /etc/init.d/chrome-remote-desktop start
-  elif [ -f /usr/bin/kasmvncserver ]; then
-    if [ -f /dev/dri/renderD128  ] ; then
-      sudo -u ${USERNAME} vncserver -hw3d -drinode /dev/dri/renderD128
-    else
-      sudo -u ${USERNAME} vncserver
-    fi 
-  fi
-}
-
-launch_xvfb() {
-    # https://medium.com/dot-debug/running-chrome-in-a-docker-container-a55e7f4da4a8
-    # Set defaults if the user did not specify envs.
-    export DISPLAY=${XVFB_DISPLAY:-:1}
-    local screen=${XVFB_SCREEN:-0}
-    local resolution=${XVFB_RESOLUTION:-1280x1024x24}
-    local timeout=${XVFB_TIMEOUT:-5}
-
-    # Start and wait for either Xvfb to be fully up,
-    # or we hit the timeout.
-    Xvfb ${DISPLAY} -screen ${screen} ${resolution} &
-    local loopCount=0
-    until xdpyinfo -display ${DISPLAY} > /dev/null 2>&1
-    do
-        loopCount=$((loopCount+1))
-        sleep 1
-        if [ ${loopCount} -gt ${timeout} ]
-        then
-            echo "[ERROR] xvfb failed to start."
-            exit 1
-        fi
-    done
-}
-
-# This can export any existing DISPLAY - and is broadly supported,
-# but not fastest.
-run_vnc_server() {
-    local passwordArgument='-nopw'
-    if [ -n "${VNC_SERVER_PASSWORD}" ]
-    then
-        local passwordFilePath="${HOME}/x11vnc.pass"
-        if ! x11vnc -storepasswd "${VNC_SERVER_PASSWORD}" "${passwordFilePath}"
-        then
-            echo "[ERROR] Failed to store x11vnc password."
-            exit 1
-        fi
-        passwordArgument=-"-rfbauth ${passwordFilePath}"
-        echo "[INFO] The VNC server will ask for a password."
-    else
-        echo "[WARN] The VNC server will NOT ask for a password."
-    fi
-    x11vnc -display ${DISPLAY} -forever ${passwordArgument} &
-    wait $!
-}
-
-
-function start_chrome_in_docker() {
-  # CHROME_CONFIG_HOME env variable is set in CRD to create a separate env.
-  # CHROME_USER_DATA_DIR is set to ~/.config/chrome-remote-desktop/chrome-profile (if found)
-
-  # --enable-logging=stderr --disable-gpu -v=1
-  # --disable-setuid-sandbox --disable-seccomp --disable-namespace-sandbox --no-sandbox  --disable-notifications --disable-seccomp-filter-sandbox
-  google-chrome   --disable-dev-shm-usage
+  if [ -f /dev/dri/renderD128  ] ; then
+    sudo -u ${USERNAME} vncserver -hw3d -drinode /dev/dri/renderD128
+  else
+    sudo -u ${USERNAME} vncserver
+  fi 
 }
 
 # Add a custom user - with PID, PGID, PUSERNAME ('pod').
-function add_main_user() {
+add_main_user() {
   local u=${USERNAME:-build}
   local h=${HOME:-/x/home/${u}}
 
@@ -121,8 +61,7 @@ function add_main_user() {
   chmod 4755 /x/sync/app/chrome/chrome-sandbox || true
 }
 
-
-function start_as_root() {
+start_as_root() {
   export USERNAME=${USERNAME:-build}
   
   echo PATH=$PATH
@@ -183,38 +122,26 @@ function start_as_root() {
   fi
 }
 
-# This seems to work without any root.
-function start_as_user() {
-  busybox syslogd -C1024
-  
-  # dbus, crd require root - but we can start kvnc as user.
-  vncserver
-}
-
-function pod() {
-  if [ $(id -u) == 0 ]; then 
-    start_as_root
-  else 
-    start_as_user
-  fi
-
-  exec sleep infinity
-}
 
 # Startup script for a VM - at this point the init has loaded the modules, 
 # pivot root has been called.
 # 
-function vm() {
+vm() {
   hostname $(cat /etc/hostname)
   ifup -a
   /etc/init.d/ssh start
-  pod
+  start_as_root
 }
 
 # Host runs when starting a real machine, not a container.
 # It is called by initrd or directly by the kernel.
 host() {
-  # Not using init 
+  if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
+      ssh-keygen -q -f /etc/ssh/ssh_host_ecdsa_key -N '' -t ecdsa
+  fi
+  busybox syslogd -C1024
+
+  # Not using init
   /sbin/openrc sysinit
   /sbin/openrc boot
   
@@ -224,21 +151,18 @@ host() {
   # Show the interfaces
   ifconfig -a
   cat /etc/ssh/*.pub
-  
-  # TODO: REMOVE BEFORE RELEASE 
-  busybox ash
+
+  wpa_supplicant -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf &
 
   # Takes care of zombies
   tini -s sleep -- infinity & 
 
-  
   busybox ash
-
 }
 
 if [ -z ${1+x} ] ; then
-  echo Starting default: use "pod" $*
-  pod
+  echo Starting default: $*
+  host
 else
   C=${1}
   shift

@@ -1,113 +1,119 @@
-#!/bin/sh
+#!/bin/bash
 
+# Setup will create the files for th efi partition, including
+# the signed UKI, using the initos image.
+
+# Additional configs that will be added to the signed UKI:
+# - authorized_keys
+# - domain
+# - root.pem - mesh root certificate
+# - hosts ?
+# - mesh.json - mesh json configuration
+SECRET=${HOME}/.ssh/initos
+mkdir -p ${SECRET}/uefi-keys
 export SRCDIR=${SRCDIR:-$(pwd)}
-export OUT=${OUT:-/x/vol/initos}
-export REPO=${REPO:-git.h.webinf.info/costin}
 
-# Build the USB and disk images using the 'recovery-full' - which includes kernel,
-# modules, firmware.
-full() {
-  images
-  sign
-}
+WORK=/x/vol/boot
 
 # Sign will use $HOME/.ssh/initos directory to create a private root key and EFI signing
 # keys on first run.
-# 
+#
 # Will use the key to sign UKI EFI files and the images, and to add additional config
-# files (wpa_config, signatures, domain, etc). 
-# 
+# files (wpa_config, signatures, domain, etc).
+#
 # It expects a /x/initos volume containing the images/ and boot/ files.
+#
+# Sign runs a container with the recovery image and keys mounted.
+# It produces a set of UKI images, including the signed one.
+#
+# Requires the sqfs file and verity hash to be already available.
 sign() {
-  set -x
+  local POD=recovery
+
+  # Update with latest files, optional
+  buildah copy $POD recovery/ /
+
+  # Create signed UKI (and unsigned one)
+  VOLS="-v ${SECRET}/uefi-keys:/etc/uefi-keys" 
+  VOLS="$VOLS -v ${WORK}:/x/initos" 
+  buildah run $VOLS $POD -- setup-initos sign2
+}
+
+dsign() {
+  docker run -it --rm  \
+     -v ${SECRET}/uefi-keys:/etc/uefi-keys \ 
+     -v ${WORK}:/x/initos \ 
+    ${REPO}/initos:latest /sbin/setup-initos sign2
+}
+
+# Same thing, using docker - copy latest files
+dsign2() {
   # in case of changes
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin:/opt/initos/bin"
+  VOLS="-v ${SECRET}/uefi-keys:/etc/uefi-keys" 
+  VOLS="$VOLS -v ${WORK}:/x/initos" 
+  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin:/opt/initos/sbin"
 
-  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
-  VOLS="$VOLS -v ${OUT}:/x/initos"
-
-  SECRET=${HOME}/.ssh/initos
-  mkdir -p ${SECRET}/uefi-keys
-
-  if [ ! -f ${SECRET}/domain ]; then
-    echo -n initos.mesh.internal. > ${SECRET}/domain
-  fi
-  DOMAIN=$(cat ${SECRET}/domain)
-  
   # Inside the host or container - initos files will be under /initos (for now)
-  docker run -it --rm -e DOMAIN=${DOMAIN} \
+  docker run -it --rm  \
       ${VOLS} \
-      -v ${HOME}/.ssh/initos/uefi-keys:/etc/uefi-keys \
-    ${REPO}/initos-full:latest /opt/initos/bin/setup-initos sign
+    ${REPO}/initos:latest /opt/initos/sbin/setup-initos sign2
 }
 
-# Dist creates the RO images and the files required for generating the EFI.
-# Should be run on an empty directory (will not re-run), when the kernel, modules
-# firmware or upstream binaries change.
-# 
-# Can be slow.
-images() {
-  
-  # Only used on the git repo, to use locally update files.
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin:/opt/initos/bin"
+##### PUSH to machines
 
-  VOLS="$VOLS -v ${OUT}:/x/initos"
+# This is the USB recovery disk - mounts the original
+# efi as efi2.
+push_recovery_usb() {
+  host=${1:-usb}
 
-  docker run -it --rm \
-      ${VOLS} \
-    ${REPO}/initos-full:latest /opt/initos/bin/setup-initos dist
+  scp -r -O ${WORK}/usb/EFI $host:/boot/efi/
+  scp -r -O ${WORK}/secure $host:/boot/efi/
+  scp -r -O ${WORK}/img $host:/boot/efi/initos
 }
 
-images_host() {
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin:/opt/initos/bin"
-  VOLS="$VOLS -v /lib/firmware:/lib/firmware"
-  VOLS="$VOLS -v /lib/modules:/lib/modules"
-  VOLS="$VOLS -v /boot:/boot"
+push_recovery() {
+  host=${1:-usb}
 
-  VOLS="$VOLS -v ${OUT}:/x/initos"
-
-  docker run -it --rm \
-      ${VOLS} \
-    ${REPO}/initos-recovery:latest /opt/initos/bin/setup-initos dist
-
+  scp -r -O ${WORK}/img $host:/boot/efi2/initos
+  scp -r -O ${WORK}/secure/EFI $host:/boot/efi2/
 }
 
+push_usb() {
+  host=${1:-host18}
 
-push() {
-  local host=${1:-host8}
+  ssh $host mount /dev/sda1 /mnt/usb
 
-  # Expects /z/initos/usb to be the USB EFI partition and 
-  # /z/initos/boot/efi to be the 'canary' EFI partition.
-  rsync -avuz ${OUT}/ ${host}:/z/initos/ \
-     --exclude virt/ --exclude boot/ --exclude work/
+  scp -r -O ${WORK}/usb/EFI $host:/mnt/usb
+  scp -r -O ${WORK}/secure $host:/mnt/usb
+
+  ssh $host umount /mnt/usb
 }
 
-test() {
-  local host=${1:-host8}
-  set -e
+push_usb_all() {
+  host=${1:-host18}
 
-  sign
-  push
+  ssh $host mount /dev/sda1 /mnt/usb
 
-  ssh ${host} "sync && reboot -f &"
+  scp -r -O ${WORK}/usb/EFI $host:/mnt/usb
+  scp -r -O ${WORK}/secure $host:/mnt/usb
+  scp -r -O ${WORK}/img $host:/mnt/usb/initos
+
+  ssh $host umount /mnt/usb
 }
 
-testall() {
-  local host=${1:-host8}
-  set -e
-  ./dbuild.sh all
-  ./dbuild.sh deb
-  sudo rm -rf ${OUT}/img
-  images
-  sign
-  push
+push_secure() {
+  host=${1:-host18}
 
-  ssh ${host} "sync && reboot -f &"
+  scp -r -O ${WORK}/secure/EFI $host:/boot/efi
 }
 
-if [ $# -eq 0 ]; then
-  images
-  sign
-else 
-  $*
-fi
+push_secure_all() {
+  host=${1:-host18}
+
+  scp -r -O ${WORK}/img $host:/boot/efi/initos
+  scp -r -O ${WORK}/secure/EFI $host:/boot/efi
+}
+
+$*
+
+

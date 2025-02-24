@@ -23,7 +23,6 @@ initramfs_1st() {
     /proc \
     /sys \
     /dev \
-    /sysroot \
     /media/cdrom \
     /media/usb \
     /tmp \
@@ -33,8 +32,6 @@ initramfs_1st() {
   # Spread out busybox symlinks and make them available without full path
   # This appears slightly faster than having the initramfs include all symlinks ?
   /bin/busybox --install -s
-
-  mkdir -p /sysroot /z /x /initos
 
   # Make sure /dev/null is a device node. If /dev/null does not exist yet, the command
   # mounting the devtmpfs will create it implicitly as an file with the "2>" redirection.
@@ -66,6 +63,11 @@ mount_proc() {
   [ -d /dev/pts ] || mkdir -m 755 /dev/pts
 
   mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+  
+  mkdir -p /sysroot /z /x /initos /boot/efi \
+     /boot/efi2 /lib/modules /lib/firmware \
+     /home /var/log /var/cache
+
 
   # shared memory area (later system will need it)
   mkdir -p /dev/shm
@@ -82,39 +84,36 @@ mount_proc() {
 initramfs_common() {
   initramfs_1st
   mount_proc
+  
+  # Not sure this is still needed (used for vm)
   cmdline /proc/cmdline
 
   logi "Starting INITOS initramfs $(uname -r)"
 
   sysctl -w kernel.printk="2 4 1 7"
 
-  # Required on alpine kernel - without this there is no display
-  # Debian appears to have it compiled in the kernel.
-  modprobe -a simpledrm
-
-  # Load a set of core modules we use
+  # Load a set of core modules we use to load the VERITY
+  # image.
   initramfs_mods
-
-  host_files
 
   # Attempt to find the root device - need to load modules and check blocks until
   # we find the root we want.
   udev_start
 
-  echo "Press 'r' for recovery (BTRFS_ROOT)"
-  echo "      'c' for manual LUKS" 
-  echo "      'u' for using USB disk (USB_BTRFS_ROOT) for recovery" 
+  echo "Press 'r' for remote recovery"
+  echo "      'c' for manual LUKS unlock" 
   # Also: "a" for admin boot - will enable shells during init
   # "s" for starting a shell in the rootfs. Both only in insecure mode.
   read -t 4 -n 1 key
+
   export MODE=$key
 
   udevadm settle
-
 }
 
 # Mount a partition to a destination, creating the dir. For vfat also run a fsck
 # and remove remaining FSCK files after.
+# This is used for the EFI partition, to find the VERITY image.
 mount_disk() {
   bootd=${1}
   boott=${2:-vfat}
@@ -132,7 +131,7 @@ mount_disk() {
   fi
   
   if [ "$boott" == "vfat" ] ; then
-    rm ${dst}/FSCK*.REC || true
+    rm -f ${dst}/FSCK*.REC || true
   fi
 }
 
@@ -141,6 +140,10 @@ mount_disk() {
 # or nlplug-findfs, but we may skip that if the core modules are enough.
 initramfs_mods() {
   # Not including USB drivers.
+
+  # Required on alpine kernel - without this there is no display
+  # Debian appears to have it compiled in the kernel.
+  modprobe -a simpledrm
 
   modprobe scsi_mod
   # Support scsi disks - needed for sata ?
@@ -152,8 +155,8 @@ initramfs_mods() {
   modprobe squashfs
   modprobe loop
   modprobe dm-verity
+  modprobe mmc_block
   # btrfs, vfat are are normally present - but may be loaded if missing
-
 }
 
 # Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
@@ -170,127 +173,105 @@ initramfs_mods_usb() {
 }
 
 
-# Mount the boot disk - with recovery, firmware, modules, etc.
-# Each component is a separate unionfs.
+# Mount the boot image - verity and unionfs
+# This is (usually, for simplicity) the EFI partition.
 mount_boot() {
-  local dir=${1:-/z/initos/img}
+  local dir=${1:-/boot/efi/initos/img}
 
   # It would be tempting to add persistent overlay here and make the root
   # modifiable - but that breaks the security model, we can't verify the overlay.
   # For any configs, certs, etc - we can add them to the UKI or rebuild.
-  mkdir -p /initos /z/initos/log
+  mkdir -p /initos /z/initos/log /z/initos/initos
+
   mount -t tmpfs root-tmpfs /initos
 
   mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
-  logi "Mounting boot partition, signatures"
 
-  #mount_verity recovery /initos/recovery ${dir}
+  logi "Mounting boot partition, signatures"
 
   ver=$(uname -r)
 
-  if [ -f ${dir}/alpinehost-${ver}.sqfs ]; then
+  if [ -f ${dir}/recovery.sqfs ]; then
     mkdir -p /lib/firmware
     mkdir -p /lib/modules/${ver}
-    mount_verity alpinehost-${ver} /z/initos/alpinehost ${dir}
-    mount -o bind /z/initos/alpinehost/lib/firmware /lib/firmware
-    mount -o bind /z/initos/alpinehost/lib/modules/${ver} /lib/modules/${ver}
+    mount_verity recovery /initos/recovery ${dir}
+    mount -o bind /initos/recovery/lib/firmware /lib/firmware
+    mount -o bind /initos/recovery/lib/modules/${ver} /lib/modules/${ver}
     return
-  fi
-
-  if [ -f ${dir}/firmware.sqfs ]; then
-    mkdir -p /lib/firmware
-    mount_verity firmware /lib/firmware ${dir}
-  fi
-
-  if [ -f ${dir}/modules-${ver}.sqfs ]; then
-    mkdir -p /lib/modules/${ver}
-    mount_verity modules-${ver} /lib/modules/${ver} ${dir}
   fi
 }
 
-mount_boot_persistent() {
-  local dir=${1:-/z/initos/img}
+# Mount a SQFS file as a dm-verity device (if signatures found on the
+# initrd /boot dir, in secure mode).
+#
+# The destintion dir will be an overlay drive.
+mount_verity() {
+  local name=$1
+  local dst=$2
+  local dir=${3:-/z/initos/img}
 
-  # It would be tempting to add persistent overlay here and make the root
-  # modifiable - but that breaks the security model, we can't verify the overlay.
-  # For any configs, certs, etc - we can add them to the UKI or rebuild.
-  mkdir -p /initos /z/initos/log
-  mount -o bind /z/initos /initos
+  # TODO: move it all to /var/lib/initos/ and /opt/initos
+  mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name}
 
-  mkdir -p /initos/recovery /initos/ro /initos/work /initos/rw
-  logi "Mounting persistent boot partition"
+  # The hash is on the /boot UKI, created by sign !
 
-  #mount_verity recovery /initos/recovery ${dir}
-
-  if [ -f ${dir}/firmware.sqfs ]; then
-    mkdir -p /lib/firmware
-    mount_verity firmware /lib/firmware ${dir}
+  # For SECURE, use /boot/hash.${name} which is signed. For insecure - it is only
+  # used to verify integrity, not authenticity.
+  veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity \
+      $(cat /boot/hash.${name})
+  if [ $? -ne 0 ]; then
+     logi "Error: Failed to mount ${name} - verity integrity or missing files"
+     
+     lfatal "Error: Failed to mount ${name}"
+     return 1
   fi
 
-  ver=$(uname -r)
-  if [ -f ${dir}/modules-${ver}.sqfs ]; then
-    mkdir -p /lib/modules/${ver}
-    mount_verity modules-${ver} /lib/modules/${ver} ${dir}
-  fi
+  mount_overlay $name $dst /dev/mapper/${name} squashfs
 }
 
 # Configure the sysroot with files from the signed image (for secure)
 # or unsecure image (if LUKS failed).
 root_conf() {
   mkdir -p /sysroot/boot
-  cp /boot/root.pem /sysroot/boot/root.pem
+  if [ -f /boot/root.pem ]; then
+    cp /boot/root.pem /sysroot/boot/root.pem
+  fi
+  if [ -f /boot/domainname ]; then
+    cp /boot/domainname /sysroot/boot/domainname
+  fi
+
+  # Set MAC to the mac address
+  find_mac
+
   # Just in case
   rm -f /sysroot/.dockerenv
 
-  if [ -d /x/initos ]; then
+  # Save logs for this boot
+  if [ -d /x/initos/log ]; then
     edump /sysroot/x/initos/log/boot
+    mv /tmp/hwdrivers* /sysroot/x/initos/log/boot
   fi
 }
 
-# Mount recovery using the signed image
-# Few untrusted files will be added for networking, from the non-encrypted disk.
-# Keep the ssh keys separate from the ones in the encrypted disk.
-mount_recovery() {
-  dir=${1:-/z/initos/insecure}
-
-  if [ -d /z/initos/alpinehost/etc ] ; then 
-    mount -o bind /z/initos/alpinehost /sysroot
-  else   
-    logi "Mounting recovery squash as rootfs"
-    mount_verity recovery /sysroot /z/initos/img
-  fi
-
-  if [ -f ${dir}/interfaces ]; then
-    cp ${dir}/interfaces /sysroot/etc/network/interfaces
-  fi
-  if [ -d ${dir}/ssh ]; then
-    cp -a ${dir}/ssh /sysroot/etc
-  fi
+is_secure() {
+  modprobe efivarfs
+  mount -t efivarfs none /sys/firmware/efi/efivars
   
-  # TODO: from boot partition !
-  if [ -f ${dir}/authorized_keys ]; then
-    mkdir -p /sysroot/root/.ssh
-    chown -R root /sysroot/root
-
-    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
-  fi
-  if [ -f ${dir}/wpa_supplicant.conf ]; then
-    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
-  fi
-  if [ ! -f /sysroot/etc/resolv.conf ]; then
-    echo "nameserver 1.1.1.1" > /sysroot/etc/resolv.conf
-  fi
+  LD_LIBRARY_PATH=/initos/recovery/usr/lib \
+     /initos/recovery/usr/bin/mokutil --sb-state
 }
 
-load_tpm() {
+# After mounting /lib/modules and firmware, load all drivers.
+load_drivers() {
     # this is normally done by sysinit - we want tpm2 to be loaded
   # Needs to happen after full firmware and modules are in place
-  hwdrivers > /z/initos/log/hwdrivers.log 2>&1
+  hwdrivers > /tmp/hwdrivers.log 2>&1
   logi "hwdrivers loaded $(ls -l /dev/tpm*)"
   udevadm trigger
   udevadm settle
+
   logi "udevadm settle $(ls -l /dev/tpm*)"
-  hwdrivers  /z/initos/log/hwdrivers2.log 2>&1 # TPM seems to need some time to init
+  hwdrivers  /tmp/hwdrivers2.log 2>&1 # TPM seems to need some time to init
   logi "hwdrivers2 $(ls -l /dev/tpm*)"
 }
 
@@ -311,24 +292,17 @@ move_mounted_to_sysroot() {
   sync
 }
 
-
-
-export LOG_V=""
-
 # Info log - shown on console, logged.
 logi() {
 	last_emsg="$*"
 	echo "INITOS: $last_emsg..." > /dev/kmsg
-
 	echo "$last_emsg\n"
 }
 
 # Verbose log - saved but not shown on console
 logv() {
   local msg="$*"
-  # TODO: if serial (usb) console available - use it (headless)
-
-  LOG_V="${LOG_V}\n${msg}"
+	echo "INITOS: $msg..." > /dev/kmsg
 }
 
 lfatal() {
@@ -362,8 +336,6 @@ edump() {
   # current date and time
   export LOG_DIR=${dst}/$(date +"%Y-%m-%d-%H-%M-%S")
   mkdir -p ${LOG_DIR}
-
-  echo $LOG_V > ${LOG_DIR}/logv
 
   echo "$ORIG_DEVICES" > ${LOG_DIR}/devices_before_mods
 
@@ -427,33 +399,6 @@ unlock_tpm() {
   echo -n "$PASSPHRASE" | cryptsetup open $part c -
 }
 
-# Mount a SQFS file as a dm-verity device (if signatures found on the
-# initrd /boot dir, in secure mode).
-#
-# The destintion dir will be an overlay drive.
-mount_verity() {
-  local name=$1
-  local dst=$2
-  local dir=${3:-/z/initos/img}
-
-  # TODO: move it all to /var/lib/initos/ and /opt/initos
-  mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name}
-
-  # TODO: the hash should be in same dir with the file, but also 
-  # add a signature. And make it hidden.
-  HASH_DIR=${HASH_DIR:-${dir}}
-  
-  # For SECURE, use /boot/hash.${name} which is signed. For insecure - it is only
-  # used to verify integrity, not authenticity.
-  veritysetup open ${dir}/${name}.sqfs ${name} ${dir}/${name}.sqfs.verity \
-      $(cat ${HASH_DIR}/hash.${name})
-  if [ $? -ne 0 ]; then
-     logi "Error: Failed to mount ${name} - verity integrity or missing files"
-     lfatal "Error: Failed to mount ${name}"
-     return 1
-  fi
-  mount_overlay $name $dst /dev/mapper/${name} squashfs
-}
 
 # Mount an overlayfs on top of a squashfs, dm-verity or other RO device.
 # name and destination are needed, device (default to /dev/mapper/NAME)
@@ -480,10 +425,40 @@ mount_overlay() {
   fi
 }
 
-# Unlock a LUKS partition.
-# This may need to be changed to unlock multiple partitions, and do a btrfs 
-# scan to find fs that span multiple disks
-mount_cryptd() {
+# Logic to find and mount the root device.
+#
+# To properly mount we also need to find the modules/firmware, and will also mount
+# the recovery image which can be used as a container/chroot.
+#
+# - in 'dev' mode - wait for a key for 6 seconds.
+#    - 'r' will use the recovery image on USB (by label)
+#    - 'a' will use the recovery image on USB (by label), open a shell
+#    - 'c' will mount the LUKS with user-input
+#    - default - will try to mount LUKS with TPM2, fallback to recovery
+# - in 'secure' mode - will attempt to boot LUKS with TPM2, fallback to recovery
+# - recovery and boot partitions are mounted
+# -
+
+# open LUKS drive using keyboard
+# If successful, /x will be mounted as btrfs.
+open_luks_manual() {
+  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  if [ -n "$cryptd" ]; then
+    logi Attempting to mount LUKS using keyboard $cryptd
+    cryptsetup luksOpen $cryptd c
+    if [ $? -eq 0 ]; then
+      logi "Manual LUKS worked, mounting" 
+      mount_btrfs_raw /dev/mapper/c /x
+      if [ $? -eq 0 ]; then
+        logi "BTRFS mounted using user key"
+        return
+      fi
+    fi
+    
+  fi
+}
+
+open_luks() {
   local crypted=$1
   
   echo "Found LUKS device: ${cryptd}"
@@ -491,57 +466,32 @@ mount_cryptd() {
   unlock_tpm $cryptd
   if [ $? -eq 0 ]; then
     logi "TPM unlocked, mounting btrfs on /x"
-    mount_btrfs /dev/mapper/c
+    mount_btrfs_raw /dev/mapper/c /x
     if [ $? -eq 0 ]; then
         logi "BTRFS mounted"
         return
     fi
   fi
-
-  if [ "$MODE" = "c" ]; then
-    logi "Found LUKS device, TPM failed, console unlock: ${cryptd}"
-    cryptsetup luksOpen $cryptd c
-    if [ $? -eq 0 ]; then
-      logi "Manual LUKS worked, mounting" 
-      mount_btrfs /dev/mapper/c
-      if [ $? -eq 0 ]; then
-        logi "BTRFS mounted using user key"
-        return
-      fi
-    fi
-  fi
-  logi "Can't open or mount LUKS, will fallback to recovery"
 }
 
-
-# Mount a BTRFS subvolume as /sysroot - ready for the switch root
-#
-mount_btrfs() {
-  local root_device=${1:-/dev/mapper/c}
+mount_btrfs_raw() {
+  local root_device=${1}
+  local dst=${2}
 
   BTRFS_OPTS="-o nobarrier -o compress"
 
-  # Mount the root device. It is expected that modules, firmware are present and updated.
-  mkdir -p /sysroot /x
+  mkdir -p /dst
 
-  mount -t btrfs "${root_device}" /x
+  mount -t btrfs "${root_device}" ${dst}
   if [ $? -ne 0 ]; then
       logi "Error: Failed to mount BTRFS partition"
       return 1
   fi
-  mount_rootfs
 }
 
+# Mount /sysroot from the BTRFS subvolume, mount additional volumes.
 mount_rootfs() {
   root_device=${1:-/dev/mapper/c}
-  if [ ! -d /x/vol ]; then
-    btrfs subvol create /x/vol
-  fi
-
-  if [ ! -d /x/vol/images ]; then
-    mkdir -p /x/vol/images
-    chattr +C /x/vol/images
-  fi
 
   if [ -f /x/swap ]; then
     swapon /x/swap
@@ -554,31 +504,85 @@ mount_rootfs() {
   if [ -z $INITOS_ROOT ]; then
     if [ -d "/x/@" ]; then
       INITOS_ROOT="@"
+    else
+      INITOS_ROOT="NOTFOUND"
     fi
   fi
 
-  mount -t btrfs "${root_device}" /sysroot -o subvol=${INITOS_ROOT} \
-    -o noatime -o nodiratime
-  if [ $? -ne 0 ]; then
-    logi "Error: Failed to mount BTRFS partition ${INITOS_ROOT}, fallback to recovery"
-    mount -t btrfs "${root_device}" /sysroot -o subvol=initos/recovery \
-    -o noatime -o nodiratime
+  if [ -d /x/${INITOS_ROOT} ]; then
+    mount -t btrfs "${root_device}" /sysroot -o subvol=${INITOS_ROOT} \
+      -o noatime -o nodiratime
     if [ $? -ne 0 ]; then
-        logi "Error: Failed to mount BTRFS recovery"
-        return 1
+      logi "Error: Failed to mount BTRFS partition ${INITOS_ROOT}, fallback to recovery"
     fi
   fi
 
-  mkdir -p /lib/modules /lib/firmware /home /var/log /var/cache
-  #mount -o bind /x/initos/modules /lib/modules
-  mount -o bind /x/@home /home
-  mount -o bind /x/@cache /var/cache
-  mount -o bind /x/@log /var/log
-  #mount -o bind /x/initos/firmware /lib/firmware
+  if [ -d /x/@home ] ; then
+    mount -o bind /x/@home /home
+  fi
+  if [ -d /x/@cache ]; then
+    mount -o bind /x/@cache /var/cache
+  fi
+  if [ -d /x/@log ]; then
+    mount -o bind /x/@log /var/log
+  fi
 
-  # TODO: if the lib/modules and firmware are missing - unsquash the modloop-lts after
-  # verifying the signature/
+  # if [ -d /x/@recovery/rw ]; then
+  #   echo Persistent overlay
+  #   mkdir -p /initos/precovery /x/@recovery/work
+  #   mount -t overlay \
+  #     -o lowerdir=/initos/ro/recovery,upperdir=/x/@recovery/rw,workdir=/x/@recovery/work \
+  #     overlayfs /initos/precovery
+  #   if [ $? -ne 0 ]; then
+  #      logi "Error: Failed to mount precovery"
+  #   fi
+  # fi
 }
+
+
+# Mount recovery using the signed image. This happens only if the TPM can't decrypt the LUKS partition.
+#
+# Few untrusted files will be added for networking, from the non-encrypted disk - enough to get SSH started.
+# Keep the ssh keys and IPs separate from the ones in the encrypted disk, only for remote recovery.
+mount_recovery() {
+  dir=${1:-/boot/efi/insecure}
+
+  logi "Mounting recovery squash as rootfs, using EFI minimal files"
+  if [ -d /initos/precovery/etc ]; then
+    mount -o bind /initos/precovery /sysroot
+  else
+    mount -o bind /initos/recovery /sysroot
+  fi
+
+  if [ -f ${dir}/interfaces ]; then
+    cp ${dir}/interfaces /sysroot/etc/network/interfaces
+  fi
+
+  if [ -d ${dir}/ssh ]; then
+    cp -a ${dir}/ssh /sysroot/etc
+    chmod 700 /sysroot/etc/ssh/ssh_host*
+ fi
+
+  # TODO: from boot partition !
+  if [ -f ${dir}/authorized_keys ]; then
+    mkdir -p /sysroot/root/.ssh
+    cp ${dir}/authorized_keys /sysroot/root/.ssh/authorized_keys
+    chown -R root /sysroot/root
+  fi
+ 
+  if [ -f ${dir}/wpa_supplicant.conf ]; then
+    cp ${dir}/wpa_supplicant.conf /sysroot/etc/wpa_supplicant/wpa_supplicant.conf
+  fi
+
+  # Patch the init files on the host to current version (image may be older)
+  cp /sbin/init-* /sysroot/sbin
+
+  if [ ! -f /sysroot/etc/resolv.conf ]; then
+    echo "nameserver 1.1.1.1" > /sysroot/etc/resolv.conf
+  fi
+}
+
+
 
 # retry function. Not used right now, will be used for LVM open
 retry() {
@@ -598,47 +602,6 @@ retry() {
       return $exit
     fi
   done
-}
-
-# Setup a chroot env
-setup_chroot() {
-  R=${1:-/sysroot}
-
-    # https://wiki.gentoo.org/wiki/Chroot/en
-    mount --rbind /dev ${R}/dev
-    mount --make-rslave ${R}/dev
-    mount -t proc /proc ${R}/proc
-    mount --rbind /sys ${R}/sys
-    mount --make-rslave ${R}/sys
-    mount --rbind /tmp ${R}/tmp
-
-    mount -o bind /lib/modules ${R}/lib/modules
-    mount -o bind /lib/firmware ${R}/lib/firmware
-    #mount -o bind /ws/initos ${R}/ws/initos
-    mount -o bind /x/vol/devvm-1/initos ${R}/x/initos/
-    mount -o bind /x/vol/devvm-1/initos/boot ${R}/boot
-
-}
-
-enter_chroot() {
-  R=${1:-/sysroot}
-  shift
-
- # No --net
- unshare --root=${R} --pid --mount --fork --mount-proc --uts --ipc --cgroup --propagation shared  -- $*
- #chroot ${R} /bin/busybox ash
-
-
-}
-
-chroot_clean() {
-    X=${1:-/sysroot}
-
-    umount ${X}/dev/pts
-    umount  ${X}/dev/
-    umount  ${X}/proc/
-    umount  ${X}/tmp/
-    umount  ${X}/sys/
 }
 
 cmdline() {
@@ -711,7 +674,7 @@ udev_start()
 # image customization or for the rootfs configuration.
 # In secure mode it can be signed or encrypted - but it can't hold private keys
 # secure unless TPM is used - however at that point a real disk is simpler.
-host_files() {
+find_mac() {
   if [ -f /sys/class/net/wlan0/address ]; then
     export MAC=$(cat /sys/class/net/wlan0/address)
   elif [ -f /sys/class/net/eth0/address ]; then
@@ -723,20 +686,4 @@ host_files() {
   MAC=${MAC//:/-}
 
 }
-
-# Verify the signature of a file using a public key.
-verify() {
-  file_to_verify="$1"
-  signature_file="$2"
-  public_key_file="$3"
-
-  # Calculate the SHA256 hash of the file
-  sha256_hash=$(sha256sum "$file_to_verify" | awk '{print $1}')
-
-  # Verify the signature using the public key
-  openssl dgst -sha256 -verify "$public_key_file" -signature "$signature_file" <(echo "$sha256_hash")
-
-  #minisign -Vm <file> -P RWSpi0c9eRkLp+M2v00IqZhHRq2sCG6snS3PkDu99XzIe3en5rZWO9Yq
-}
-
 

@@ -1,151 +1,191 @@
 #!/bin/sh
 
-# WIP: use dbuild.sh (docker-based build) to build the docker images
-# and dist images.
-# 
-# This script will use buildah(-style) script to do the build.
-# Syntax and model is buildah, but it can also use docker and in 
-# future kubectl and VM.
-# 
-# Like the Dockerfile, it creates a few containers:
-# - debhost: debian with kernel, firmware, modules, host tools
-# - recovery: alpine image with recovery tools
-# - debui: debian with KasmVnc, I3 - no kernel (for containers)
-# 
-# Also, experimental and for low-end machines:
-# - ahost: extends recovery using debian kernel, firmware, modules  
-# - aui: ahost + Sway ( may fold into alpinehost)
+# This script will build 2 docker images:
+# - alpinetools - alpine plus tools to build UKI and for recovery
+# - initos - aplinetools plus pre-build initrd, kernel and sqfs image
 #
-# The 'setup.sh' script is using the recovery container:
-#
-# - generate signed UKI EFI files, which  will unlock the
-#   TPM and run a rootfs (debhost or alpinehost)
+# The SQFS image contains the latest debian modules, initrd contains
+# the alpine-based initrd based on the same modules.
+# All additional files are under /boot.
 # 
-# - generates 'usb' unsigned UKI EFI, with shell access.
-# It will boot unsigned rootfs (alpineui or debhost)
+# There are 2 variants, one using Dockerfile and one with buildah.
 # 
-# - img/ - sqfs images build from different containers.
+# The 'setup.sh' script will use the initos image to create a 
+# signed EFI kernel, and initialize the keys if missing.
+# 
+# You can use setup.sh without building the OCI image first - using
+# the github-built images will be used instead. 
 
+# Using /var/cache/build as top dir - must be owned by build
+# ~/.local/share/containers point to the same place, ephemeral and can
+# be cleaned
+
+# Initos source dir - can be on the alpinetools image or on the source.
+IDIR=/ws/initos/recovery/sbin
 export SRCDIR=${SRCDIR:-$(pwd)}
+# All created files, mounted to /x/initos in container
+export WORK=${WORK:-/var/cache/build/initos}
 
-export OUT=${OUT:-/x/vol/initos/buildah}
-
-export REPO=${REPO:-git.h.webinf.info/costin}
+# Container run - script to run a command in a container
+# Current dir is /ws/initios, WORK dir is /x/initos
 
 CRUN=${SRCDIR}/recovery/sbin/run-oci
 
-export WORK=$HOME/tmp/initos
-mkdir -p $WORK
+export SRCDIR=${SRCDIR:-$(pwd)}
+export REPO=${REPO:-git.h.webinf.info/costin}
+export OUT=${OUT:-/x/vol/initos}
+
+export DOCKER_BUILDKIT=1
+
+set -e
+
+
+
+# Buildah notes:
+# It is not possible to do mknod on rootless - so inside the container it won't
+# be able to do debootstrap or similar. So instead getting the kernel in a
+# temp deb container.
 
 all() {
+  clean
 
-  debhost
-  debui
+  # Get the latest kernel.
+  # When kernel changes, rebuild everything.
+  debkernel
+
+  # Tools to build initrd (and UKI, image, etc).
+  # This must be alpine (or something with musl library) to keep initrd small.
+  # mkinitrd works with debian - but would copy libc files.
+  # Using the go/rust initrd may be better - but I think alpine and shell
+  # is easier to read and understand.
+  alpinetools
+
+
+#  # Alpinetools plus the kernel/modules/firmware to build the image
+#  # Can also use mounts when running alpinetools.
   recovery
-  alpinehost
 }
 
-clear() {
-  buildah rm debhost debui recovery alpinehost
+clean() {
+  buildah rm alpinetool recovery debkernel || true
+  buildah rmi ${REPO}/initos-base:latest || true
+  buildah rmi ${REPO}/initos:latest || true
+  # rmi -a # all images
+  rm -rf ${WORK}
 }
 
-# Debian with everything for a host - including virtual kernel
-# and modules
-debhost() {
-  POD=debhost ${CRUN} from debian:bookworm-slim
+
+# This is an alpine-based image with the tools for creating the signed
+# UEFI UKI image. It needs the modules and firwmare from the debian host, since
+# the kernel is debian (could be arch or something else - needs to
+#  be compatible)
+#
+# The mkinitfs and other tools can also be ported to debian - WIP.
+alpinetools() {
+  local POD=alpinetools 
+  buildah rm ${POD} || true
+  mkdir -p ${WORK}/work/apkcache
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+
+  buildah --name ${POD} ${VOLS} from alpine:edge
+
+  buildah copy ${POD} recovery/ /
+
+  buildah run ${POD} setup-recovery install
   
-  ${CRUN} run debhost ${IDIR}/setup-deb stage add_base_users 
-  ${CRUN} run debhost ${IDIR}/setup-deb stage add_tools 
-  ${CRUN} run debhost ${IDIR}/setup-deb stage add_kernel
-
-  ${CRUN} run debhost ${IDIR}/setup-deb stage add_vkernel
-  
+  buildah commit ${POD} ${REPO}/initos-base:latest
 }
+
+# Only the kernel and drivers (no nvidia - install on the partition)
+# The recovery is based on musl/alpine to keep it small.
+debkernel() {
+  mkdir -p ${WORK}/work/cache
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  local POD=debkernel 
+
+  buildah rm ${POD} || true
+
+  buildah --name ${POD} ${VOLS} from debian:bookworm-slim
+  buildah copy ${POD} recovery/ /
+  buildah run ${POD} -- setup-initos add_deb_kernel
+
+  buildah commit debkernel debkernel
+}
+
+recovery() {
+  local POD=recovery
+
+  buildah rm ${POD} || true
+  buildah --name ${POD} from ${REPO}/initos-base:latest
+
+  # This could be done in the container with debootstrap
+  buildah copy --from debkernel ${POD} /boot/ /boot/
+  #buildah copy --from debkernel ${POD} /lib/modules/ /lib/modules/
+  #buildah copy --from debkernel ${POD} /lib/firmware/ /lib/firmware/
+
+  buildah run \
+    --mount=type=bind,from=debkernel,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=debkernel,src=/lib/firmware,dst=/lib/firmware \
+    -v ${WORK}:/x/initos \
+    ${POD} -- setup-initos recovery_sqfs recovery /boot
+
+  buildah run \
+    --mount=type=bind,from=debkernel,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=debkernel,src=/lib/firmware,dst=/lib/firmware \
+    ${POD}  setup-initos build_initrd
+
+  buildah commit ${POD} ${REPO}/initos:latest
+}
+
+# Build roimage and verity signature, directly on the out img dir.
+#
+# Will create SQFS files for the EFI images.
+# Reques sqfstar to be installed (but can be done with another container)
+roimage() {
+  local POD=recovery
+  
+  buildah copy ${POD} recovery/ /
+  buildah run \
+    --mount=type=bind,from=debkernel,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=debkernel,src=/lib/firmware,dst=/lib/firmware \
+    -v ${WORK}:/x/initos \
+    ${POD} -- setup-initos recovery_sqfs recovery /x/initos/img
+}
+
 
 # will create the images from the running containers.
 commit() {
-  # Host images (large)
-  # 1.8GB (uncompressed)
-  ${CRUN} commit debhost ${REPO}/debhost:latest
-  # 1.2GB - without sway, 400M squash
-  ${CRUN} commit alpinehost ${REPO}/alpinehost:latest
+  # About 500MB
+  buildah push ${REPO}/initos:latest
   
-  # Containers (small-ish)
-  # About 800MB
-  ${CRUN} commit debui ${REPO}/debui:latest
 
   # About 200MB
-  ${CRUN} commit recovery ${REPO}/recovery:latest
+  buildah push ${REPO}/initos-base:latest
 }
 
-pushimg() {
-  #buildah push ${REPO}/recovery:latest oci:-
+##### Dockerfile
 
-  ver=$(buildah unshare -m A=alpinehost -- \
-   sh -c 'cat ${A}/boot/version')
+# Build the initos docker image.
+dall() {
+  docker build --progress plain  \
+     -t ${REPO}/initos-base:latest --target initos-base \
+      -f ${SRCDIR}/Dockerfile ${SRCDIR}
 
-  buildah unshare -m A=debhost -- \
-   sh -c 'tar -cf - -C ${A} .' | \
-    sqfstar ${WORK}/img/debhost-${ver}.sqfs -e .dockerenv
-  
-  buildah unshare -m A=alpinehost -- \
-   sh -c 'tar -cf - -C ${A} .' | \
-    sqfstar ${WORK}/img/alpinehost-${ver}.sqfs -e .dockerenv
+  docker build --progress plain  \
+     -t ${REPO}/initos:latest --target recovery \
+      -f ${SRCDIR}/Dockerfile ${SRCDIR}
 
+  # docker build --progress plain  \
+  #    --target out \
+  #     -o ${OUT} \
+  #     -f ${SRCDIR}/Dockerfile ${SRCDIR}
 }
 
-IDIR=/ws/initos/recovery/sbin
-
-
-debui() {
-  POD=debui ${CRUN} from debian:bookworm-slim
-  
-  ${CRUN} run debui ${IDIR}/setup-deb stage add_base_users 
-  ${CRUN} run debui ${IDIR}/setup-deb stage add_tools 
-
-  ${CRUN} run debui ${IDIR}/setup-deb stage add_kasm
-}
-
-
-# Generate recovery image as $REPO/initos-recovery:latest. Will not push.
-# A container initos-recovery running the image will be left running (sleep).
-# Will mount source dir and /x/vol/initos in the container.
-recovery() {
-  POD=recovery ${CRUN} from alpine:edge
-  ${CRUN} run recovery ${IDIR}/setup-alpine install
-
-  ${CRUN} copy recovery recovery/ /
-}
-
-upgrade() {
-  ${CRUN} run debhost apt-update 
-  ${CRUN} run debhost dist-upgrade -y 
-}
-
-extract() {
-  docker export debvm | \
-    (cd /x/vol/devvm-v/rootfs-ro/ && sudo tar -xf  - )
-}
-
-sh() {
-  ${CRUN} sh $*
-}
-
-alpinehost() {
-  ${CRUN} commit recovery alpinehost
-  POD=alpinehost ${CRUN} from alpinehost
-
-  ${CRUN} copy --from debhost alpinehost  /boot/ /boot/
-  ${CRUN} copy --from debhost alpinehost /lib/modules/ /lib/modules/
-  ${CRUN} copy --from debhost alpinehost /lib/firmware/ /lib/firmware/
-}
-
-dist() {
-  ${CRUN} run alpinehost ${IDIR}/setup-initos dist
-}
-
-sign() {
-  VOLS="-v ${HOME}/.ssh/initos/uefi-keys:/etc/uefi-keys" ${CRUN} run alpinehost ${IDIR}/setup-initos sign
+dpush() {
+  docker push ${REPO}/initos-base:latest
+  docker push ${REPO}/initos:latest
 }
 
 $*
+

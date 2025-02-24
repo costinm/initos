@@ -1,72 +1,103 @@
 #!/bin/sh
 
-# A separate script is used for 'secure' mode:
-# - look for LUKS, use tpm2 or password to unlock and load root from a BTRFS subvol
-# - fallback to verify recovery.sqfs and run it, will provide SSH server for further debug
+# A script is used for initializing 'secure' mode:
+#
+# - Default: look for LUKS, use tpm2 to unlock and load root
+#  from a BTRFS subvol. In case of failure, fallback to remote recovery.
+#
+# - Default, with keyboard unlock (c). Fallback to keyboard if TPM doeesn't 
+#   work.
+#
+# - Remote recovery mode (r or fallback): use authorized_keys from the image
+#   to allow access. The wifi settings and interfaces loaded from insecure
+#   EFI partition (dhcp equivalent) if TPM unlock fails, with
+#   ephemeral/untrusted ssh key. A remote machine needs to connect
+#   an unlock and recover, no local shell.
+#
+# - Local recovery with manual unlock (a). Ask for the LUKS key, boot to
+#   a root shell if the key is correct. Unlocking LUKS gives access to all
+#   data, having the password is equivalent to root.
+
+
+# In case of problems (forgot LUKS, can't ssh):
+# -disable secure mode, this should also clean the LUKS passwords
+# -boot from a USB image.
+#
+# The LUKS image should have a recovery password set.
 
 # Override settings in init-common
 export INIT_OS=secure
-export HASH_PREFIX=/boot
+
+# TODO: find a way to identify locked boot loader.
 
 . /sbin/init-common.sh
-
-# Logic to find an mount the root device.
-# For secure mode, expect a LUKS device.
-find_root() {
-  # TODO: if multiple - use the one on nvmexxxp2, mmc..p2, etc
-  #  (opinionated partitioning, 1 is EFI)
-  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
-  if [ -n "$cryptd" ]; then
-    logi Attempting to mount LUKS $cryptd
-    mount_cryptd $cryptd
-  else 
-    logi "No LUKS partition found - mounting plain text disk"
-    mkdir -p /x /sysroot
-    mount -o bind /z /x
-    # This is called for LUKS after mounting /dev/mapper/c to /x
-    mount_rootfs
-  fi
-
-  if [ -d /sysroot/etc ]; then
-    return
-  fi  
-  
-  logi "Failed to open existing disk,fallback to recovery (secure)"
-
-  mount_recovery
-  if [ $? -eq 0 ]; then
-    logi "Recovery mounted"
-    export MODE=r
-    # TODO: REMOVE BEFORE RELEASE 
-    #busybox ash
-    return
-  fi
-  lfatal "Failed to mount recovery"
-}
-
 
 # Main entry point - called by the init script
 initramfs_init() {
   initramfs_common
 
-  bootd=$(findfs LABEL=BOOT_BTRFS)
+  # The modules and firmwares are loaded from a VERITY SQFS on
+  # the EFI partition.
+  retry 4 findfs LABEL=BOOT
+
+  bootd=$(findfs LABEL=BOOT)
   if [ -n "$bootd" ]; then
-    mount_disk $bootd btrfs /z
+    mount_disk $bootd vfat /boot/efi
+    # Mount /lib/modules, /lib/firmware and /initos/recovery (plus aux files)
     mount_boot
-    logi "Boot BOOT_BTRFS mounted on /z from $bootd mode=$MODE"
+    logi "Boot BOOT mounted on /boot/efi from $bootd mode=$MODE"
   else 
-    lfatal "BOOT_BTRFS partition not found"
+    lfatal "BOOT partition not found, rebooting"
   fi
 
-  
+  load_drivers
+
   if [ "${MODE}" = "r" ]; then
+    # Bind-mounts recovery to /sysroot.
     mount_recovery
     logi "Recovery requested and mounted"
+  elif [ "${MODE}" = "a" ]; then
+    open_luks_manual
+    if [ ! -d /x/initos ]; then 
+      lfatal "Failed to open LUKS"
+    fi
+    mount_recovery
+    # Local shell allowed (recovery is ephemeral)
+    # This is a bit risky - an attacker could attach a LUKS disk on a separate disk, have it unlocked
+    # and get a shell that may access the TPM. So the option may be removed on a prod server, but 
+    # for now keeping it until I find a way to identify the 'locked' mode. If boot is not locked - 
+    # user can just boot a different distro.
+    chroot /sysroot passwd -d root
+  elif [ "${MODE}" = "c" ]; then
+    open_luks_manual
+    if [ ! -d /x/initos ]; then 
+      lfatal "Failed to open LUKS"
+    fi
+    mount_rootfs /dev/mapper/c
   else 
-    load_tpm
-    # At this point we should have a tpm
-    find_root
-    logi "Rootfs mounted"
+    open_luks
+    if [ ! -d /x/initos ]; then 
+      mount_recovery
+      logi "TPM unlock failed, fallback to recovery." 
+    else 
+      logi "Rootfs mounted"
+      mount_rootfs /dev/mapper/c
+    fi
+  fi
+
+  if [ ! -d /sysroot/etc ]; then
+    logi "Failed to open existing encrypted disk or no rootfs,fallback to recovery (secure)"
+
+    mount_recovery
+
+    if [ $? -eq 0 ]; then
+      logi "Recovery mounted"
+      export MODE=r
+    fi
+  fi
+
+  if [ ! -d /sysroot/etc ]; then
+    lfatal "Failed to mount recovery"
   fi
 
   root_conf
@@ -75,7 +106,10 @@ initramfs_init() {
 
   if [ "$MODE" = "r" ]; then
     logi "Start recovery image (insecure config)"
-    exec switch_root /sysroot /sbin/init-pod host
+    exec switch_root /sysroot /sbin/init
+  elif [ "$MODE" = "a" ]; then
+    logi "Unlocked LUKS, recovery shell allowed"
+    exec switch_root /sysroot /bin.sh
   elif [ -f /sysroot/init ]; then
     logi "Preparing to switch root - custom init"
     exec switch_root /sysroot /init
