@@ -1,0 +1,196 @@
+#!/bin/sh
+
+# Main function after modules loaded and system mounted.
+# Expects /dev/vda to be the recovery squashfs,
+# /dev/vdb modules corresponsing to the kernel.
+# /dev/vdc is the real root, expected to be btrfs.
+initramfs_init_vm() {
+  # Should be about 0.4 sec at this point
+  #/bin/sh
+  #set -x
+  mkdir -p /x /z
+
+  # Not using -o compress
+  if [ -e /dev/vda2 ]; then
+      # TODO: remove this, expect rootfs
+      mount -t btrfs -o nobarrier /dev/vda2 /sysroot
+      mount -t virtiofs /dev/root /z
+  elif [ -e /dev/vda ]; then
+      mount -t btrfs -o nobarrier  /dev/vda /sysroot
+      mount -t virtiofs /dev/root /z
+  else
+      # kitty and other apps don't work on virtiofs
+      mount -t virtiofs /dev/root /sysroot
+  fi
+
+  if [ -e /dev/vdb ]; then
+    mount -t btrfs -o nobarrier /dev/vdb /x
+  fi
+
+  if [ -f /sysroot/swap ]; then
+    swapon /sysroot/swap
+  fi
+  
+  ifconfig lo up
+  ifconfig eth0 up
+  ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
+  route add default gw $KOPT_initos_gw
+
+  # Test the time to do a start, init, cmd, poweroff
+  if [ -n "$KOPT_initos_cmd1"  ]; then
+    ${KOPT_initos_cmd1}
+    poweroff -d 0 -f
+  fi
+  if [ ! -e /sysroot/etc ]; then
+      echo "No rootfs found"
+      poweroff -f
+  fi
+  cp /sbin/initos* /sysroot/sbin
+  rm -f /sysroot/.dockerenv
+
+  if [ -n "$KOPT_cmd"  ]; then
+      ${KOPT_cmd} ; poweroff -f 
+  fi
+
+  if [ -f /z/sbin/initos ]; then 
+    move_mounted_to_sysroot
+    #switch_root /sysroot /bin/sh --  -c "${KOPT_cmd} && poweroff -f"
+    exec switch_root /sysroot /z/sbin/initos vm_init     
+  fi
+
+  cp /sbin/initos /sysroot/sbin/initos
+  move_mounted_to_sysroot
+  #switch_root /sysroot /bin/sh --  -c "${KOPT_cmd} && poweroff -f"
+  exec switch_root /sysroot /sbin/initos-init-vm vm_init
+}
+
+## First step - expand busybox and mount the basic filesystems.
+# Extracted from alpine init.
+initramfs_1st() {
+  # No kernel options processed - we build intitramfs and cmdline in the same efi.
+  # May read an initrc file if needed - but the goal is to keep it precise and simple.
+  # Initramfs does not include the links (for some reason?)
+  /bin/busybox mkdir -p /usr/bin \
+    /usr/sbin \
+    /proc \
+    /sys \
+    /dev \
+    /media/cdrom \
+    /media/usb \
+    /tmp \
+    /etc \
+    /run/cryptsetup
+
+  # Spread out busybox symlinks and make them available without full path
+  # This appears slightly faster than having the initramfs include all symlinks ?
+  /bin/busybox --install -s
+
+  # Make sure /dev/null is a device node. If /dev/null does not exist yet, the command
+  # mounting the devtmpfs will create it implicitly as an file with the "2>" redirection.
+  # The -c check is required to deal with initramfs with pre-seeded device nodes without
+  # error message.
+  [ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
+}
+
+# Second step, mount proc/sys, extracted from alpine init.
+mount_proc() {
+  if [ -e /proc/cmdline ]; then
+    return
+  fi
+  mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
+
+  mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null \
+    || mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev
+
+  # Make sure /dev/kmsg is a device node. Writing to /dev/kmsg allows the use of the
+  # earlyprintk kernel option to monitor early init progress. As above, the -c check
+  # prevents an error if the device node has already been seeded.
+  [ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
+
+  mount -t proc -o noexec,nosuid,nodev proc /proc
+
+  # pty device nodes (later system will need it)
+  [ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
+  [ -d /dev/pts ] || mkdir -m 755 /dev/pts
+
+  mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+  
+  mkdir -p /sysroot /z /x /initos /boot/efi \
+     /boot/efi2 /lib/modules /lib/firmware \
+     /home /var/log /var/cache
+
+  # shared memory area (later system will need it)
+  mkdir -p /dev/shm
+  mkdir -p /run
+
+  mount -t tmpfs tmpfs /run
+
+  # Module not present
+  #mount  -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+  mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+}
+
+# All remaining mounted dirs will be moved under same dir in /sysroot,
+# ready to switch_root
+move_mounted_to_sysroot() {
+  # From original alpine init
+  cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
+    if [ "$DIR" != "/" -a "$DIR" != "/sysroot" -a -d "$DIR" ]; then
+      mkdir -p /sysroot$DIR
+      mount -o move $DIR /sysroot$DIR
+    fi
+  done
+
+  sync
+}
+
+# Set KOPTS_xxx=yyy based on kernel cmdline  
+cmdline() {
+  local c=$(cat $1)
+
+  # look for "--" in cmd, extract everything after
+  # [[ is for extended tests, =~ regex
+  if [[ "$c" =~ ".*--.*" ]]; then
+    # The # means 'remove patern', ## remove longest pattern
+    export KOPT_cmd="${c#*--}"
+    # % and %% remove from the end
+    c="${c%%--*}"
+  fi
+
+  set -- $c
+
+  for opt; do
+    #echo $opt
+    # split opt in key and value
+    key="${opt%%=*}"
+    value="${opt#*=}"
+    if [[ "$key" =~ "initos.*" ]]; then
+      key=${key/-/_}
+      export "KOPT_${key/./_}"="$value" || true
+    fi
+  done
+}
+
+initramfs_mods_vm() {
+  # Required for debian
+  modprobe virtio_console
+  modprobe virtio_pci
+
+  # Not present on debian
+  #modprobe virtio_iommu
+
+  modprobe virtio_net
+  modprobe virtio_blk
+  modprobe bridge
+}
+
+if [ "$$" = "1" ]; then
+  initramfs_1st
+  mount_proc
+  cmdline /proc/cmdline
+  initramfs_mods_vm
+  initramfs_init_vm
+else
+  $*
+fi

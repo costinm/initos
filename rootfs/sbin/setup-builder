@@ -1,0 +1,285 @@
+#!/bin/sh
+
+# Initos consists of a few docker images:
+# - initos-base - alpine with tools to build the EFI UKI and signed SQFS rootfs
+# - debian-kernel - debian base with the kernel/modules installed.
+# - initos - base plus a pre-build initrd, kernel and sqfs image using debian kernel
+#
+# The 'initos' image purpose is to create an EFI partition consisting of:
+# - a signed UKI (kernel+initrd) - including root certificates and mesh configs.
+# - a verity signed SQFS, containing the files in the initos image and kernel modules/firmware 
+# 
+# Unlike a typical distro, the EFI partition is custom build on a separate build server 
+# and installed using SSH on one or more machines. It is not a general purpuse EFI that
+# can be downloaded or build locally - the build machine has the private keys to sign,
+# and the worker machines can't make any changes.
+#
+# The SQFS image contains the latest debian kernel/modules, plus the alpine base.
+# It include scripts to use TPM2 or password to unlock a Verity partition, setup
+# root certs and networking, run a ssh server for admin. 
+# It is intended as a 'host sidecar' - will remain available on the host.
+# After initialization, it will either pivot to a rootfs on the encrypted disk or 
+# run one or more VMs or containers.
+#
+# The initrd contains only the minimal script and missing modules to verify signature
+# of the SQFS.
+# 
+# Building the InitOS images
+# 
+# There are 2 variants, one using Dockerfile and one with buildah, both running the 
+# same scripts. I mostly use buildah, github actions build with docker. It is fine to 
+# use the auto-build github images - build if you want to make changes or don't trust,
+# after reviewing the scripts (and you shouldn't trust random github projects).
+# 
+# Setup the customized EFI
+# 
+# The setup script will run the initos image with 2 mounted volumes - one holding
+# the encryption keys and root configuration, and one output directory where the 
+# EFI files will be generated.
+# 
+# The EFI files can be copied to a USB disk for the initial install or recovery, or
+# copied using ssh on a machine that already runs Initos ( or other distros if you have
+# an EFI partition with ~512M space)
+# 
+# 
+# The 'setup.sh' script will use the initos image to create a 
+# signed EFI kernel, and initialize the keys if missing.
+# 
+# You can use setup.sh without building the OCI image first - using
+# the github-built images will be used instead. 
+
+# Using /var/cache/build as top dir - must be owned by build
+# ~/.local/share/containers point to the same place, ephemeral and can
+# be cleaned
+
+# Initos source dir - can be on the alpinetools image or on the source.
+export SRCDIR=${SRCDIR:-$(pwd)}
+
+# Cache for apk and deb files
+export WORK=${WORK:-${HOME}/.cache/initos}
+
+export SRCDIR=${SRCDIR:-$(pwd)}
+
+export REPO=${REPO:-git.h.webinf.info/costin}
+
+# For the docker build variant.
+export DOCKER_BUILDKIT=1
+
+set -e
+
+
+# Buildah notes:
+# It is not possible to do mknod on rootless - so inside the 
+# container it won't be able to do debootstrap or similar. 
+# So getting the kernel in a temp deb container.
+
+all() {
+  clean
+
+  # Get the latest kernel.
+  # When kernel changes, rebuild everything.
+  debkernel
+
+  # Tools to build initrd (and UKI, image, etc).
+  # This must be alpine (or something with musl library) to keep initrd small.
+  # mkinitrd works with debian - but would copy libc files.
+  # Using the go/rust initrd may be better - but I think alpine and shell
+  # is easier to read and understand.
+  initos_base
+
+ 
+  # Base + kernel + generated initrd + sqfs including debkernel modules.
+  # Used to build signed EFI images. 
+  initos_efi_builder
+}
+
+clean() {
+  buildah rm initos-base initos kernel || true
+  buildah rmi ${REPO}/initos-base:latest || true
+  buildah rmi ${REPO}/initos:latest || true
+  # rmi -a # all images
+  rm -rf ${WORK}
+}
+
+
+# This is an alpine-based image with the tools for creating the signed
+# UEFI UKI image. It needs the modules and firwmare from the debian host, since
+# the kernel is debian (could be arch or something else - needs to
+#  be compatible)
+#
+# The mkinitfs and other tools can also be ported to debian - WIP.
+initos_base() {
+  _build_cmd alpine:edge initos-base  setup-recovery install
+}
+
+# Run a single command in a container than commit it.
+# Params: BASE POD command
+_build_cmd() {
+  local BASE=$1
+  local POD=$2
+  shift; shift
+
+  # Cache directories - deb and alpine
+  mkdir -p ${WORK}/apkcache ${WORK}/lib_cache
+  VOLS="$VOLS -v ${WORK}/lib_cache:/var/lib/cache"
+  VOLS="$VOLS -v ${WORK}/apkcache:/etc/apk/cache"
+
+  buildah rm ${POD} || true
+
+  buildah pull ${BASE}
+  buildah --name ${POD} ${VOLS} from ${BASE}
+  buildah copy ${POD} rootfs/sbin /sbin
+  buildah run ${POD} -- $*
+
+  buildah commit ${POD} ${POD}
+}
+
+# Only the kernel and drivers (no nvidia - install on the partition)
+# The recovery is based on musl/alpine to keep it small.
+debkernel() {
+  _build_cmd debian:bookworm-slim kernel /sbin/setup-initos add_deb_kernel
+}
+
+debui() {
+  _build_cmd debian:bookworm-slim kernel /sbin/setup-deb ui
+}
+
+exportfs() {
+  buildah --name orig from $1
+  buildah run \ 
+     -v $2:/data
+     --mount=type=bind,from=orig,src=/,dst=/mnt \
+    initios -- cp -a /mnt/ /data
+  buidah rm orig
+}
+
+# Clean build using initos image
+initos_efi_builder() {
+  local POD=initos
+
+  buildah rm ${POD} || true
+  buildah --name ${POD} from initos-base 
+  # ${REPO}/initos-base:latest
+ 
+  initos_efi_update 
+
+  buildah commit ${POD} ${REPO}/initos-efi-builder:latest
+}
+
+initos_efi_add() {
+  local POD=initos
+
+  buildah copy ${POD} rootfs/sbin /sbin
+  buildah copy ${POD} rootfs/bin /bin
+  buildah copy ${POD} rootfs/etc /etc
+
+  VOLS="$VOLS -v ${WORK}/lib_cache:/var/lib/cache"
+  VOLS="$VOLS -v ${WORK}/apkcache:/etc/apk/cache"
+
+  buildah run ${VOLS} ${POD} -- $*
+
+}
+
+initos_efi_update() {
+  local POD=initos
+
+  buildah copy ${POD} rootfs/sbin /sbin
+  buildah copy ${POD} rootfs/bin /bin
+  buildah copy ${POD} rootfs/etc /etc
+
+  # This could be done in the container with debootstrap
+  buildah copy --from kernel ${POD} /boot/ /boot/
+
+  # Build roimage and verity signature, directly on the out img dir.
+  #
+  # Will create SQFS files for the EFI images - smaller than including
+  # the files directly and easier to use.
+
+  buildah run \
+    --mount=type=bind,from=kernel,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=kernel,src=/lib/firmware,dst=/lib/firmware \
+    ${POD} -- setup-initos vinit
+
+  buildah run \
+    --mount=type=bind,from=kernel,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=kernel,src=/lib/firmware,dst=/lib/firmware \
+    ${POD} -- setup-initos recovery_sqfs recovery /boot
+
+  buildah run \
+    --mount=type=bind,from=kernel,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=kernel,src=/lib/firmware,dst=/lib/firmware \
+    ${POD}  setup-initos build_initrd
+
+}
+
+# It still needs an initrd.
+# The image needs to be saved as a .img or sqfs.
+virt() {
+  VER=$(ls /lib/modules | grep cloud | tail)
+  # Virt files. 
+  VIRT=${VIRT:-${WORK}/vimg}
+  mkdir -p ${VIRT}
+
+  if [ ! -f ${VIRT}/ch-remote ]; then
+    virt_install
+  fi
+  if [ ! -f ${VIRT}/vmlinuz ]; then
+    cp /boot/vmlinuz-$VER ${VIRT}/vmlinuz
+  fi
+  # Build the initrd used by sign
+  buildah copy initos rootfs/sbin /sbin
+
+  buildah run -t \
+    -v ${VIRT}:/opt/virt \
+    --mount=type=bind,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,src=/lib/firmware,dst=/lib/firmware \
+      initos -- \
+    setup-initos vinit $VER
+
+  # May want to add the modules from the host image (for virt), but seems
+  # easier to just mount the sqfs if needed.
+}
+
+# will create the images from the running containers.
+commit() {
+  # About 500MB
+  buildah push ${REPO}/initos:latest
+  
+  # About 200MB
+  buildah push ${REPO}/initos-base:latest
+}
+
+##### Dockerfile
+
+# Build the initos docker image.
+dall() {
+  # docker build --progress plain  \
+  #    -t ${REPO}/initos-base:latest --target initos-base \
+  #     -f ${SRCDIR}/Dockerfile ${SRCDIR}
+
+  docker build --progress plain  \
+     -t ${REPO}/initos:latest  \
+      -f ${SRCDIR}/Dockerfile ${SRCDIR}
+
+  # docker build --progress plain  \
+  #    --target out \
+  #     -o ${OUT} \
+  #     -f ${SRCDIR}/Dockerfile ${SRCDIR}
+}
+
+dpush() {
+  # docker push ${REPO}/initos-base:latest
+  docker push ${REPO}/initos:latest
+}
+
+if [ -z ${1+x} ] ; then
+  # By default don't rebuild the deb kernel and alpine.
+  # TODO: check if they exist, pull from github
+
+  # This creates the SQFS and common initrd, after updating
+  # the scripts in the image.
+  initos_efi_builder
+else
+  $*
+fi
+

@@ -1,0 +1,259 @@
+#!/bin/sh
+
+# Build script for initos. The build typically runs 
+# inside a container with optional volumes for cache.
+#
+# The 'sign' function is the entrypoint for the container, will
+# generate a signed efi partition including the sqfs signed image
+# and patching.
+# 
+# The results:
+# - creating a 'base-recovery' image, that can be run in Docker in a trusted machine to generate signed
+# artifacts including bootstrap ssh authorized keys and user-specific roots of trust.
+#
+# - creation of a directory containing all artifacts needed for install by copying to an existing
+# USB EFI partition.
+#
+
+set -x
+set -e
+
+# Destination dir for the efi partition artifacts.
+# May include additional files to bake into images.
+# Signing the images also requires a volume holding the signing keys
+# and configs.
+WORK=${WORK:-/x/initos}
+
+mkdir -p ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
+
+
+# Build the initramfs for the real kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the lighter musl binaries.
+build_initrd() {
+  local VER=${1:-$(cat /boot/version)}
+  local img=${2:-/boot/initos-initrd.img}
+
+  [ ! -f /lib/modules/${VER}/modules.dep ] && echo "Missing modules" && return
+
+    # Uses mkinitfs.conf added from file in the docker image.
+    # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
+
+    # -k - keep the file
+    # -t - temp dir where all is stored
+    # -i - what init file to use - replace default with our script.
+    #rm -rf ${WORK}/initrd
+    # -k -t ${WORK}/initrd
+
+    # Not loaded: btrfs, tpm2
+
+    # Technically cryptsetup, tpm could be loaded from recovery
+    # image, with a double pivot.
+    cp /etc/passwd /usr/share/mkinitfs/passwd
+    cp /etc/group /usr/share/mkinitfs/group
+
+    #echo "features=\"ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
+    
+    # clevis ? 
+    #rm -rf ${WORK}/initfs.host
+    # -t ${WORK}/initfs.host
+    mkinitfs -i /sbin/initos-initrd \
+      -F "ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev" \
+      -o ${img} $VER
+
+    # /init will be the inito-initrd
+
+    # Add -k to keep and inspect, or extract it
+    # Currently 90M, 54M in modules.
+}
+
+
+# Generate an unsigned efi image, based on alpine with a custom init script.
+# alpine_initrd is run in an alpine container, rescue or chroot.
+#
+# The init image will be generated in /boot/initramfs.
+# Modules are expected to be in /lib/modules/modules-KERNEL_VERSION
+# Kernel is expected to be in /boot/vmlinux-KERNEL_VERSION
+#
+# For secure mode, kernel+initrd+cmdline are signed, but the rootfs needs to
+# be either signed or on a LUKS partition ( where encryption+signing happens as well).
+#
+# In the first case, normally the SHA of the rootfs needs to be passed as an argument
+# either in kernel cmdline or as a file in initrd.
+#
+# The '@firmware' and '@modules' subvolumes must also be created
+# if using separate volumes - for now they're in @recovery rootfs.
+
+recovery_sqfs() {
+  local name=${1:-recovery}
+  local DIR=${2:-/boot}
+
+  # -one-file-system also works on the host - but not so well in a container.
+
+  # buildah unshare -m A=debui -- \
+  #  sh -c 'tar -cf - -C ${A} .' | \
+  #   sqfstar ${WORK}/vimg/virt.sqfs -e .dockerenv
+
+  #alpine_clear
+
+  # Excluding boot from the sqfs (kernel remains on the image and is used to build
+  # the EFI, but no need to add a copy)
+  # However the cloud kernel is needed for VM
+
+  mkdir -p ${DIR}
+  rm -f ${DIR}/${name}.sqfs
+  sqfs_add ${name} ${DIR}
+}
+
+# Add the current docker image to an existing SQFS file.
+# This is useful if the kernel+modules+firmware is created independently.
+sqfs_add() {
+  local name=${1:-recovery}
+  local DIR=${2:-/boot}
+
+  cd /
+
+  # Doesn't include /boot files (kernel is separate)
+  # Includes both normal and cloud modules
+  mksquashfs . ${DIR}/${name}.sqfs \
+     -regex \
+     -e "x/.*" \
+     -e ".dockerenv" \
+     -e "boot/.*" \
+     -e "proc/.*" \
+     -e "sys/.*" \
+     -e "run/.*" \
+     -e "work/.*" \
+     -e "ws/.*" \
+     -e "tmp/.*" \
+     -e "etc/apk/cache.*"
+}
+
+# sqfs_add_kernel() {
+#   local name=${1:-recovery}
+#   local DIR=${2:-/x/initos/img}
+
+#   cd /
+
+#   mksquashfs . ${DIR}/${name}.sqfs \
+#      -regex \
+#      -i "boot/.*" \
+#      -i "lib/modules/.*" \
+#      -i "lib/firmware/.*" 
+     
+# }
+
+alpine_clear() {
+  rm /var/lib/dbus/machine-id || true
+  rm /etc/hostname || true
+  rm /etc/resolv.conf || true
+  echo "" > /etc/machine-id || true
+}
+
+export DEBIAN_FRONTEND=noninteractive
+APTINSTALL="apt install --assume-yes --no-install-recommends "
+
+# Adds Kernel, firmware, Nvidia driver.
+# Builds the initrd images for intel/amd uCode.
+# This adds X
+add_deb_kernel_nvidia() {
+
+  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
+
+  apt update
+  export INITRD=No
+  apt install -y --no-install-recommends \
+    nvidia-driver
+}
+
+# Adds Kernel, firmware
+# Builds the initrd images for intel/amd uCode.
+add_deb_kernel() {
+  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
+
+  apt update
+  export INITRD=No
+  apt install -y --no-install-recommends \
+   linux-image-amd64 firmware-misc-nonfree \
+     firmware-linux-free \
+       firmware-realtek \
+       firmware-iwlwifi firmware-atheros \
+       amd64-microcode intel-microcode
+
+  TMPDIR=/tmp/initrd
+  rm -rf $TMPDIR
+  mkdir $TMPDIR
+
+  cd $TMPDIR
+  mkdir -p kernel/x86/microcode
+
+  if [ -d /lib/firmware/amd-ucode ]; then
+    cat /lib/firmware/amd-ucode/microcode_amd*.bin > kernel/x86/microcode/AuthenticAMD.bin
+  fi
+  find . | cpio -o -H newc >/boot/amd-ucode.img
+  
+  rm -rf kernel
+  mkdir -p kernel/x86/microcode
+  if [ -d /lib/firmware/intel-ucode ]; then
+   cat /lib/firmware/intel-ucode/* > kernel/x86/microcode/GenuineIntel.bin
+  fi
+
+  find . | cpio -o -H newc >/boot/intel-ucode.img
+
+  ver=$(ls /lib/modules)
+  echo -n ${ver} > /boot/version
+
+  # Also install the cloud kernel - upgrade them at the same cadence, and
+  # will be used to run the real root as a VMs for more security.
+  # Images grows from 795 -> 909 M, Initos image from 568-> 634
+  apt install -y --no-install-recommends \
+     linux-image-cloud-amd64
+
+  # Can't stop the creation - but not used. Just need the kernel and modules.
+  rm -rf /boot/initrd.img* /tpm/* || true
+}
+
+add_virt_kernel() {
+  apt update
+  export INITRD=No
+  apt install -y --no-install-recommends \
+     linux-image-cloud-amd64
+  ver=$(ls /lib/modules)
+  echo -n ${ver} > /boot/versionv
+  # Can't stop the creation - but not used. Just need the kernel and modules.
+  rm -rf /boot/initrd.img*  || true
+}
+
+# vinit updates the initram-Fs for the virt kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version-virt to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the ligher musl binaries.
+vinit() {
+  # VER=${1:-$(cat /boot/version-virt)}
+  # if [ -z ${VER} ]; then
+    VER=$(ls /lib/modules | grep cloud | tail)
+  #fi
+  mkdir -p ${WORK}/vimg/
+
+  cp /boot/vmlinuz-${VER} /opt/virt/vmlinuz
+  # btrfs is pretty slow for a VM - the rootfs may have all the modules
+  # and load it as needed.
+  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
+  # or on virtio.
+  mkinitfs -k  -i /sbin/initos-initrd-vm \
+     -F "base btrfs virtio initosvm" \
+     -o /opt/virt/initramfs ${VER}
+}
+
+
+# debootstrap_kernel() {
+#   mkdir /tmp/deb
+#   debootstrap --variant=minbase --print-debs sid  /tmp/deb
+# }
+
+$*

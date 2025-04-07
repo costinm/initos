@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# Setup a VM or container.
+# - starts with an OCI image or already expanded rootfs
+# - generate startup scripts
+
+

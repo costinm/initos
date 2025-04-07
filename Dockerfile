@@ -11,47 +11,60 @@ ARG DEBBASE=debian:bookworm-slim
 #################
 FROM ${BASE} as initos-base
 
+# Required if base is setting a different user ( like sunshine )
+# USER root
+# ENV LANG C.UTF-8
+# # Will create a base username
+# ARG USERNAME=build
+# # Istio base sets it to /home - need to copy or link the files
+# ENV HOME /x/home/${USERNAME}
+# ENV FONTCONFIG_PATH /etc/fonts
+# ENV PATH /sbin:/usr/sbin:/bin:/usr/bin:/x/sync/app/bin:/x/sync/app/home/bin:/usr/local/bin:${PATH}
+# WORKDIR /x/home/${USERNAME}
+# # Not installing accessibility dbus
+# ENV NO_AT_BRIDGE 1
+
 # Rest of the files added in the last step (to avoid rebuilds)
-COPY ./recovery/sbin/setup-recovery /sbin/setup-recovery
+COPY ./rootfs/sbin/setup-recovery /sbin/setup-recovery
 
 # Cache the APKs
 RUN  --mount=target=/etc/apk/cache,id=apk,type=cache \
     /sbin/setup-recovery install 
     
-COPY ./recovery/ /
+COPY ./rootfs /
 
 ######## Debian: kernel
-FROM ${DEBBASE} as debkernel
+FROM ${DEBBASE} as kernel
 
-COPY ./recovery/sbin/setup-initos /sbin/setup-initos
+COPY ./rootfs/sbin/setup-initos /sbin/setup-initos
+
 RUN --mount=target=/var/lib/cache,id=apt,type=cache \
   setup-initos add_deb_kernel
+
+
+######## TODO: Arch
+# Arch 
+#FROM arch:latest as kernel
+#
+#RUN pacman -Syu linux linux-firmware
+
+
+### Generate the binary images - can be used with the basic recovery 
+# to sign and generate the USB
+FROM scratch as out
+COPY --link --from=initos /boot ./
 
 #################
 FROM initos-base as tmp
 
-COPY --from=debkernel --link /lib/modules/ /lib/modules
-COPY --from=debkernel --link /boot/ /boot/
-COPY --from=debkernel --link /lib/firmware/ /lib/firmware
+COPY --from=kernel --link /lib/modules/ /lib/modules
+COPY --from=kernel --link /boot/ /boot/
+COPY --from=kernel --link /lib/firmware/ /lib/firmware
 
 RUN /sbin/setup-initos build_initrd
 RUN /sbin/setup-initos recovery_sqfs recovery /boot
 
 #################
-FROM initos-base as recovery
+FROM initos-base as initos
 
 COPY --from=tmp --link /boot/ /boot/
-
-
-
-#### SQFS generation - normally done using the image itself.
-# Will also generate unsigned EFI for USB installer.
-# Signing still requires running the container with the private keys mounted.
-# FROM recovery as sqfs
-
-# RUN  --mount=target=/etc/apk/cache,id=apk,type=cache \
-#     /sbin/setup-initos recovery_sqfs
-
-# FROM scratch as out
-# COPY --link --from=sqfs /x/initos ./
-

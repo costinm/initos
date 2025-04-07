@@ -1,0 +1,45 @@
+#!/bin/sh
+
+# Called from initos-initrd-vm, after switch-root.
+# 
+
+
+# Called instead of switch-root.
+# This is a special case where the 'main' to run is on the 
+# virtiofs (or btrfs) disks, without a full OS (distroless or 
+# static compile or musl binary). Busybox from initrd is used for
+# the startup.
+start_app() {
+    echo direct run
+    $*
+}
+
+
+# Called from initos-initrd-vm. For VM case the rootfs
+# is virtio, a second btrfs is optional. Network is configured
+# based on params passed in cmdline in initrd.
+vm_init() {
+  env
+
+  local kv=$(uname -r)
+  logi "Starting VINITOS $kv"
+
+  # Modules from the shared disk (bind mounts) or separate RO volume.
+  # the rootfs can be a bare container.
+  mkdir -p /lib/modules/$kv
+  if [ -d /z/lib/modules/$kv ]; then
+    mount -o bind /z/lib/modules/$kv /lib/modules/$kv
+  fi
+
+  if [ -f /sbin/init ]; then
+    exec /sbin/init
+  fi
+  exec /bin/sh
+}
+
+# Info log - shown on console, logged.
+logi() {
+	last_emsg="$*"
+	echo "INITOS: $last_emsg..." > /dev/kmsg
+	echo "$last_emsg\n"
+}

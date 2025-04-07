@@ -1,0 +1,2 @@
+#/sbin/cryptsetup
+/sbin/veritysetup

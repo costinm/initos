@@ -1,0 +1,61 @@
+#!/bin/sh
+
+set -e
+
+
+# Virt files. 
+VIRT=${VIRT:-/var/cache/vimg}
+
+# Virtual machine files
+VMDIR=/x/vol/${VM}
+
+set -x
+
+# Need a kernel, modules and firmware for virt
+add_vkernel() {
+  apt update
+
+  apt install -y --no-install-recommends linux-image-cloud-amd64
+
+  rm -rf /boot/initrd.img* /tmp/* || true
+}
+
+# It still needs an initrd.
+# The image needs to be saved as a .img or sqfs.
+initrd() {
+  VER=$(ls /lib/modules | grep cloud | tail)
+
+  # Build the initrd used by sign
+
+  buildah run -t \
+    -v ${VIRT}:/x/initos \
+    --mount=type=bind,src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,src=/lib/firmware,dst=/lib/firmware \
+      initos -- \
+    setup-initos vinit $VER /x/initos/initramfs.img
+
+  # May want to add the modules from the host image (for virt), but seems
+  # easier to just mount the sqfs if needed.
+}
+
+
+install() {
+  local d=${1:-${VIRT}}
+
+  wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/ch-remote \
+    -O ${d}/ch-remote
+  chmod +x ${d}/ch-remote
+
+  wget https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v41.0/cloud-hypervisor-static \
+     -O ${d}/cloud-hypervisor
+  chmod +x ${d}/cloud-hypervisor
+
+  wget -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish \
+     -O /tmp/virtiofsd.zip
+  unzip /tmp/virtiofsd.zip -d /tmp
+  mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd ${d}
+}
+
+
+# For virt - no longer using sqfs, too slow. IMG, partition or virtio
+$*

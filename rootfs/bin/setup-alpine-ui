@@ -1,0 +1,72 @@
+#!/bin/sh
+
+# Base alpine is created using setup-alpine in recovery, and 
+# is part of the initios and alpinetools images, as well as the sqfs. 
+
+# Wayland UI
+wui() {
+  #  apk add mesa-dri-gallium
+  setup-desktop sway
+  apk add rofi-wayland rofi-pass rofi-top
+
+  # As root: start seatd
+  # make sure video, input groups match
+  apk add seatd
+}
+
+# Common additional packages for UI
+ui2() {
+  apk add bash bash-completion
+  apk add kitty kitty-kitten # required
+
+  apk add firefox # esr is the less updated long term
+
+  #apk add chromium
+}
+
+# Native X UI
+xui_alpine() {
+  apk add i3wm dbus-x11
+  apk add tint2 rofi alttab i3status
+  apk add xorg-server
+  apk add xinit
+#  apk add xset
+#  apk add xrandr
+#  apk add xmodmap
+#  apk add xinput
+#  apk add xhost
+#  apk add xkill
+}
+
+# Downloads the linux (alpine).
+#
+# Very slow, installs a lot of firmware.
+# The kernel will be packed into the UKI by a separate step.
+#
+# The /boot dir on the container or real hosts will not have any of the files - they
+# are used to build the UKI in the EFI partition and modules/firmware go to different
+# subvolumes.
+# linux_alpine() {
+#   apk add linux-lts
+#   apk add intel-ucode amd-ucode
+
+#   KERNEL_VERSION=$(cat /usr/share/kernel/lts/kernel.release)
+
+#   # This is the version that will be used in the UKI (can be changed)
+#   # echo $KERNEL_VERSION > /boot/version
+
+#   # Versioned name, matching the modules dir.
+#   mv /boot/vmlinuz-lts /boot/vmlinuz-${KERNEL_VERSION}
+#   ln -s /boot/vmlinuz-${KERNEL_VERSION}  /boot/vmlinuz
+
+#   # For a VM using alpine kernel: 'linux-virt' package.
+
+#   du -sh /lib/firmware
+#   # Decompress all zst files.
+#   (cd /lib/firmware; find . -name "*.zst" -exec zstd -d --rm -f {} \;  || true) 2>/dev/null
+#   echo "Expanded zst"
+#   du -sh /lib/firmware
+# }
+
+
+$*

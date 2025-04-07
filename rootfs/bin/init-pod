@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# Functions to run various things at 'pod' startup ( or docker image, VM)
+# Expects tini (for zombies) and checks for different apps presence in the image.
+#
+# For 'dev' pods, detects if vncserver is installed - and starts it if it is. Same for CRD.
+# Pods are expected to use debian or ubuntu rootfs.
+
+APPS_DIR=/x/sync/app
+USERNAME=${USERNAME:-build}
+
+set -eo pipefail
+# set -u is for unbound variables 
+
+start_x() {
+  if [ -f /etc/init.d/dbus ]; then
+    /etc/init.d/dbus start
+  fi
+  if [ -f /etc/init.d/x11-common ]; then
+    /etc/init.d/x11-common start
+  fi
+
+  rm -f /tmp/.X11-unix/* || true
+
+  if [ -f /dev/dri/renderD128  ] ; then
+    sudo -u ${USERNAME} vncserver -hw3d -drinode /dev/dri/renderD128
+  else
+    sudo -u ${USERNAME} vncserver
+  fi 
+}
+
+# Add a custom user - with PID, PGID, PUSERNAME ('pod').
+add_main_user() {
+  local u=${USERNAME:-build}
+  local h=${HOME:-/x/home/${u}}
+
+  userdel build
+
+  echo Adding $u with $h and $USERID
+
+  useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
+         -d ${h} ${USERNAME}
+
+  usermod -p '*' ${USERNAME}
+
+  #chown ${u} /home /work
+
+  # rm -rf /work && ln -s /x/work /work
+
+  usermod -a -G chrome-remote-desktop ${u} || true
+  usermod -a -G docker ${u} || true
+  usermod -a -G kvm ${u} || true
+  usermod -a -G video ${u} || true
+  usermod -a -G render ${u} || true
+
+  # access to /etc/ssl/private
+  usermod -a -G ssl-certs ${u} || true
+
+  echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
+
+  chmod 4755 /x/sync/app/chrome/chrome-sandbox || true
+}
+
+start_as_root() {
+  export USERNAME=${USERNAME:-build}
+  
+  echo PATH=$PATH
+
+  if [ "$USERNAME" == "costin" ]; then 
+    # This is for costin16 with encrypted chrome pass...
+    cp /home/${USERNAME}/.ssh/machine-id /etc/machine-id
+  fi
+
+  # Problems with chrome remote desktop
+  rm -f /usr/local/bin/run-parts || true 
+
+  busybox syslogd -C1024
+
+  # Base image should have build user, as UID 1000
+  id ${USERNAME} ||     add_main_user
+
+  #sudo chmod 4755 /opt/google/chrome/chrome-sandbox || true
+  # usermod -G chrome-remote-desktop ${u} || true
+  # # If the base image has docker
+  # usermod -G docker ${u} || true
+  
+  if [ -f /var/run/docker.sock ]; then
+    echo Detected host docker - adding user
+    groupadd -g 110 docker-host
+    usermod -a -G docker-host ${USERNAME} || true
+    usermod -a -G docker-host build || true
+    usermod -a -G docker ${USERNAME} || true
+    usermod -a -G docker build || true
+  elif [ -f /usr/bin/dockerd ]; then
+    # Available in the Istio base image
+    echo Detected docerkd - start
+    usermod -a -G docker ${USERNAME} || true
+    usermod -a -G docker build || true
+    /etc/init.d/docker start 
+    # dockerd &
+  fi
+
+  # In the UI the env is reset - need to source this to get K8S address if running in K8S
+  env  > /tmp/.startup.env
+
+  # Home is part of docker image, work is persistent.
+  #ln -s /work/.config ${HOME}
+
+  chown ${USERNAME} /work
+
+  echo "Starting X"
+
+  start_x
+
+  echo "Starting custom username scripts"
+  if [ -f /x/start.sh ]; then
+     sudo -u $USERNAME /x/start.sh &
+  fi
+
+  if [ -f /x/home/${USERNAME}/.onstart ]; then
+     sudo -u $USERNAME /x/home/${USERNAME}/.onstart &
+  fi
+}
+
+# Post switch root is called in the new environment.
+# InitOS is mounted at /initos/recovery - and a chroot env can be created to allow its
+# use for networking and management.
+# 
+# If a LUKS partition was mounted, it will have additional configs for Initos - either
+# a LBU-style tar.gz or a persistent overlay.
+# 
+# This will create processes - but at the end exec the init on the main rootfs (if it exists)
+# 
+post_switch_root() {
+  local mode=${1:-secure}
+
+  R=/initos/recovery
+  mount --rbind /dev ${R}/dev
+  mount --make-rslave ${R}/dev
+  mount --rbind /sys ${R}/sys
+  mount --make-rslave ${R}/sys
+
+  mount -t proc /proc ${R}/proc
+  mount --rbind /tmp ${R}/tmp
+  
+  mkdir -p ${R}/rootfs
+  mount --rbind / ${R}/rootfs
+
+  # mount -o bind /lib/modules ${R}/lib/modules
+  # mount -o bind /lib/firmware ${R}/lib/firmware
+
+  chroot $R /sbin/initos init_recovery
+
+  if [ -f /sbin/init ]; then
+    exec /sbin/init 
+  fi
+  if [ -f /init ]; then
+    exec /init 
+  fi
+}
+
+
+# Startup script for a VM - at this point the init has loaded the modules, 
+# pivot root has been called.
+# 
+vm() {
+  hostname $(cat /etc/hostname)
+  ifup -a
+  /etc/init.d/ssh start
+  start_as_root
+}
+
+if [ -z ${1+x} ] ; then
+  echo Starting default: $*
+  vm
+else
+  C=${1}
+  shift
+  $C $*
+fi

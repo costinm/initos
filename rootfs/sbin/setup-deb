@@ -1,0 +1,529 @@
+#!/bin/bash
+
+# Functions to install various setup/install things in a debian 'pod'
+# ( docker image, VM, host).
+#
+# This is called from the Dockerfile or manually.
+#
+# Note: most applications should run in docker and have 
+# the binaries from a volume - avoid using distro-specific 
+# apps outside 'core' UI and utils. Anything that can be 
+# in a volume (managed with tar/sync/etc) should be in a volume.
+# That means downloading the release into /opt/APP or 
+# /x/sync/app/bin (also mounted to /opt/bin )
+
+
+set -euo pipefail
+
+WORK=${WORK:-/x/initos}
+
+# Will make sure the user exists - useful in pods for
+# running as a custom username.
+USERNAME=${USERNAME:-build}
+
+export DEBIAN_FRONTEND=noninteractive
+APTINSTALL="apt install --assume-yes --no-install-recommends "
+
+# Users built into the docker image. 
+add_base_users() {
+  local u=${USERNAME:-build}
+  local h=${USER_HOME:-/x/home/${u}}
+
+  # Template home directory.
+  mkdir -p /home/log
+  mkdir -p /work
+  mkdir -p /x/home
+
+  # For ubuntu based images - there is a default user with 1000
+  (userdel ubuntu || true)
+
+  useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
+         -d ${h} ${u}
+  usermod -p '*' ${u}
+
+  groupadd -g 2000 restic
+  useradd -u 2000 -g restic -G restic -s /bin/bash \
+         -d /x/backup restic
+  # -p takes an encrypted pass - so this disables pass login
+  usermod -p '*' restic
+
+  mkdir -p ${h}
+  chown ${u} ${h}
+
+}
+
+# stage runs a set of installs, keeping track of disk and dpkg 
+# before and after. For debugging sizes.
+stage() {
+  local stage=$1
+  local l=/var/log/install
+  mkdir -p ${l}
+
+  df > ${l}/df-before-${stage}.log
+  dpkg -l > ${l}/pkg-before-${stage}.log
+
+  apt update
+
+  $stage
+  
+  apt clean
+
+  df > ${l}/df-after-${stage}.log
+   > ${l}/dpkg-after-${stage}.log
+}
+
+lspkg() {
+  dpkg --get-selections | grep -v deinstall > /tmp/packages1.txt
+  apt-mark showmanual > /tmp/packagesm.txt 
+  dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n
+}
+
+add_host_tools() {
+
+  # Openrc or systemd need to be installed (openrc is simpler)
+  # sysvinit-core
+  # Openrc errors:
+  # checkroot umountroot - for cryptdisks
+  # mountkernfs urandom for networking
+  # umountroot for udev
+  $APTINSTALL openrc tini  sysvinit-utils init-system-helpers
+  
+  # cryptsetup 
+  
+  $APTINSTALL wpasupplicant \
+    ifupdown ifupdown-extra  bridge-utils \
+    ethtool  wireless-tools
+
+  $APTINSTALL bsdutils busybox 
+  
+  # Add other 'host' tools
+  $APTINSTALL tpm2-tools dosfstools fdisk gdisk hdparm file findutils fuse3
+
+  # TODO: iw dev and other tools
+  # ifupdown-ng, wifi, openssl,
+  # rsync openssh binutil brdige btrfs-progs curl, openssh-sftp-server
+  # wpa, fdisk, iputils, tcpdump, smartmontools, lvm2 iproute2, htop,
+  # findutils
+
+  # podman
+
+  # tini
+
+}
+
+function install_host_ui() {
+  # mako: notifications
+  # rofi: menus (launch, windows)
+
+  # d-feet - dbus debugger  ?
+
+  $APTINSTALL mako-notifier rofi  wayvnc sway-backgrounds sway-notification-center waybar  wofi
+  #xtightvncviewer
+
+}
+
+function install_container_ui() {
+  # mako: notifications
+  # rofi: menus (launch, windows)
+
+  # d-feet -
+
+  # i3 instslls i3-wm, dunst, i3lock, i3status suckless-tools
+
+  # x11vnc
+  $APTINSTALL rofi d-feet i3
+  # others:
+  # xsettingsd lxappearance viewinior
+
+  # xfce4-polkit - display auth dialog
+  # kitty
+  #
+}
+
+function add_tools() {
+  local u=${USERNAME:-build}
+
+  echo "Adding common debug tools and home"
+  
+
+  # fuser3, sshfs: to mount remote sshd volumes with FUSE (And others)
+  # dnsutils, net-tools, tcpdump, iptables, iproute2, netcad-openbsd - network debugging
+  # curl
+  # tmux, vim, less, bash-completion, mc - text based UI
+
+  # Not sure:
+  # syncthing - optional, may use the APP volume instead or docker image
+  # sshd - using sshmesh
+
+  # For mounting gocryptfs, sshfs, etc - may not work in docker/lxc
+
+  # 77MB on top of istio image
+
+   # ca-certificates - installs openssl (+18M)
+
+   # Busybox has:
+
+   # dnsutils: 48M, bind9-dnsutils. busybox nslookup instead
+   # netcat-openbsd
+   # iputils-ping
+   # wget xz-utils bzip2
+
+   # sshfs(4M): fuse3, openssh-client(14M), 5M
+
+   # Gnupg - 19M, required for installing CRD
+   # mc - 2M
+  $APTINSTALL \
+          net-tools \
+          lsof \
+         tcpdump \
+         iptables iproute2 bridge-utils \
+         bsdutils btrfs-progs
+
+    echo Y | $APTINSTALL sudo
+
+    # SECURITY: sudo without password, for the admin or 'main' user.
+    # Image runs in containers, with the user accessed using SSH keys.
+    # We need a way to run commands as root - this is better than setting 
+    # a root password or running stuff as root directly.
+
+    echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
+     
+    $APTINSTALL nftables 
+    $APTINSTALL iperf3
+
+    $APTINSTALL    curl
+    $APTINSTALL vim
+    $APTINSTALL mc
+    $APTINSTALL tmux less  bash-completion
+    $APTINSTALL    ca-certificates
+
+
+  mkdir -p /opt/busybox/bin
+  $APTINSTALL   busybox
+
+  busybox --install /opt/busybox/bin
+  # Problems with chrome remote desktop
+  rm -f /usr/local/bin/run-parts || true 
+  rm -f /usr/local/bin/dpkg || true 
+
+  $APTINSTALL       openssh-server
+  # That's why deb/rpm is really bad for containers (and more) - 
+  # there is an install script that creates keys that would be distributed.
+  rm /etc/ssh/ssh_host_*
+
+  echo Y | apt remove git || true
+  # Istio base image has git messed up
+  $APTINSTALL git
+
+  # fuser3
+  # dnsutils, net-tools, tcpdump, iptables, iproute2, netcad-openbsd - network debugging
+  # curl
+  # tmux, vim, less, mc - text based UI
+
+  # Not sure:
+  # syncthing - optional, may use the APP volume instead or docker image
+  # sshd - using sshmesh
+
+  # TODO: have an admin user installed ? 
+  # admin, UID=99, sudoers  
+}
+
+function add_firefox() {
+  FF_VERSION=$(curl -sI https://download.mozilla.org/?product=firefox-latest | awk -F '(releases/|/win32)' '/Location/ {print $2}') 
+  FF_URL=https://releases.mozilla.org/pub/firefox/releases/${FF_VERSION}/linux-x86_64/en-US/firefox-${FF_VERSION}.tar.bz2
+  (cd /opt && curl -L $FF_URL | tar xvfj -)
+}
+
+function add_chrome() {
+  apt update
+  # requires gnupg
+  DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+        gnupg
+  curl https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
+  echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list
+  apt update
+
+  # Required for encrypted secrets support
+  DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+          gnome-keyring upower
+
+  # Chrome (for isolated env)
+  # Must happen after curl is installed
+  # ~100M
+  apt-get -y -q install google-chrome-stable 
+  #--no-install-recommends
+}
+
+function add_code() {
+  apt-get install wget gpg && \
+      wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg && \
+      install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg && \
+      sh -c 'echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list' && \
+      rm -f packages.microsoft.gpg && apt update
+  curl -fsSL https://code-server.dev/install.sh > /tmp/install.sh && \
+      sh /tmp/install.sh
+  apt-get install --assume-yes --no-install-recommends    code
+}
+
+add_host_ui() {
+  # wofi: d-menu (rofi-wayland not yet available)
+  # waybar - bar, requires the font
+  # mako - notifications
+  $APTINSTALL sway swayidle swaylock \
+     mako-notifier wofi \
+     fonts-font-awesome waybar xwayland \
+  # bemenu grim slurp
+}
+
+
+function add_ui() {
+  # i3 based UI.
+  # Alternatives: openbox, sway
+
+  # last release: 2010: openbox
+  # fluxbox is similar - 2015 last release
+  
+  # obconf: +65M
+  # obkey - key config 
+
+  # i3 +10M
+
+  # eterm: 1.3M, but can't find font
+  # xfce4-terminal: +74M
+  # kitty: 16M
+
+  # 219M on top of istio image. Includes x11-common but not xorg
+  $APTINSTALL  \
+           i3 dbus-x11 desktop-base libdbus-glib-1-2 \
+          kitty i3status rofi tint2 alttab
+  # For code: 
+  # 12M gtk
+  $APTINSTALL libnss3 libatk1.0-0 libatk-bridge2.0-0
+
+  echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+}
+
+
+# function add_cinnamon() {
+# # 496M
+#   DEBIAN_FRONTEND=noninteractive \
+#   apt install --assume-yes --no-install-recommends \
+#      cinnamon-core dbus-x11 desktop-base && \
+#      apt-get clean && \
+#       bash -c 'echo "exec /etc/X11/Xsession /usr/bin/cinnamon-session-cinnamon2d" > /etc/chrome-remote-desktop-session'
+# }
+
+# Kasm 
+# function add_kasm_ubuntu() {
+#   add_kasm jammy
+# }
+
+# Faster than a clean build
+# Must be followed by sign, etc - kernel may have been updated
+upgrade() {
+
+  # TODO: remove old kernel/modules
+  apt-update
+  apt dist-upgrade -y
+  apt autoremove --purge
+  apt-get autoclean
+}
+
+function add_kasm() {
+  KASM_VER=${KASM_VER:-1.3.3}
+
+  local DIST=${1:-bookworm}
+
+  # 220M
+  curl -fsSL -o /tmp/kasmvnc.deb \
+    https://github.com/kasmtech/KasmVNC/releases/download/v${KASM_VER}/kasmvncserver_${DIST}_${KASM_VER}_amd64.deb
+
+  $APTINSTALL /tmp/kasmvnc.deb
+  $APTINSTALL libdatetime-perl  
+  rm /tmp/kasmvnc.deb
+
+  add_ui   
+}
+
+# function add_crd() {
+#   # i3 based UI.
+#   # Alternatives: openbox, sway
+
+#   # 219M on top of istio image. Includes x11-common but not xorg
+#   DEBIAN_FRONTEND=noninteractive \
+#         apt install --assume-yes --no-install-recommends \
+#            i3 dbus-x11 desktop-base libdbus-glib-1-2 \
+#           kitty i3status rofi tint2
+#   # org.gnome.Mutter.DisplayConfig is also used - to get current display configuration
+  
+#   echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+
+#    curl  https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb -o crd.deb
+#    # 47M on top of UI, includes xserver-xorg-video-dummy, xvfb
+#    DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends ./crd.deb
+
+#     rm crd.deb
+
+#     # gsettings-desktop-schemas: required by chrome remote desktop
+#     DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+#        gsettings-desktop-schemas
+# }
+
+
+##### Dev tools #####
+
+function add_android() {
+  GRADLE_VERSION=2.9
+  cd /usr/local/ && curl -L -O http://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-all.zip \
+    && unzip -o gradle-${GRADLE_VERSION}-all.zip && rm /usr/local/gradle-${GRADLE_VERSION}-all.zip
+
+
+#  # Environment variables
+#  #ENV ANDROID_NDK_HOME /usr/local/android-ndk-r9b
+#  ENV ANT_HOME /usr/local/apache-ant-${ANT_VERSION}
+#  # ENV MAVEN_HOME /usr/local/apache-maven-3.1.1
+#  ENV GRADLE_HOME /usr/local/gradle-${GRADLE_VERSION}
+#  #ENV PATH $PATH:$ANDROID_NDK_HOME
+#  ENV PATH $PATH:$ANT_HOME/bin
+#  # ENV PATH $PATH:$MAVEN_HOME/bin
+#  ENV PATH $PATH:$GRADLE_HOME/bin
+
+}
+
+add_codew() {
+  local d=/x/sync/app/codew
+  VERSION=3.12.0
+
+  mkdir -p $d/lib $d/bin
+  #mkdir -p ~/.local/lib ~/.local/bin
+
+  curl -fL https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-linux-amd64.tar.gz \
+    | tar -C $d/lib -xz
+
+  mv $d/lib/code-server-$VERSION-linux-amd64 $d/lib/code-server-$VERSION
+  ln -s $d/lib/code-server-$VERSION/bin/code-server $d/bin/code-server
+
+  # TO Run:
+  # ln -s /x/sync/app/codew ~/.local ?
+  #PATH="~/.local/bin:$PATH"
+  #code-server
+
+  # Now visit http://127.0.0.1:8080. Your password is in ~/.config/code-server/config.yaml
+}
+
+add_codew_deb() {
+  VERSION=3.12.0
+  curl -fOL https://github.com/coder/code-server/releases/download/v$VERSION/code-server_${VERSION}_amd64.deb
+  sudo dpkg -i code-server_${VERSION}_amd64.deb
+  sudo systemctl enable --now code-server@$USER
+  # Now visit http://127.0.0.1:8080. Your password is in ~/.config/code-server/config.yaml
+}
+
+
+chrome_firmware() {
+  # requires iomem=relaxed
+  cd; curl -LOk mrchromebox.tech/firmware-util.sh && sudo bash firmware-util.sh
+}
+
+
+
+function add_dev_tools() {
+
+    # 46M, brings perl
+    DEBIAN_FRONTEND=noninteractive \
+      apt install  -y  --no-install-recommends \
+             git
+
+    DEBIAN_FRONTEND=noninteractive \
+          apt install  -y  --no-install-recommends \
+        patch file \
+      gcc build-essential libc6-dev make \
+    meld
+
+  # bison gawk g++
+  #     autoconf  automake libtool
+}
+
+function add_k8s() {
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+  sudo apt-get update
+  sudo apt-get install ca-certificates curl
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+  # Add the repository to Apt sources:
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update
+
+  apt install -y --no-install-recommends \
+       docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # docker compose
+    DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+    mkdir -p $DOCKER_CONFIG/cli-plugins
+  #  curl -SL https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-linux-x86_64 -o $DOCKER_CONFIG/cli-plugins/docker-compose
+
+    usermod -G docker ${USERNAME}
+
+    [ $(uname -m) = x86_64 ] && curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+   chmod +x ./kind
+    mv ./kind /usr/local/bin/kind
+
+    kubectl completion bash | sudo tee /etc/bash_completion.d/kubectl >/dev/null
+
+    echo 'alias k=kubectl' >>~/.bashrc
+    echo 'complete -o default -F __start_kubectl k' >>~/.bashrc
+}
+
+function add_docker() {
+  sudo apt-get update
+  sudo apt-get install ca-certificates curl
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+  # Add the repository to Apt sources:
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update
+
+  apt install -y --no-install-recommends \
+       docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+#    # docker compose
+#    DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+#    mkdir -p $DOCKER_CONFIG/cli-plugins
+#  #  curl -SL https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-linux-x86_64 -o $DOCKER_CONFIG/cli-plugins/docker-compose
+
+#    usermod -G docker ${USERNAME}
+}
+
+function add_tinygo() {
+  TINYGO_RELEASE=0.36.0
+  wget https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_RELEASE}/tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz && \
+      tar xf tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz -C /opt && \
+      rm tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz
+}
+
+
+function add_golang() {
+  local GOLANG_VERSION=1.22.2
+  local GOLANG_DOWNLOAD_URL=https://golang.org/dl/go$GOLANG_VERSION.linux-amd64.tar.gz
+
+  curl -fsSL "$GOLANG_DOWNLOAD_URL" -o golang.tar.gz \
+  	&& tar -C /usr/local -xzf golang.tar.gz \
+  	&& rm golang.tar.gz
+}
+
+
+C=${1}
+shift
+$C $*

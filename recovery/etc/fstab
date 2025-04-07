@@ -1,3 +1,0 @@
-LABEL=EFI     /z/initos/efi   vfat    defaults 0 0 
-LABEL=USB_BOOT_BTRFS /z/initos/usbroot  btrfs noauto 0 0
-LABEL=USB_EFI     /z/initos/usb   vfat    noauto  0 0 

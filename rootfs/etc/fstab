@@ -1,0 +1,2 @@
+#LABEL=BOOT     /boot/efi   vfat    defaults 0 0 
+#LABEL=USBBOOT /boot/usbefi  vfat noauto 0 0

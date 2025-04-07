@@ -1,0 +1,161 @@
+#!/bin/sh
+
+# The 'sign' function is the entrypoint for the container, will
+# generate a signed efi partition including the sqfs signed image
+# and patching.
+# 
+# - creation of a directory containing all artifacts needed for install by copying to an existing
+# USB EFI partition.
+
+set -x
+set -e
+
+# Destination dir for the efi partition artifacts.
+# May include additional files to bake into images.
+# Signing the images also requires a volume holding the signing keys
+# and configs.
+WORK=${WORK:-/x/initos}
+
+mkdir -p ${WORK}/img ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
+
+# Generate the key pairs for signing the kernel and the disk image.
+# This is done before install - as a separate step/process - the rest can be automated easily,
+# but signing must be done on a secure machine and is specific to each user.
+sign_init() {
+  local u=${DOMAIN:-mesh.internal}
+
+  efi-mkkeys -s ${u} -o /etc/uefi-keys
+
+  # Generate a 'mesh root' - both SSH and https.  
+  # Will be bundled on all signed images, and used to encrypt the LUKS pass.
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+     -out /etc/uefi-keys/root.key
+
+  openssl ec -in /etc/uefi-keys/root.key -pubout -out \
+     /etc/uefi-keys/root.pem
+  
+  ssh-keygen -y -f /etc/uefi-keys/root.key > \
+     /etc/uefi-keys/authorized_keys
+}
+
+# Sign will create the UKI signed, insecure and usb images.
+# It will also regenerate and sign the SQFS file, and add patches
+# to the UKI that will be used to configure the hosts, including 
+# a 'mesh root cert', authorized keys, common configs.
+#
+# The patches can also be added to the SQFS file before signing.
+# They go to /opt/initos/local
+# 
+# It is intended to run from a container with /etc/uefi-keys mounted
+# to a disk on an encrypted partition or 'secrets', and /x/initos
+# mounted with the destination disk, where efi image will be 
+# created. It can also be used from recovery.
+sign() {
+  local ver=${1:-A}
+  local variant=${2:-secure}
+  local host=${3:-default}
+  
+  
+  # Mounted dir
+  DEST=/x/vol/boot
+  set -e
+
+  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
+  if [ ! -f /etc/uefi-keys/db.crt ]; then
+    sign_init
+  fi
+
+  mkdir -p ${DEST}/initos/img ${DEST}/initos/KEYS /local ${DEST}/EFI/BOOT
+
+  cp /etc/uefi-keys/*.auth ${DEST}/initos/KEYS
+  cp /etc/uefi-keys/*.crt ${DEST}/initos/KEYS
+  cp /etc/uefi-keys/*.cer ${DEST}/initos/KEYS
+  
+  # Initos image includes the recovery. It can also be built or manipulated on the
+  # host.
+  if [ ! -f ${DEST}/initos/img/recovery.sqfs ]; then
+    cp /boot/recovery.sqfs ${DEST}/initos/img/recovery.sqfs
+  fi
+
+  # If hash is missing, use verity to sign it now
+  # If making changes to the img (on the mounted disk), remove hash.recovery to force
+  # regeneration.
+  if [ ! -f ${DEST}/initos/img/hash.recovery ]; then
+    # TODO: check if older 
+    veritysetup format \
+    --root-hash-file=${DEST}/initos/img/hash.recovery \
+    ${DEST}/initos/img/recovery.sqfs \
+    ${DEST}/initos/img/recovery.sqfs.verity
+
+  fi
+
+  cp ${DEST}/initos/img/hash.recovery /local/hash.recovery 
+  
+  cp /etc/uefi-keys/authorized_keys /local/
+  cp /etc/uefi-keys/root.pem /local/
+
+  # Per host local configs
+  cp -a /etc/uefi-keys/hosts/${host}/local/* /local/ || true
+  
+  INIT_PATCH=/tmp/initrd-patch.cpio.gz
+  # Additional cpio files - keys, current init (initrd build is slow, this can
+  # override)
+  (find /sbin/initos* \
+        /local \
+   | sort \
+   | cpio --quiet --renumber-inodes -o -H newc \
+   | gzip) > ${INIT_PATCH}
+
+  # The normal /init is fine - but if we patch we need to 
+  # use the new script.
+  local cmd="initos_ver=${ver} console=ttyS0 rdinit=/sbin/initos-initrd console=tty1 net.ifnames=0 panic=5"
+ 
+  echo "$cmd initos=insecure loglevel=6 debug_init  iomem=relaxed " > /boot/cmdline.insecure
+  echo "$cmd initos=secure loglevel=0 quiet " > /boot/cmdline.secure
+
+  # Build the initrd and EFI images.
+  kernel_version=$(cat /boot/version)
+  KERNEL=/boot/vmlinuz-${kernel_version}
+  #cp /tmp/initos-hashes.cpio.gz $DEST
+
+  if [ "${variant}" = "usb" ]; then
+    echo "$cmd initos=usb loglevel=0 iomem=relaxed " > /boot/cmdline.usb
+    efi-mkuki \
+        -c /boot/cmdline.usb \
+        -o ${DEST}/EFI/BOOT/bootx64.EFI \
+          ${KERNEL} \
+          /boot/intel-ucode.img /boot/amd-ucode.img /boot/initos-initrd.img ${INIT_PATCH}
+    return
+  fi
+
+  efi-mkuki \
+      -c /boot/cmdline.insecure \
+      -o ${DEST}/initos/insecure.EFI \
+        ${KERNEL} \
+          /boot/intel-ucode.img /boot/amd-ucode.img /boot/initos-initrd.img ${INIT_PATCH}
+
+  efi-mkuki \
+    -c /boot/cmdline.secure \
+    -o /tmp/tmp.EFI \
+      ${KERNEL} \
+      /boot/intel-ucode.img /boot/amd-ucode.img /boot/initos-initrd.img ${INIT_PATCH}
+
+  sbsign --cert /etc/uefi-keys/db.crt \
+    --key /etc/uefi-keys/db.key \
+    --output ${DEST}/EFI/BOOT/bootx64.EFI \
+    /tmp/tmp.EFI
+
+  rm /tmp/tmp.EFI ${INIT_PATCH}
+  chmod -R 755 ${DEST}
+}
+
+#    sigfile=${hashfile}.sig
+#    cat $hashfile | xxd -r -p | openssl dgst \
+#      -sha256 -sign /etc/uefi-keys/root.key \
+#      -out root_hash.sig
+
+if [ -z ${1+x} ] ; then
+  sign
+else
+  $*
+fi

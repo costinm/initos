@@ -1,0 +1,19 @@
+# Instead of network/interfaces or other tools, use udev directly with a custom script
+# This works for TAP devices as well as any other network interface.
+# Use udevadm control reload-rules, restart systemd-udev if running on deb
+
+# By default, /usr/lib/udev/bridge-network-interface is using 
+# ifquery --list --allow auto to find interfaces, then ifquery to find
+# bridge_port properties.
+# 
+
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="vm-*", RUN+="/usr/sbin/brctl addif br-lan %k"
+
+# Doesn't work:
+#SUBSYSTEM=="net", ACTION=="add", KERNEL=="/devices/virtual/net/vm-devvm-1", RUN+="touch /tmp/udevnet"
+#SUBSYSTEM=="net", ACTION=="add", KERNEL=="vm-devvm-1", RUN+="touch /tmp/usevnet"
+# SUBSYSTEM=="net", ACTION=="add", DRIVER=="tun", RUN+="/usr/bin/touch /tmp/xdettvnet"
+#SUBSYSTEM=="net", ACTION=="add", KERNEL=="tun.*", RUN+="/usr/bin/touch /tmp/udettvnet"
+# Too generic
+# SUBSYSTEM=="net", ACTION=="add", KERNEL!="lo", RUN+="/usr/bin/touch /tmp/udevnet-$name"
+#KERNEL=="tap", RUN+="touch /tmp/tapev", ACTION=="add"

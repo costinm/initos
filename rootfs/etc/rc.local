@@ -1,0 +1,15 @@
+#!/bin/sh
+
+if [ -d /initos/rootfs ]; then
+    echo "starting initos as sidecar"
+    /initos/rootfs/sbin/initos sidecar
+else 
+    # Fix docker - if 'rooter' is detect it'll disable accept.
+    #iptables -I DOCKER-USER -j ACCEPT
+    iptables -P FORWARD ACCEPT
+
+    echo "rc.local started"
+    ifconfig -a
+
+fi
+

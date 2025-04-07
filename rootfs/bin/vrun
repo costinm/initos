@@ -1,0 +1,555 @@
+#!/bin/sh
+
+# Run a command in a virtual envirnment ('Pod', container, VM, ssh remote, kubectl).
+# 
+# This is an 'opinionated' wrapper on multiple tools. It takes the name of the destination as 
+# an env variable (not in the CLI), and the name is mapped to specific 'workload config' which determines
+# how to run the command.
+#
+# It may be able to start an workload if it is not running. A separate process may stop/reclaim unused VMs/containers.
+# 
+# The setup is done by setup-vm.
+# 
+# Most of the time the 'run' will use `ssh` or `kubectl` or one of the local container tools.
+# 
+# - pods in /x/vol/NAME
+# - a simple config containing only env vars.
+# Defaults:
+# - if ./rootfs/ is present - will be used with a VM
+#    - if ./disk.img - will be mounted as well
+
+
+# TODO:
+# - add ssh, kubectl
+# - add running the command on multiple workloads. 
+# - get configs on-demand from a control plane (k8s or istio for example)
+
+#
+# For VM:
+# Using cloud-hypervisor initially - for more diversity, qemu should also work, crosvm would be ideal 
+# if it had downloadable binaries.
+#
+# Using virtiofs to access shared files with the host filesystem. A local disk is usually required as cache and to
+# keep Java and other apps happy.
+# 
+# The rootfs can be a host dir (similar to containers) or the immutable recovery image.
+
+# Directory layout outside the container:
+#    WORK ( defaults to /x/vol/$NAME )
+#    SRCDIR - /ws/$NAME - source directory
+# 
+# Directory layout inside the container:
+#   /ws/$APP - the source directory (read only)
+#   /work/$APP - the work directory, with /work/$APP/dist for the files to be distributed
+#   /run/secrets/$APP - secrets volume
+#
+# Various cache directories set to files in /work/$APP/cache, etc
+
+
+#set -x
+set -e
+
+if [ -f ${HOME}/.config/vrun/env ]; then 
+  source ${HOME}/.config/vrun/env
+fi
+
+
+export SRCDIR=${SRCDIR:-$(pwd)}
+
+# If the script is named vrun-devvm -> the VM will be devvm
+# Otherwise the current working dir will be used as VM dir. 
+# Images are still in /x/vol/images 
+if [ -z ${VM} ]; then
+  vmsuffix="${0#*vrun-}"
+
+  if [ -z "$vmsuffix" ]; then
+    VM=$(basename $PWD)
+  else
+    VM=$vmsuffix
+  fi
+fi
+
+if [ -z ${VM} ]; then 
+  echo "VM must be set to the target workload"
+  exit 1
+fi
+
+# If set, will be added as a prefix to the command
+#TIME="time "
+TIME=""
+
+# Base directory for all VM files.
+VOLS=${VOLS:-/x/vol}
+
+# Directory with hypervisor binaries, kernel, initrd, recovery
+VIRT=${VIRT:-/opt/virt}
+IMGDIR=${IMGDIR:-/x/vol/images}
+WORK=${WORK:-${VOLS}/${VM}}
+
+# Defaults to the name of the working directory.
+# This is the application name (may have multiple pod).
+NAME=${NAME:-$(basename $PWD)}
+APP=${APP:-${NAME}}
+# Name of the container (--name)
+POD=${POD:-$NAME}
+
+export REPO=${REPO:-git.h.webinf.info/costin}
+TAG=${TAG:-latest}
+IMAGE=${IMAGE:-${REPO}/${APP}:${TAG}}
+
+if [ -f ${WORK}/env ]; then 
+  . ${WORK}/env
+fi
+
+### Hypvervisor
+
+# For each pod, start a single Virtiofsd - should be mounted as root (/).
+# Use bind mounts to manage the content.
+run_virtiofsd() {
+  local base=${1:-${WORK}}
+
+  mkdir -p $base/share/lib/modules
+  if [ -d ${base}/rootfs ]; then 
+    dir=${base}/rootfs
+  else
+    mkdir -p ${base}/share
+    dir=${base}/share
+  fi
+
+  if [ -f ${WORK}/virtiofsd.pid ]; then 
+    kill -9 $(cat ${WORK}/virtiofsd.pid) || true
+    rm -f ${WORK}/virtiofsd.pid
+  fi
+
+  rm -f ${WORK}/virtiofsd.sock || true
+
+  # Faster than virtio-9p or regular 9p/nfs
+  # FUSE messages over vhost-user socket
+  # DAX (using host buffers) not enabled.
+  #       --log-level debug 
+  ${VIRT}/virtiofsd \
+      --socket-path=${WORK}/virtiofs.sock \
+      --shared-dir=${dir} \
+      --cache=never \
+      --xattr \
+      --allow-direct-io \
+      --allow-mmap \
+      --sandbox chroot \
+      --log-level debug \
+      --thread-pool-size=2 > ${WORK}/virtiofs.log  2>&1 &
+      
+    # Default sandbox is namespace, doesn't work in chroot  
+    # --allow-mmap should only be used with exclusive access
+    # 
+
+    # Save the PID
+    echo $! > ${WORK}/virtiofsd.pid
+
+    return 0
+}
+
+# Testing: 
+# - DEBUG=init
+#    - Run a command before swaproot, poweroff immediatly after.
+#      Useful for finding startup time.
+#          `CMD_OPTS=cmdx=/bin/ls`
+# - Run a command after pivot, poweroff after
+#      cmd="df" 
+
+# Alpine kernel includes no filesystem - virtiofs is a module - so modules must be loaded
+# by the initrd. Debian has similar issues.
+
+vm_init() {
+  mount -o bind /lib/modules ${WORK}/share/lib/modules
+  # TODO: additional bind mounts configured in the lib
+}
+
+start() {
+  start_vm $*
+}
+
+# Start will run run the pod (VM) in background, like a container.
+# There is no command - just init.
+start_vm() {
+  BASE=2
+
+  OPTS="$OPTS --pvpanic"
+  OPTS="$OPTS --rng src=/dev/urandom"
+  OPTS="$OPTS --api-socket=${WORK}/ch.sock"
+  OPTS="$OPTS --memory size=${vm_mem},shared=on --cpus boot=${vm_cpu}"
+  OPTS="$OPTS --balloon size=1G,deflate_on_oom=on "
+
+  # Networking - add the tap with specific interface, add cmd line for the guest side.
+  #local hostip=$(_ip_base $BASE)
+  #local guestip=$(_ip_base $(( $BASE + 1 )) )
+  
+
+  # virtio-net is used for eth
+  # tap is the address of the tap on the VM side
+  # Adding ip=172.17.1.22 to kernel cmdline adds 10 sec delay
+  #OPTS="$OPTS --net tap=vm-$VM,ip=${hostip},mask=255.255.128.0,iommu=on"
+  #CMD_OPTS="$CMD_OPTS net.ifnames=0 initos.ip=${guestip} initos.gw=${hostip}"
+  OPTS="$OPTS --net tap=vm-$VM,iommu=on"
+  CMD_OPTS="$CMD_OPTS net.ifnames=0 initos.ip=${vm_ip} initos.gw=${vm_gw}"
+  
+  OPTS="$OPTS --kernel ${VIRT}/vmlinuz"
+  OPTS="$OPTS --initramfs ${VIRT}/initramfs "
+
+  CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
+  
+  # Using the rootfs as root or shared
+  run_virtiofsd ${WORK}  
+  OPTS="$OPTS --fs tag=/dev/root,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=512"
+
+  DISKS=
+  if [ -f ${IMGDIR}/${VM}.img ] ; then
+      DISKS="--disk path=${IMGDIR}/${VM}.img"
+  fi
+  OPTS="$OPTS $DISKS"
+    
+  #  --vsock \
+  #  --pmem file=${WORK}/boot/efi/recovery.sqfs \
+
+  rm -f ${WORK}/ch.sock
+  rm -f ${WORK}/serial.socket
+ 
+  #set -x
+
+  if [ "${DEBUG}" = "init" ]; then
+    # Debian kernel doesn't seem to work with hvc0, serial is fine
+    # Verbose
+    OPTS="$OPTS --serial tty --console off"
+    CMD_OPTS="$CMD_OPTS debug loglevel=8 ignore_loglevel"
+    CMD_OPTS="$CMD_OPTS console=hvc0 console=ttyS0 "
+    CMD_OPTS="$CMD_OPTS systemd.log_level=debug systemd.log_target=console"
+    CMD_OPTS="$CMD_OPTS systemd.debug_shell"
+    # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
+    # Otherwise the virtio-console driver is used - faster but less early messages
+
+    if [ -n "${cmd}" ] ; then 
+      # Instead of start - get a shell
+      $TIME ${VIRT}/cloud-hypervisor $OPTS \
+      --cmdline "${CMD_OPTS} --${cmd}"
+    else 
+      $TIME ${VIRT}/cloud-hypervisor $OPTS \
+      --cmdline "${CMD_OPTS} initos.cmd1=/bin/sh"
+    fi 
+  elif [ -n "${cmd}" ] ; then 
+    
+    OPTS="$OPTS --serial tty --console off"
+    CMD_OPTS="$CMD_OPTS quiet console=ttyS0 "
+    
+    # Instead of start - get a shell (post chroot)
+    $TIME ${VIRT}/cloud-hypervisor $OPTS \
+       --cmdline "${CMD_OPTS} --${cmd}"
+  elif [ "${FG}" = "1" ]; then
+    OPTS="$OPTS --serial tty --console off"
+    CMD_OPTS="$CMD_OPTS quiet console=ttyS0 "
+  
+    ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}"
+  else
+    OPTS="$OPTS --serial socket=${WORK}/serial.socket --console off"
+    CMD_OPTS="$CMD_OPTS quiet"
+    CMD_OPTS="$CMD_OPTS console=ttyS0 "
+  
+    ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" &
+    echo $! > ${WORK}/vm.pid
+
+    #sleep 1
+    # TODO: wait for vm-$VM to show up
+    #brctl addif br-lan vm-$VM
+  fi
+
+  # --net .. mac=...
+  #systemd.unit=rescue.target systemd.debug-shell=1 
+
+  # exit with openrc-shutdown -p 0
+  # or poweroff -d 0 -f
+}
+
+# Each VM is expected to have a SSH server. Just SSH and run the command.
+# This is the same as 'remote pods'.
+run_vm() {
+  ssh $VMIP $*
+}
+
+stop_vm() {
+  vm_ctrl shutdown-vmm
+}
+
+vm_console() {
+  socat UNIX-CONNECT:${WORK}/serial.socket  -
+}
+
+# Expose ch-remote control
+vm_ctrl() {
+  ${VIRT}/ch-remote --api-socket ${WORK}/ch.sock $*
+
+}
+
+# mkdisk will create (or overrite) a BTRFS image and pre-populate it with a rootfs.
+mkdisk() {
+  local img=$1
+
+  mkdir -p ${IMGDIR}
+  truncate -s ${vm_disk} ${IMGDIR}/${VM}.img
+  # Same as - but simpler/faster than
+  # qemu-img create -f raw ${WORK}/disk.img 10G
+
+  # Can be mounted using:
+  #dev=$(losetup -f ${WORK}/disk.img --show)
+
+  mkdir -p ${WORK}/rootfs
+
+  mkfs.btrfs ${IMGDIR}/${VM}.img --rootdir ${WORK}/rootfs
+  #parted $dev mklabel gpt
+
+  # --shrink will keep the image at the required size - can be used for a base image.
+}
+
+stop_vm() {
+  ch-remote --api-socket=${WORK}/ch.sock shutdown-vmm
+}
+
+
+### CHROOT BASED (full access to host)
+
+# Setup a chroot env
+start_chroot() {
+
+  R=${1:-${WORK}}
+  if [ "$POD" = "/sysroot" ]; then
+    R=/sysroot
+  fi
+
+  # https://wiki.gentoo.org/wiki/Chroot/en
+  mount --rbind /dev ${R}/dev
+  mount --make-rslave ${R}/dev
+  mount -t proc /proc ${R}/proc
+  mount --rbind /sys ${R}/sys
+  mount --make-rslave ${R}/sys
+  mount --rbind /tmp ${R}/tmp
+
+  mount -o bind /lib/modules ${R}/lib/modules
+  mount -o bind /lib/firmware ${R}/lib/firmware
+
+  #mount -o bind /ws/initos ${R}/ws/initos
+  #mount -o bind /x/vol/devvm-1/initos ${R}/x/initos/
+  #mount -o bind /x/vol/devvm-1/initos/boot ${R}/boot
+}
+
+run_chroot() {
+  R=${WORK}
+  if [ "$POD" = "/sysroot" ]; then
+    R=/sysroot
+  fi
+
+ chroot ${WORK} $*
+}
+
+run_unshare() {
+ # No --net
+ unshare --root=${WORK} --pid --mount --fork --mount-proc \
+     --uts --ipc --cgroup --propagation shared  -- $*
+}
+
+stop_chroot() {
+  X=${1:-/sysroot}
+
+  umount ${X}/dev/pts
+  umount  ${X}/dev/
+  umount  ${X}/proc/
+  umount  ${X}/tmp/
+  umount  ${X}/sys/
+}
+
+### Buildah
+# Will run buildah/podman, with files in HOME/.local/share/containers
+# vfs-layers contains tgz layers (tar-split.gz)
+# 
+# Useful commands:
+# - images, containers
+# - inspect ${POD}, --type=image 
+# - info - runtime (runc), dirs
+# - commit - create OCI image
+# - config (--cmd, entrypoint), manifest - image config
+# - from, copy, run, rm
+# - mount - mount container to dir
+# - login, pull, push, tag
+# - push docker-daemon:...
+# 
+# Less useful:
+# - add - use copy instead
+# - build - what's the point (Dockerfile)
+# - rename, rmi, source(?)
+# - unshare: after unshare buildah mount works for user
+
+start_buildah() {
+  img=${1}
+
+  # Source files
+  VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
+
+  # APK cache - to avoid downloading files.
+  mkdir -p ${WORK}/work/apkcache
+  mkdir -p ${WORK}/work/cache
+
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/${APP}"
+  #DOCKER_OPTS="--net br-lan"
+
+  buildah --name ${POD} \
+      ${VOLS} \
+      from ${img}
+}
+
+stop_buildah() {
+  buildah rm $POD
+}
+
+# Run a single command in a pod (or VM, container).
+# First param is the name of the pod.
+run_buildah() {
+  buildah ${VOLS} run ${POD} -- $*
+}
+
+sh_buildah() {
+  buildah ${VOLS} run -t ${POD} -- $*
+}
+
+copy_buildah() {
+  buildah copy ${POD} $*
+}
+
+commit_buildah() {
+  buildah commit ${POD} $*
+}
+
+### Direct ctr
+
+# crun_setup() {
+#   echo oci-runtime-tool - create spec
+#   echo umoci - like crane
+#   echo expand to /x/vol/NAME/rootfs
+
+#   # Need /opt/cni/bin and /etc/cni/net.d/ to be setup
+
+#   ctr run -t --cni --rootfs ./rootfs/ devvm /bin/bash
+#   ctr c delete devvm
+# }
+
+### Docker pod 
+
+# A docker pod is like a k8s pod or VM - sleeps or run a long lived app, 
+# and exec can be called. 
+# It is also similar to buildah - except buildah doesn't need a long-running
+# process, can enter the namespaces when it needs.
+
+run_docker() {
+  docker exec -it ${POD} $*
+}
+
+copy_docker() {
+    docker cp ${POD} ${1}:$2
+}
+
+start_docker() {
+  img=${1}
+
+  # Source files
+  VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
+
+  # APK cache - to avoid downloading files.
+  mkdir -p ${WORK}/work/apkcache
+  mkdir -p ${WORK}/work/cache
+
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/${APP}"
+  #DOCKER_OPTS="--net br-lan"
+
+  docker run $DOCKER_OPTS --name ${POD} -d \
+    ${VOLS} \
+    ${IMAGE} \
+      sleep infinity
+}
+
+stop_docker() {
+  docker stop $POD
+}
+
+# docker export -> tar file that can be piped
+# crane export -> same
+
+# podman_in_recovery() {
+#   # if running on recovery
+#   mount -t tmpfs /var/lib/containers
+
+#   #crane pull --format oci git.h.webinf.info/costin/initos-recovery:latest /tmp/r
+#   podman run $DOCKER_OPTS --privileged -it --net host \
+#      git.h.webinf.info/costin/initos-recovery:latest /bin/sh
+# }
+
+
+### Docker run
+# Like buildah - but containers go away after each command.
+# works if containers only operate on the mounted volumes.
+
+start_drun() {
+  echo drun
+}
+
+# Run a short lived command in docker, remove the container after.
+# 'docker start' can only restart a container - because docker is designed
+# around 'a single long running service'.
+run_drun() {
+  local n=${POD}
+  # Source files
+  VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
+
+  # APK cache - to avoid downloading files.
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  # Separate volumes - at runtime will also be mounted here.
+  #VOLS="$VOLS -v ${WORK}/modules:/lib/modules"
+  #VOLS="$VOLS -v ${WORK}/boot:/boot"
+  #VOL$VOLS -v ${WORK}/firmware:/lib/firmware"
+
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/${APP}"
+  #DOCKER_OPTS="--net br-lan"
+
+  docker run $DOCKER_OPTS -it --rm \
+    ${VOLS} \
+    ${IMAGE} \
+    $*
+}
+
+
+## Support functions 
+_ip_base() {
+  local num=$1
+  local ip=192.168.19.$(( num & 255 ))
+  echo $ip
+}
+
+
+docker_extract() {
+  img=${1}
+  mkdir ${WORK}/rootfs
+
+  docker export $img | \
+    (cd ${WORK}/rootfs && tar -xf  - )
+}
+
+
+
+CMD=$1
+shift
+$CMD "$*"

@@ -10,10 +10,14 @@
 # - hosts ?
 # - mesh.json - mesh json configuration
 SECRET=${HOME}/.ssh/initos
-mkdir -p ${SECRET}/uefi-keys
+
 export SRCDIR=${SRCDIR:-$(pwd)}
 
-WORK=/x/vol/boot
+# Output generated here
+WORK=${HOME}/.cache/initos/efi
+
+mkdir -p ${SECRET}/uefi-keys ${WORK}
+
 
 # Sign will use $HOME/.ssh/initos directory to create a private root key and EFI signing
 # keys on first run.
@@ -27,92 +31,59 @@ WORK=/x/vol/boot
 # It produces a set of UKI images, including the signed one.
 #
 # Requires the sqfs file and verity hash to be already available.
-sign() {
-  local POD=recovery
+efi() {
+  local POD=initos
+  buildah containers --format {{.ContainerName}} | grep initos > /dev/null
+  if [[ $? -eq 0 ]]; then
+  echo started
+  else
+  buildah --name initos from ghcr.io/costinm/initos:latest
+  echo starting 
+  fi
 
   # Update with latest files, optional
-  buildah copy $POD recovery/ /
+  buildah copy $POD rootfs /
 
   # Create signed UKI (and unsigned one)
   VOLS="-v ${SECRET}/uefi-keys:/etc/uefi-keys" 
-  VOLS="$VOLS -v ${WORK}:/x/initos" 
-  buildah run $VOLS $POD -- setup-initos sign2
+  VOLS="$VOLS -v ${WORK}:/x/vol/boot" 
+  buildah run $VOLS $POD -- setup-efi sign $*
 }
 
-dsign() {
+defi() {
   docker run -it --rm  \
      -v ${SECRET}/uefi-keys:/etc/uefi-keys \ 
      -v ${WORK}:/x/initos \ 
-    ${REPO}/initos:latest /sbin/setup-initos sign2
+    ${REPO}/initos:latest /sbin/setup-efi sign $*
 }
 
-# Same thing, using docker - copy latest files
-dsign2() {
-  # in case of changes
-  VOLS="-v ${SECRET}/uefi-keys:/etc/uefi-keys" 
-  VOLS="$VOLS -v ${WORK}:/x/initos" 
-  VOLS="$VOLS -v ${SRCDIR}/recovery/sbin:/opt/initos/sbin"
-
-  # Inside the host or container - initos files will be under /initos (for now)
-  docker run -it --rm  \
-      ${VOLS} \
-    ${REPO}/initos:latest /opt/initos/sbin/setup-initos sign2
-}
 
 ##### PUSH to machines
 
-# This is the USB recovery disk - mounts the original
-# efi as efi2.
-push_recovery_usb() {
-  host=${1:-usb}
+# test hosts: usb, host19, host8
 
-  scp -r -O ${WORK}/usb/EFI $host:/boot/efi/
-  scp -r -O ${WORK}/secure $host:/boot/efi/
-  scp -r -O ${WORK}/img $host:/boot/efi/initos
-}
-
-push_recovery() {
-  host=${1:-usb}
-
-  scp -r -O ${WORK}/img $host:/boot/efi2/initos
-  scp -r -O ${WORK}/secure/EFI $host:/boot/efi2/
-}
 
 push_usb() {
-  host=${1:-host18}
+  host=${1:-host19}
 
-  ssh $host mount /dev/sda1 /mnt/usb
+  ssh $host mount /dev/sda1 /boot/usb
+  
+  mkdir -p ${WORK}/EFI/BOOT
+  cp ${WORK}/initosUSB.EFI ${WORK}/EFI/BOOT/BOOTx64.EFI
+  rsync -rvz --inplace ${WORK}/  $host:/boot/usb/
 
-  scp -r -O ${WORK}/usb/EFI $host:/mnt/usb
-  scp -r -O ${WORK}/secure $host:/mnt/usb
-
-  ssh $host umount /mnt/usb
+  ssh $host umount /boot/usb
 }
 
-push_usb_all() {
-  host=${1:-host18}
+push() {
+  host=${1:-host8}
+  # The partitions are small, can't do temp file
+  mkdir -p ${WORK}/EFI/BOOT
+  cp ${WORK}/initosA.EFI ${WORK}/EFI/BOOT/BOOTx64.EFI
 
-  ssh $host mount /dev/sda1 /mnt/usb
-
-  scp -r -O ${WORK}/usb/EFI $host:/mnt/usb
-  scp -r -O ${WORK}/secure $host:/mnt/usb
-  scp -r -O ${WORK}/img $host:/mnt/usb/initos
-
-  ssh $host umount /mnt/usb
+  rsync -ruvz --inplace ${WORK}/  $host:/boot/b/
 }
 
-push_secure() {
-  host=${1:-host18}
-
-  scp -r -O ${WORK}/secure/EFI $host:/boot/efi
-}
-
-push_secure_all() {
-  host=${1:-host18}
-
-  scp -r -O ${WORK}/img $host:/boot/efi/initos
-  scp -r -O ${WORK}/secure/EFI $host:/boot/efi
-}
 
 $*
 
