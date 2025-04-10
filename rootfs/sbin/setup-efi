@@ -48,6 +48,28 @@ sign_init() {
   cp -a /etc/uefi-keys /config
 }
 
+# Copy the efi keys to the EFI partition
+efi_keys() {
+  DEST=/data
+
+  cp /etc/uefi-keys/*.auth ${DEST}/keys
+  cp /etc/uefi-keys/*.cer ${DEST}/keys
+  cp /etc/uefi-keys/*.crt ${DEST}/keys
+  # Internal, not used (ESL)
+  #cp /etc/uefi-keys/*.esl ${DEST}/keys
+  
+  #cert-to-sig-list PK.crt PK.esl
+  #sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth
+
+  # Under EFI:
+  # 
+  # UpdateVars db db.auth
+  # UpdateVars KEK KEK.auth
+  # Last:
+  # UpdateVars PK PK.auth
+
+}
+
 # Sign will create the UKI signed, insecure and usb images.
 # It will also regenerate and sign the SQFS file, and add patches
 # to the UKI that will be used to configure the hosts, including 
@@ -75,12 +97,10 @@ efi() {
     cp -a /config/uefi-keys /etc
   fi
 
-  mkdir -p ${DEST}/initos ${DEST}/initos/KEYS /local ${DEST}/EFI/BOOT
+  mkdir -p ${DEST}/initos ${DEST}/keys /local ${DEST}/EFI/BOOT
 
-  cp /etc/uefi-keys/*.auth ${DEST}/initos/KEYS
-  cp /etc/uefi-keys/*.crt ${DEST}/initos/KEYS
-  cp /etc/uefi-keys/*.cer ${DEST}/initos/KEYS
-  
+  efi_keys
+
   # Initos image includes the recovery. It can also be built or manipulated on the
   # host.
   if [ ! -f ${DEST}/initos/initos.sqfs ]; then
@@ -111,12 +131,13 @@ efi() {
   cp -a /config/hosts/${host}/local/* /local/ || true
   
   INIT_PATCH=/tmp/initrd-patch.cpio.gz
-  (find /sbin/initos* /local \
+  (find /sbin/initos* /sbin/setup-initos* /local \
    | sort  | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${INIT_PATCH}
 
-  local cmd="console=ttyS0 rdinit=/sbin/initos-initrd console=tty1 net.ifnames=0 panic=5"
+  # Console on ttyS0: for headless servers
+  local cmd="console=ttyS0 console=tty1 net.ifnames=0 panic=5"
  
-  kernel_version=$(cat /boot/version)
+  kernel_version=$(cat /boot/version) # Created on download
   KERNEL=/boot/vmlinuz-${kernel_version}
   #UCODE="/boot/intel-ucode.img /boot/amd-ucode.img"
   UCODE=""
@@ -133,7 +154,7 @@ efi() {
   # TODO: add a file an create another config.cpio - command line can be set by efibootmgr.
   # Technically if the command line can be changed an attacker can also set rdinit=/bin/sh - the bootloader must 
   # be locked down and EFI restricted just like TPM
-  echo "$cmd initos=USB loglevel=6 debug_init iomem=relaxed " > /boot/cmdline.usb
+  echo "$cmd initos=USB  rdinit=/sbin/initos-initrd-ins loglevel=6 debug_init iomem=relaxed " > /boot/cmdline.usb
   efi-mkuki \
       -c /boot/cmdline.usb \
       -o ${DEST}/EFI/BOOT/BOOTx64.EFI \
@@ -141,7 +162,7 @@ efi() {
         ${UCODE} /boot/initos-initrd.img ${INIT_PATCH}
  
 
-  echo "$cmd loglevel=2 quiet " > /boot/cmdline
+  echo "$cmd loglevel=2 quiet rdinit=/sbin/initos-initrd" > /boot/cmdline
   efi-mkuki \
       -c /boot/cmdline \
       -o /tmp/tmp.EFI \
@@ -155,6 +176,7 @@ efi() {
 
   rm /tmp/tmp.EFI
   chmod -R 755 ${DEST}
+  rm -rf /etc/uefi-keys
 }
 
 #    sigfile=${hashfile}.sig
@@ -165,5 +187,5 @@ efi() {
 if [ -z ${1+x} ] ; then
   efi
 else
-  $*
+  "$@"
 fi

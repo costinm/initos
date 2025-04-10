@@ -2,18 +2,25 @@
 
 # Run a command in a virtual envirnment ('Pod', container, VM, ssh remote, kubectl).
 # 
-# This is an 'opinionated' wrapper on multiple tools. It takes the name of the destination as 
-# an env variable (not in the CLI), and the name is mapped to specific 'workload config' which determines
+# This is an 'opinionated' wrapper on multiple tools. It takes the name of the target as 
+# an POD env variable (not in the CLI params), and the name is mapped to specific 'workload config' which determines
 # how to run the command.
+# 
+# If the env is not set, current working dir or the name of the script is used.
+# 
+# "start"/"stop" can be used to explicitly start/stop the environment.
+# "run ..." will be executed in the environment, may start it if not running.
 #
-# It may be able to start an workload if it is not running. A separate process may stop/reclaim unused VMs/containers.
+# A separate process may stop/reclaim unused VMs/containers.
 # 
 # The setup is done by setup-vm.
 # 
-# Most of the time the 'run' will use `ssh` or `kubectl` or one of the local container tools.
+# Most of the time the 'run' will use `ssh` or `kubectl` or one of the local
+# container tools.
+#
+# The configs and rootfs are expected to be under ${VOLS}/${POD} (/x/vol or ~/vol) 
 # 
-# - pods in /x/vol/NAME
-# - a simple config containing only env vars.
+# Inside the pod config dir:
 # Defaults:
 # - if ./rootfs/ is present - will be used with a VM
 #    - if ./disk.img - will be mounted as well
@@ -165,7 +172,7 @@ vm_init() {
 }
 
 start() {
-  start_vm $*
+  start_vm "$@"
 }
 
 # Start will run run the pod (VM) in background, like a container.
@@ -270,7 +277,7 @@ start_vm() {
 # Each VM is expected to have a SSH server. Just SSH and run the command.
 # This is the same as 'remote pods'.
 run_vm() {
-  ssh $VMIP $*
+  ssh $VMIP "$@"
 }
 
 stop_vm() {
@@ -283,7 +290,7 @@ vm_console() {
 
 # Expose ch-remote control
 vm_ctrl() {
-  ${VIRT}/ch-remote --api-socket ${WORK}/ch.sock $*
+  ${VIRT}/ch-remote --api-socket ${WORK}/ch.sock "$@"
 
 }
 
@@ -344,13 +351,13 @@ run_chroot() {
     R=/sysroot
   fi
 
- chroot ${WORK} $*
+ chroot ${WORK} "$@"
 }
 
 run_unshare() {
  # No --net
  unshare --root=${WORK} --pid --mount --fork --mount-proc \
-     --uts --ipc --cgroup --propagation shared  -- $*
+     --uts --ipc --cgroup --propagation shared  -- "$@"
 }
 
 stop_chroot() {
@@ -413,19 +420,19 @@ stop_buildah() {
 # Run a single command in a pod (or VM, container).
 # First param is the name of the pod.
 run_buildah() {
-  buildah ${VOLS} run ${POD} -- $*
+  buildah ${VOLS} run ${POD} -- "$@"
 }
 
 sh_buildah() {
-  buildah ${VOLS} run -t ${POD} -- $*
+  buildah ${VOLS} run -t ${POD} -- "$@"
 }
 
 copy_buildah() {
-  buildah copy ${POD} $*
+  buildah copy ${POD} "$@"
 }
 
 commit_buildah() {
-  buildah commit ${POD} $*
+  buildah commit ${POD} "$@"
 }
 
 ### Direct ctr
@@ -449,7 +456,7 @@ commit_buildah() {
 # process, can enter the namespaces when it needs.
 
 run_docker() {
-  docker exec -it ${POD} $*
+  docker exec -it ${POD} "$@"
 }
 
 copy_docker() {
@@ -528,7 +535,7 @@ run_drun() {
   docker run $DOCKER_OPTS -it --rm \
     ${VOLS} \
     ${IMAGE} \
-    $*
+    "$@"
 }
 
 
@@ -552,4 +559,4 @@ docker_extract() {
 
 CMD=$1
 shift
-$CMD "$*"
+$CMD ""$@""

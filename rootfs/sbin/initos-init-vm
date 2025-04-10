@@ -11,7 +11,7 @@
 # the startup.
 start_app() {
     echo direct run
-    $*
+    "$@"
 }
 
 
@@ -39,7 +39,7 @@ vm_init() {
 
 # Info log - shown on console, logged.
 logi() {
-	last_emsg="$*"
+	last_emsg=""$@""
 	echo "INITOS: $last_emsg..." > /dev/kmsg
 	echo "$last_emsg\n"
 }

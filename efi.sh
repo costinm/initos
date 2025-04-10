@@ -112,12 +112,12 @@ buildc() {
   # For example 'ui' will add the alpine UI.
   ${SRCDIR}/rootfs/sbin/setup-builder initos_efi_builder $*
   # The sqfs is cached
-  rm ${WORK}/initos/*
+  rm -rf ${WORK}/initos/*
 }
 
 
 # Build the base images (slow). Alternative is to pull from 
-# github.
+# github. The base can be extended.
 buildbase() {
   ${SRCDIR}/rootfs/sbin/setup-builder clean $*
   ${SRCDIR}/rootfs/sbin/setup-builder debkernel $*
@@ -139,26 +139,27 @@ push() {
   # This packages the configs to a CPIO and signs.
   # Should not be large, just signing keys and core configs
   efi $host
+  
+  mkdir -p ${WORK}/install
+  echo ${host} > ${WORK}/install/hostname
+  cp rootfs/efi/test_setup ${WORK}/install/autosetup.sh
 
-  ssh $host "mkdir -p /boot/b; mount LABEL=BOOT${next} /boot/b"
-
+  # TODO: this should go to the sidecar, should use the script
+  # to mount the alternate partition
+  ssh $host /sbin/setup-initos-host upgrade_start
+  
   rsync -ruvz --inplace ${WORK}/  $host:/boot/b
 
-  ssh $host "umount /boot/b"
-
-  if [ "$next" = "B" ]; then
-    ssh $host "chroot /initos/rootfs efibootmgr -n 1002 && reboot"
-  else
-    ssh $host "chroot /initos/rootfs efibootmgr -n 1001 && reboot"
-  fi
+  ssh $host /sbin/setup-initos-host upgrade_finish
 
   # TODO: sleep and check, set permanent boot order
+  # using swapNext
 }
 
 if [ -z ${1+x} ] ; then
   efi
 else
-  $*
+  "$@"
 fi
 
 

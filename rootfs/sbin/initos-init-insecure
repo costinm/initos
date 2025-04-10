@@ -1,5 +1,7 @@
 #!/bin/sh
 
+source /sbin/initos
+
 export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # This script runs in the recovery image, after initrd mounts the 
@@ -24,151 +26,59 @@ initos_init() {
   # Wil the drivers are loaded/settiling, asks for a key - set as MODE - which determines how to load persistent disk.
   load_drivers
 
-  # TODO: signed tar (using root.pem)
-  # TODO: interfaces/wpa_supplicant ok on efi 
-  # nothing else.
+  patch_rootfs /boot/efi/install /
 
-  if [ ! -f /boot/efi/usb2.sh ]; then 
-    # Temp to verify the environment
-    if [ "$MODE" = "a" ]; then
-      echo "USB mode, in recovery. Use initos load_drivers, mount_persistent, mount_sysroot"
-      busybox ash
-    fi
-  else
-    source /boot/efi/usb2.sh 
+  if [ -f /etc/hostname ]; then
+    export HOSTNAME=$(cat /etc/hostname) 
+    logi "Setting hostname $HOSTNAME"
+    hostname "${HOSTNAME}"
+  fi
+
+  if [ -f /boot/efi/install/autosetup.sh ]; then 
+    source /boot/efi/install/autosetup.sh init
+    source /boot/efi/install/autosetup.sh install
   fi 
 
-  run_standalone
+  run_installer
 }
 
-# After mounting /lib/modules and firmware, load all drivers.
-load_drivers() {
-  sysctl -w kernel.printk="0 4 1 7"
-
-    # this is normally done by sysinit - we want tpm2 to be loaded
-  # Needs to happen after full firmware and modules are in place
-  hwdrivers > /tmp/hwdrivers.log 2>&1
-
-  logi "hwdrivers loaded"
-
-  udevadm trigger
-
-  udevadm settle
-
-  logi "udevadm settle"
-
-  sysctl -w kernel.printk="2 4 1 7"
-}
-
-# Info log - shown on console, logged.
-logi() {
-	last_emsg="$*"
-	echo "INITOS: $last_emsg..." > /dev/kmsg
-	echo "$last_emsg\n"
-}
-
-mount_btrfs_raw() {
-  local root_device=${1}
-  local dst=${2}
-
-  BTRFS_OPTS="-o nobarrier"
-  #  -o compress
-
-  mkdir -p ${dst}
-
-  mount -t btrfs "${root_device}" ${dst}
-  if [ $? -ne 0 ]; then
-      logi "Error: Failed to mount BTRFS partition"
-      return 1
-  fi
-}
-
-# Scan /sys for 'modalias', sort and load the modules.
-# This should load TPM if it is available
-hwdrivers() {
-  find /sys -name modalias -type f -print0 | xargs -0 sort -u | xargs modprobe -b -a
-}
-
-# Few untrusted files will be added for networking, from the non-encrypted disk - enough to get SSH started.
-# Keep the ssh keys and IPs separate from the ones in the encrypted disk, only for remote recovery.
+# Add the files from the EFI /install dir to the InitOS rootfs
+# 
+# The installer will start as a normal InitOS, but without 
+# /x mounted
+# 
+# Normally this is run once, the first time - there is no 
+# need to ssh to the machine.
 patch_rootfs() {
-  # In insecure mode and recovery, /boot/efi/insecure can keep 
+  # In insecure mode and recovery, /boot/efi/install can keep 
   # network config (physical access would allow root and any config)
-  dir=${1:-/boot/efi/insecure}
-  rootfs=${2}
-
-  #setcap cap_net_admin+ep /opt/virt/cloud-hypervisor
+  dir=${1:-/boot/efi/install}
 
   # From EFI, not signed. Alternative is DHCP, also insecure.
   # Recovery SSH. Interfaces and ssh should be different from 
   # normal disk. 
   if [ -f ${dir}/interfaces ]; then
-    cp ${dir}/interfaces ${rootfs}/etc/network/interfaces
+    cp ${dir}/interfaces /etc/network/interfaces
+  fi
+  if [ -f ${dir}/hostname ]; then
+    cp ${dir}/hostname /etc/hostname
+    export HOSTNAME=$(cat /etc/hostname) 
   fi
   if [ -f ${dir}/wpa_supplicant.conf ]; then
-    cp ${dir}/wpa_supplicant.conf ${rootfs}/etc/wpa_supplicant/wpa_supplicant.conf
+    cp ${dir}/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf
   fi
 
-  if [ -d ${dir}/ssh ]; then
-    cp -a ${dir}/ssh ${rootfs}/etc
-    chmod 700 ${rootfs}/etc/ssh/ssh_host*
-  fi
-
-  mkdir -p ${rootfs}/root/.ssh
-
-  cp /var/initos/local/authorized_keys ${rootfs}/root/.ssh/authorized_keys
-  cp /var/initos/local/root.pem ${rootfs}/etc
-  # requires rc-local systemd service, since systemd kills all processes
-  # This will run 'sidecar', which starts initos in a chroot.
-  cp /etc/rc.local ${rootfs}/etc
-  chown -R root ${rootfs}/root
-  
-  # TODO: start everything in IPv6 mode !!!
-
-  # Patch the init files on the host to current version (image may be older)
-  cp /sbin/initos* ${rootfs}/sbin
-
-  if [ ! -f ${rootfs}/etc/resolv.conf ]; then
-    echo "nameserver 1.1.1.1" > ${rootfs}/etc/resolv.conf
-  fi
 }
 
-# In insecure mode only (secure boot disabled).
-# Will use the INSECURE disk (if it exists), run a script from it.
-# 
-run_standalone() {
-  echo INITOS insecure startup. LUKS is not opened, insecure boot.
 
-  start_recovery
+# If 'INSECURE' partition is not found - start in-memory
+# User can manually run the host setup - or use the script.
+run_installer() {
 
-  # If the machine is not secured - it doesn't really matter 
-  # if we leave a root shell, physical access would compromise it
-  # anyways.
-  # This is ok for test machines.
-  rootdev=$(findfs LABEL=INSECURE)
-  if [ -n "$rootdev" ] ; then
-    mount_btrfs_raw $rootdev /x
-  fi
 
-  # TODO: may execute some startup from /x
-  if [ -f /etc/init.d/seatd ]; then
-    addgroup build seat
-    /etc/init.d/seatd start
-    /etc/init.d/polkit start
-  fi
 
-  if [ -f /x/initos/start ]; then 
-    # This asks for pass 
-    # TODO: add a shadow to /x/initos
-    /etc/init.d/agetty.tty2 start
-
-    # This can start VMs/docker images/etc
-    # Remember: this is insecure, unprotected - no secrets or 
-    # important stuff. Anyone who has access to the machine can
-    # do whatever they want and read everything - just like any
-    # unencrypted machine, regardless of OS.
-    exec /x/initos/start
-  fi
+  run_standalone_start 
+ 
 
   # Experimenting with different ways to autologin and 
   # start sway on an old insecure laptop.
@@ -176,45 +86,8 @@ run_standalone() {
   getty 38400 /dev/tty3 -n -l /sbin/autologin &
   getty 38400 /dev/tty4 -n -l /sbin/autologin.build &
 
-  exec /bin/sh
-}
-
-# Background init and ssh.
-# This is used if no rootfs has been found, for 'r' command and
-# after swithc_root to start InitOS as sidecar.
-#
-# It will still start SSH and run VMs and containers.
-start_recovery() {
-  patch_rootfs /boot/efi/insecure /
-  #patch_rootfs /boot/efi/insecure /initos/rootfs
-  
-  logi "Starting INITOS in recovery, no rootfs ${KOPT_initos}"
-  if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
-      ssh-keygen -q -f /etc/ssh/ssh_host_ecdsa_key -N '' -t ecdsa
-  fi
-
-  # Started by openrc
-  # busybox syslogd -C1024
-
-  # Not using init - openrc (like s5) is just a launcher for 
-  # initialization scripts.
-  /sbin/openrc sysinit
-  /sbin/openrc boot
-  
-  # Normall init starts this with 'wait'
-  /sbin/openrc default
-
-  # Show the interfaces
-  ifconfig -a
-  cat /etc/ssh/*.pub
- 
-  # TODO: loop showing the interface in secure mode, maybe with
-  # a small shell to read a set of commands.
-  
-  #wpa_supplicant \
-  #   -i wlan0 \
-  #   -c /etc/wpa_supplicant/wpa_supplicant.conf > /tmp/wpa 2>&1 &
-
+  # exec /bin/sh
+  /bin/sh
 }
 
 # If running as PID=1 (from initrd): run initos_init or
@@ -224,8 +97,8 @@ if [ "$$" = "1" ]; then
     initos_init
   else 
     # Run one of the functions
-    $*
+    "$@"
   fi
 else
-  $*
+  "$@"
 fi

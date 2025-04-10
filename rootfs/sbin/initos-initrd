@@ -5,15 +5,17 @@ export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 # Initrd portion, responsible to find the verity-signed 
 # sqfs and give control to it.
 # 
-# As alternative, kernel with verity and disk modules linked
-# in, and InitOS on an EFI partition with no initrd.
+# As alternative: custom kernel with verity and disk modules
+# linked in, and InitOS and verity on a ext2 partition will
+# also work the same (like ChromeOS).
+# 
+# No other code should be included here.
 
 # Based on Alpine mkinitrd, but with different init script:
 # - removed all networking or alpine-specific init - only job is to load a rootfs
 #
 # This allows using the simpler initrd, with a number of small 
 # specialized functions.
-
 
 # Main entry point - after mounting the system dirs.
 # At the end, /sysroot will include the InitOS verified
@@ -23,13 +25,7 @@ export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 # and disk drivers linked in, mounting an EFI disk
 # with verity as rootfs.
 initramfs_init() {
-
   logi "Starting INITOS initramfs $(uname -r)"
-
-  # Saving the blocks - to check later if the kernels compiled with all the required devices work
-  # better/faster boot.
-  blkid > /tmp/blkid.1st
-
   mkdir -p /sysroot /z /x /initos /boot/efi \
      /boot/efi2 /lib/modules /lib/firmware \
      /home /var/log /var/cache
@@ -38,48 +34,14 @@ initramfs_init() {
   # image. Udev will not load them by default, only modules for devices.
   initramfs_mods
 
-  # Attempt to find the root device - need to load modules and check blocks until
-  # we find the root we want.
-#  if [ "$ver" = "USB" ]; then
-#    initramfs_mods_usb
-#    # If any USB disk - will take seconds to discover
-#  fi
-#
   # Mount the rest of the modules - usually finding the root is not
   # possible without this.
   udev_start
-  logi "udevadm started"
 
-  udevadm settle
+  # Not needed - can try looking for the part, will retry
+  #udevadm settle
  
-  # Keep track of the blocks available after udev settle.
-  blkid > /tmp/blkid.4udev
-
-
-  # The current boot for InitOS is signifcant - it indicates what partition
-  # to check first.
-  # TODO: also check a local file - we want the signed EFI to only work in secure mode.
-  check_efi
-  currentBoot=$BOOT_CURRENT
-
-  if [ "$currentBoot" = "1001" ]; then
-    find_boot BOOTA
-    NEXT="B"
-  elif [ "$currentBoot" = "1002" ]; then 
-    find_boot BOOTB
-    NEXT="A"
-  elif [ "$SECURE_MODE" != "1" ]; then 
-    # Insecure also checks BOOTUSB (can be USB disk or recovery partition)
-    find_boot BOOTUSB
-  else
-    find_boot BOOTA
-  fi
-
-  if [ $? -eq 0 ]; then
-    logi "Mounted verity secure: $SECURE_MODE boot id: $BOOT_CURRENT "
-  else
-    lfatal "$currentBoot - boot partition not found"
-  fi
+  find_and_mount_efi
 
   # At this point, /boot/efi is mounted, and /dev/mapper/initos has the
   # verified rootfs (SQFS)
@@ -87,17 +49,18 @@ initramfs_init() {
   # Mount the SQFS and overlayfs
   mount_initos
 
+  boot_initos
+}
+
+# Finish mounting and switch to the signed root
+boot_initos() {
   # The modules and firmwares are loaded from a VERITY SQFS on
   # the labeled partition, usually the EFI disk (but can be a different
   # one if upgrading a machine with a very small EFI).
 
   if [ ! -d /initos/rootfs/etc ]; then
-    blkid
     lfatal "partition containing boot image not found. Use alternate boot or USB disk for recovery"
   fi
-
-  echo ${currentBoot} > /initos/rootfs/etc/BOOT_CURRENT
-  echo ${NEXT} > /initos/rootfs/etc/BOOT_NEXT
 
   # Chroot into the Initos main
   mount -o bind /initos/rootfs /sysroot
@@ -109,37 +72,65 @@ initramfs_init() {
   # This can include wpa supplicant file for insecure machines
   # (ideally on a separate net)
   mkdir -p /sysroot/var/initos/local/logs
-  cp /tmp/blkid* /sysroot/var/initos/local/logs
   cp -a /local/* /sysroot/var/initos/local  
 
   # Patch initos scripts to the latest version from initrd (with possible patches) 
-  cp /sbin/initos* /sysroot/sbin/
+  cp /sbin/initos* /sbin/setup-initos* /sysroot/sbin/
   rm -f /sysroot/.dockerenv
 
-  # Temp to verify the environment
-  if [ "$SECURE_MODE" != "1" ]; then
-    echo "Insecure boot - before switch root, enter 'a' for admin shell"
-    read -t 4 -n 1 key
-    if [ "$key" = "a" ]; then
-      busybox ash 
-    fi 
-    move_mounted_to_sysroot
-    exec switch_root /sysroot /sbin/initos-init-insecure
-  fi 
-
-  # Secure mode 
-
+  
   # Expect a TPM file containing the handle to be present, otherwise use manual unlock.
   # In both cases a LUKS partition is required - it must be set in insecure mode or 
   # while creating the hard disk image.
-  if [ -f /boot/efi/initos/tpm.env ]; then 
+  if [ -f /boot/efi/initos/tpm_handle ]; then 
+   logi "Starting TPM initos-init-tpm2"
+   echo
    move_mounted_to_sysroot
    exec switch_root /sysroot /sbin/initos-init-tpm2
   else
+   logi "Starting manual unlock initos-init-tpm2"
+   echo
    move_mounted_to_sysroot
    exec switch_root /sysroot /sbin/initos-init-manual
   fi
   lfatal "Failed to switch root"
+}
+
+# Mount the /boot/efi - by finding the partition
+# that has the right hash.
+find_and_mount_efi() {
+  # The current boot for InitOS is signifcant - it indicates what partition
+  # to check first.
+  # TODO: also check a local file - we want the signed EFI to only work in secure mode.
+  check_efi
+
+  BOOT_CURRENT=$BOOT_CURRENT
+
+  if [ "$BOOT_CURRENT" = "1001" ]; then
+    find_boot BOOTA
+    NEXT="B"
+  elif [ "$BOOT_CURRENT" = "1002" ]; then 
+    find_boot BOOTB
+    NEXT="A"
+  else
+    find_boot BOOTA
+    NEXT="B"
+  fi
+  export NEXT
+
+  if [ $? -eq 0 ]; then
+    if [ "$SECURE_MODE" = "1" ]; then 
+      logi "Mounted verity SECURE, boot id: $BOOT_CURRENT "
+    else 
+      logi "Mounted verity INSECURE ($SECURE_MODE) boot id: $BOOT_CURRENT "
+      # may as well panic - in insecure use the unsigned UKI
+      # only use is machines that lack secure boot - but still want
+      # to encrypt the disk (manually). Evil maid can easily hack it
+      # and capture the password.
+    fi
+  else
+    lfatal "$BOOT_CURRENT - boot partition not found"
+  fi
 }
 
 ## First step - expand busybox and mount the basic filesystems
@@ -191,15 +182,13 @@ mount_proc() {
   # pty device nodes (later system will need it)
   [ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
   [ -d /dev/pts ] || mkdir -m 755 /dev/pts
-  mkdir -p /dev/shm
 
   mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts  
   # shared memory area (later system will need it)
   mount -t tmpfs tmpfs /run
-  mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+  # can't be moved for some reason
+  # mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
 }
-
-
 
 # Load modules we may need - modules are also loaded if we get to udev
 # or nlplug-findfs, but we may skip that if the core modules are enough.
@@ -208,42 +197,17 @@ initramfs_mods() {
 
   # Required on alpine kernel - without this there is no display
   # Debian appears to have it compiled in the kernel.
-  modprobe -a simpledrm
+  modprobe -a simpledrm scsi_mod sd_mod \
+    squashfs loop dm-verity mmc_block efivarfs >> /tmp/initos.log 2>&1
 
-  modprobe scsi_mod
-  # Support scsi disks - needed for sata ?
-  modprobe sd_mod
-
+  # Support scsi disks - needed for sata 
   # nvme appears to be linked in both deb and alpine
-
   # for loading recovery, modules, firmware
-  modprobe squashfs
-  modprobe loop
-  modprobe dm-verity
-  modprobe mmc_block
-
-  modprobe efivarfs
   # btrfs, vfat are are normally present - but may be loaded if missing
 }
 
-# Load modules we may need - modules are also loaded if we get to udev or nlplug-findfs, but 
-# if we may skip that if the core modules are enough.
-# 
-# Unlike 'init-secure', this also loads usb drivers - will look for USB recovery
-initramfs_mods_usb() {
-  # For loading recovery from USB disk
-  modprobe usbcore
-  modprobe ehci-hcd
-  modprobe ohci-hcd
-  modprobe xhci-hcd
-  modprobe usb-storage
-}
-
 # Mount the boot image - verity and unionfs
-# This is (usually, for simplicity) the EFI partition.
 mount_initos() {
-  local dir=${1:-/boot/efi/initos}
-
   # Will be moved to recovery image
   mkdir -p /initos
   mount -t tmpfs root-tmpfs /initos
@@ -260,6 +224,10 @@ mount_initos() {
   mount -o bind /initos/rootfs/lib/firmware /lib/firmware
   mount -o bind /initos/rootfs/lib/modules/${kernel_ver} \
       /lib/modules/${kernel_ver}
+
+  mkdir -p /initos/rootfs/var/initos
+  echo ${BOOT_CURRENT} > /initos/rootfs/var/initos/BOOT_CURRENT
+  echo ${NEXT} > /initos/rootfs/var/initos/BOOT_NEXT
 }
 
 # Mount an overlayfs on top of a squashfs, dm-verity or other RO device.
@@ -271,15 +239,14 @@ mount_overlay() {
   local dev=${3:-/dev/mapper/${name}}
   local type=${4:-squashfs}
 
-  mkdir -p /initos/ro/${name} /initos/rw/${name} /initos/work/${name} ${dst}
-  logi "Mounting overlay to $dst"
+  mkdir -p ${dst} /initos/ro/${name} /initos/rw/${name} /initos/work/${name} ${dst}
+  logi "Mounting overlay $dev $type to /initos/ro/$name and overlay to $dst"
   mount -t $type $dev /initos/ro/${name}
   if [ $? -ne 0 ]; then
      lfatal "Error: Failed to sqfs ${name}"
      return 1
   fi
 
-  mkdir -p ${dst}
   mount -t overlay \
     -o lowerdir=/initos/ro/${name},upperdir=/initos/rw/${name},workdir=/initos/work/${name} \
     overlayfs ${dst}
@@ -307,13 +274,13 @@ move_mounted_to_sysroot() {
 
 # Info log - shown on console, logged.
 logi() {
-	last_emsg="$*"
-	echo "INITOS: $last_emsg..." > /dev/kmsg
+	last_emsg=""$@""
+	echo "INITOS: $last_emsg" > /dev/kmsg
 	echo "$last_emsg"
 }
 
 lfatal() {
-  echo "FAILED: $*"
+  echo "FAILED: "$@""
   local save=/boot/efi/log
   mkdir -p $save
   if [ -d $save ]; then
@@ -323,18 +290,15 @@ lfatal() {
     cat /proc/devices > $save/devices
     lsmod > $save/lsmod.log
   fi
-  if [ "${KOPT_initos}" != "USB" ]; then
-    echo "Rebooting in 20 sec"
 
-    # TODO: if /boot/efi is mounted, save to the EFI partition
-    blkid
-    
-    sleep 20
-    sync
-    reboot -f
-  fi
+  echo "Rebooting in 20 sec"
 
-  busybox ash
+  # TODO: if /boot/efi is mounted, save to the EFI partition
+  blkid
+  
+  sleep 20
+  sync
+  reboot -f
 }
 
 # retry function. Not used right now, will be used for LVM open
@@ -357,20 +321,6 @@ retry() {
   done
 }
 
-# Set KOPTS_xxx=yyy based on kernel cmdline  
-cmdline() {
-  local c=$(cat $1)
-  set -- $c
-
-  for opt; do
-    key="${opt%%=*}"
-    value="${opt#*=}"
-    if [[ "$key" =~ "initos.*" ]]; then
-      key=${key/-/_}
-      export "KOPT_${key/./_}"="$value" || true
-    fi
-  done
-}
 
 # support for eudev. see /etc/init.d/udev*
 # At the end we need to call
@@ -391,7 +341,6 @@ udev_start() {
     # Populating /dev with existing devices through uevents
     udevadm trigger --type=subsystems --action=add
     udevadm trigger --type=devices --action=add
-    echo adm  $?
 	fi
 }
 
@@ -413,8 +362,7 @@ find_boot() {
   local hashf=${4:-$(cat /local/initos.hash)}
 
   # findfs doesn't work well if multiple partitions with same label are present.
-  retry 4 findfs LABEL=$first
-
+  retry 4 findfs LABEL=$first >/dev/null 2>&1
 
   # Find all block devices of type EFI
   # Doesn't seem to work with TYPE=EFI type, vfat is ok
@@ -425,18 +373,17 @@ find_boot() {
   
   # for kind in /dev/nvme /dev/mmc /dev/sd ;  do 
 
-  for kind in $first BOOTA BOOTB BOOTUSB ;  do
+  for kind in $first BOOTA BOOTB ;  do
     # This selects only one if the label is used on multiple disk. 
     #device=$(findfs LABEL=$kind)
     device=$(blkid | grep "LABEL=\"$kind\"" | cut -d: -f1)
-    echo "$device"
+    echo "Looking for signed bootstrap on $kind $device"
     if [ -z "$device" ]; then
       continue
     fi
     echo "$device" | while read -r d; do 
       try_disk "$d" "$hashf" "$mountp" "$vname"
       if [ $? -eq 0 ]; then
-        echo "MOUNTED $d"
         break
       fi
     done
@@ -456,12 +403,12 @@ try_disk() {
   local mountp=${3:-/boot/efi}
   local vname=${4:-initos}
 
-  fsck.vfat -y $device
+  fsck.vfat -y $device >> /tmp/initos.log 2>&1
   if mount -t vfat "$device" $mountp ; then
       if [ -f $mountp/initos/initos.hash ]; then
         version_content=$(cat $mountp/initos/initos.hash)
         if [ "$version_content" = "$hashf" ]; then
-          logi "Found InitOS partition $device"
+          logi "Found InitOS partition $device $hashf"
           # Cleanup - it happens if not unmounted safely.
           rm -f $mountp/FSCK*.REC || true
 
@@ -488,57 +435,46 @@ try_disk() {
     return 1
 }
 
-# Mount a partition to a destination, creating the dir. For vfat also run a fsck
-# and remove remaining FSCK files after.
-# This is used for the EFI partition, to find the VERITY image.
-# Deprecated - try_disk instead, checks verity too.
-mount_efi() {
-  bootd=${1}
-  boott=${2:-vfat}
-  dst=${3:-/boot/efi}
-
-  mkdir -p $dst
-
-  if [ "$boott" == "vfat" ] ; then
-    fsck.vfat -y $bootd
-  fi 
-
-  mount -t ${boott} ${bootd} ${dst}
-  if [ $? -ne 0 ]; then
-    lfatal "Failed to mount $bootd partition"
-  fi
-  
-  if [ "$boott" == "vfat" ] ; then
-    rm -f ${dst}/FSCK*.REC || true
-  fi
-}
-
 # We need to find the boot partition, to load the matching signed image.
 # EFI is complicated, but really all we care about is if current boot (which is
 # stored in a standard location) is odd or even.
+# 
+# Will set SECURE_MODE and BOOT_CURRENT envs
 check_efi() {
 
   mount -t efivarfs none /sys/firmware/efi/efivars
 
   SECURE_MODE=$(od -An -t x4 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c)
   export SECURE_MODE=${SECURE_MODE:17}
-
+  # LD_LIBRARY_PATH=/initos/rootfs/usr/lib \
+  #    /initos/rootfs/usr/bin/mokutil --sb-state
 
   bootcurrent=$(od -An -t x4 /sys/firmware/efi/efivars/BootCurrent-8be4df61-93ca-11d2-aa0d-00e098032b8c)
 
   # Remove first 4 bytes (attribute bytes, zeros)
   bootcurrent=${bootcurrent:14}
   export BOOT_CURRENT=$bootcurrent
+}
 
-  echo "$bootcurrent"
+# Dummy function to use with 'source' (while moving again to a
+# common set of functions - not sure yet.). Only used in initos-initrd-* scripts
+source() {
+  export INITOS=1
+}
+
+help() {
+  echo "find_boot LABEL MOUNT NAME HASH - find the disk containing initos/NAME.hash and mount it"
 }
 
 if [ "$$" = "1" ]; then
-  initramfs_1st
-  mount_proc
-  cmdline /proc/cmdline
+  if [ -z ${1+x} ] ; then
+    initramfs_1st
+    mount_proc
 
-  initramfs_init
+    initramfs_init
+  else 
+    "$@"
+  fi
 else
-  $*
+  "$@"
 fi

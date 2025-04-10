@@ -1,8 +1,10 @@
 #!/bin/sh
 
-# TODO: renambe to setup-initos-sidecar
+# TODO: rename to setup-initos-sidecar or setup-initos-base
+# it was originally for 'recovery' only
 
 ### Alpine specific packages for the recovery image.
+#
 # Not using "--no-cache" - the cache dir should be mounted
 # to /var/cache/apk/[INDEX] and /etc/apk/cache 
 
@@ -14,6 +16,11 @@ install() {
 
   # Podman + cloud hypervisor
   alpine_add_virt
+ 
+  # TODO: make it conditional. For now I'm testing on
+  # various laptops and want to check how it works - not
+  # very useful on a server
+  wui
 
   # Add the config files
   
@@ -87,8 +94,7 @@ alpine_add_common() {
   #apk add alpine-base # Installs openrc
   apk add ifupdown-ng libcap2  openrc \
     alpine-conf  alpine-release  busybox-openrc \
-    busybox-suid
-
+    busybox-suid dhcpcd
   
   #setup-devd udev
 
@@ -327,7 +333,12 @@ wui() {
   #  apk add mesa-dri-gallium
   setup-desktop sway
   
-  #apk add rofi-wayland rofi-pass rofi-top
+  # Conflicts with rofi - host will not expose X11/kasm anyway,
+  # that should be only in VMs/pods.
+  apk add rofi-wayland rofi-pass rofi-top
+
+  # TODO: try labwc (pi) instead of sway
+  apk add labwc
 
   # As root: start seatd
   # make sure video, input groups match
@@ -360,4 +371,4 @@ xui_alpine() {
 
 
 
-$*
+"$@"

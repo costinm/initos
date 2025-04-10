@@ -53,57 +53,71 @@ scrub() {
 # In practice we need ~100M on the EFI, and some btrfs volume.
 #
 wipe_disk() {
-  disk_dev=${1:-/dev/nvme0n1}
+  DISK=${1:-/dev/nvme0n1}
 
   # if disk contains 'nvme', add 'p'
-  
-  # 'p' for nvme
-  suffix=$2
+  suffix=""
+
+  # if $DISK contains /dev/nvme, set suffix to p
+  if echo "$DISK" | grep -q "nvme"; then
+    suffix="p"
+  fi
+  if echo "$DISK" | grep -q "mmcblk"; then
+    suffix="p"
+  fi
 
   # use 100% to fill the disk. This is total, EFI and root.
   # It is possible to later use the rest of the disk for LUKS, LVM or other work partitions.
 
   # List partitions with parted
-  partitions=$(parted --script --machine -- "${disk_dev}" unit s print)
+  partitions=$(parted --script --machine -- "${DISK}" unit s print)
 
-  parted --script --machine -- "${disk_dev}" mklabel gpt
+  parted --script --machine -- "${DISK}" mklabel gpt
 
   # 512M would fit - but painful, better to have some
   # space.
   # a single partition is hard to manage.
-  parted "$disk_dev" mkpart ESP fat32 1 1024
-  parted "$disk_dev" set 1 boot on
-  parted "$disk_dev" name 1 "BOOTA"
+  parted "$DISK" mkpart primary fat32 0 1024
+  parted "$DISK" set 1 boot on
+  parted "$DISK" set 1 esp on
+  parted "$DISK" name 1 "BOOTA"
 
-  parted "$disk_dev" mkpart ESP fat32 2 2048
-  parted "$disk_dev" name 2 "BOOTB"
-
+  parted "$DISK" mkpart primary fat32 1024 2048
+  parted "$DISK" name 2 "BOOTB"
+  parted "$DISK" set 2 esp on
+  
   # Create the LUKS partition
-  parted "$disk_dev" mkpart primary ext4 2048 -1
-  parted "$disk_dev" name 3 "LUKS"
+  parted "$DISK" mkpart primary ext4 2048 -1
+  parted "$DISK" name 3 "LUKS"
 
-  partprobe $disk_dev
+  partprobe $DISK
 
+  bootd ${DISK}${suffix}1 BOOTA
+  bootd ${DISK}${suffix}2 BOOTB
 
-  mkfs.vfat ${disk_dev}${suffix}1 -n BOOTA
-  mkfs.vfat ${disk_dev}${suffix}2 -n BOOTB
+  addEFI ${DISK}
 }
 
-prepare_usb() {
-  local disk_dev=${1:-/dev/sda}
+# Initialize the boot partition - make filesystem, copy the 
+# EFI files from USB (or primary partition)
+bootd() {
+  local PART=$1
+  local LABEL=$2
 
-  wipe_disk $disk_dev
-
+  mkfs.vfat ${PART} -n $LABEL
+  mkdir -p /mnt/$LABEL
+  mount ${PART} /mnt/$LABEL
+  cp -a /boot/efi/* /mnt/$LABEL
 }
 
 # This must be called after changing the partition tables.
+# 
 addEFI() {
   d=${1:-/dev/nvme0n1}
-  # 'p' for nvme
-  suffix=$2
   efibootmgr -B -b 1001
   efibootmgr -B -b 1002
-  #efibootmgr -B -b 1003
+  efibootmgr -B -b 1003
+  efibootmgr -B -b 1004
 
   # '-u XXXX' will override the command line - but only in insecure boot.
   # If booting insecure, this works as a USB recovery/install
@@ -111,6 +125,14 @@ addEFI() {
   #     -b 1003 \
   #     -u 'console=ttyS0 rdinit=/sbin/initos-initrd console=tty1 net.ifnames=0 panic=5 initos=USB loglevel=6 debug iomem=relaxed' \
   #     -L "InitOS InsecureB" -l "\initosA.EFI"
+
+  efibootmgr -c -d ${d} -p 2 \
+      -b 1003 \
+      -L "InitOS InSecureA" -l "\EFI\BOOT\BOOTx64.EFI"
+
+  efibootmgr -c -d ${d} -p 1 \
+      -b 1004 \
+      -L "InitOS InSecureB" -l "\EFI\BOOT\BOOTx64.EFI"
 
   efibootmgr -c -d ${d} -p 2 \
       -b 1002 \
@@ -121,6 +143,7 @@ addEFI() {
       -b 1001 \
       -l "\initosA.EFI"
  
+
   # -a - set active 
   # -b - modify 
   # -o - boot order
@@ -142,39 +165,47 @@ bootNext() {
 
 upgrade_start() {
   mkdir -p /boot/b
-  mount LABEL=BOOT$(cat /initos/rootfs/etc/BOOT_NEXT) /boot/b
+  local next=$(cat /var/initos/BOOT_NEXT)
+
+  echo "Mounting BOOT{$next} to /boot/b and accepting new version"
+
+  mount LABEL=BOOT${next:-B} /boot/b
 }
 
 upgrade_finish() {
   umount /boot/b
-  local c=$(cat /initos/rootfs/etc/BOOT_CURRENT)
-  if [ "$c" = "1001" ]; then 
-    chroot /initos/rootfs efibootmgr -n 1002 && reboot
-  else 
-    chroot /initos/rootfs efibootmgr -n 1001 && reboot
-  fi
-}
-
-bootNextRemote() {
-  local id=$1
 
   rm  /sys/firmware/efi/efivars/dump-*
-  if [ -e /initos/rootfs/sys/firmware ]; then 
-     chroot /initos/rootfs efibootmgr -n $id
-  else
-     /initos/rootfs/usr/bin/arch-chroot /initos/rootfs efibootmgr -n $id
+  local c=$(cat /var/initos/BOOT_CURRENT)
+  if [ "$c" = "1001" ]; then 
+    efibootmgr -n 1002 
+  elif [ "$c" = "1002" ]; then 
+    efibootmgr -n 1001 
+  elif [ "$c" = "1003" ]; then 
+    efibootmgr -n 1004 
+  elif [ "$c" = "1004" ]; then 
+    efibootmgr -n 1003 
+  else 
+    efibootmgr -n 1001 
   fi
+
   sync
-  reboot -f
+  reboot -f &
 }
 
 # swapNext is useful for switching A and B as first. 
 # The other approach is to upgrade B, test if it works, upgrade A while B is running - and reboot.
 # That means 2 reboots and risk that B will have a late failure.
 swapNext() {
-  local id=$1
-  if [ "$id" = "A" ]; then 
+  local c=$(cat /var/initos/BOOT_CURRENT)
+  if [ "c" = "1001" ]; then 
+    efibootmgr -o 1002,1001
+  elif [ "c" = "1002" ]; then 
     efibootmgr -o 1001,1002
+  elif [ "c" = "1003" ]; then 
+    efibootmgr -o 1004,1003
+  elif [ "c" = "1004" ]; then 
+    efibootmgr -o 1003,1004
   else
     efibootmgr -o 1002,1001
   fi
@@ -182,19 +213,31 @@ swapNext() {
 
 # Create and mounts the LUKS device. key is the second param.
 mkLUKS() {
-  local disk_dev=$1
-  local key=$2
+  local PART=$1
+  local KEY=$2
+  local MAPPER=${3:-c}
 
   # Linux LUKS partition type is 8309
   # -v -c aes-xts-plain64 -s 512 --hash sha512 --pbkdf pbkdf2 \
   #   --iter-time 1000 --use-random
-  echo -n "${KEY}" | cryptsetup luksFormat --type luks2 ${disk_dev} -
+  echo -n "${KEY}" | cryptsetup luksFormat --type luks2 ${PART} -
 
-  echo -n "${KEY}" | cryptsetup luksOpen ${disk_dev} c -
+  echo -n "${KEY}" | cryptsetup luksOpen ${PART} ${MAPPER} -
+}
 
-  mkfs.btrfs /dev/mapper/c
+mkbtrfs() {
+  local MAPPER=${1:-c}
+
+  mkfs.btrfs /dev/mapper/${MAPPER}
   # Doesn't really matter, visible after encyption unlock.
-  btrfs filesystem label /dev/mapper/c "ROOT"
+  btrfs filesystem label /dev/mapper/${MAPPER} "ROOT"
+
+  mount /dev/mapper/${MAPPER} /x
+}
+
+addbtrfs() {
+  local MAPPER=${1:-c1}
+  btrfs device add /dev/mapper/${MAPPER} /x
 
 }
 
@@ -207,34 +250,39 @@ xinit() {
     # Subvolume for large images (no copy on write)
     mkdir -p /x/vol/images
     chattr +C /x/vol/images
+
+    mkdir -p /x/images
+    chattr +C /x/images
+
+    btrfs subvol create /x/initos
 }
 
 # Create a LUKS encrypted filesystem, with a btrtf volume on top.
 # The password is random and saved to TPM and in 'escrow' using the /boot/root.pem public key
 # (that means the mesh owner can recover the passoword)
 mkcrypt() {
-  local disk_dev=$1
+  local DISK=$1
 
   init_pass
 
   save_tpm_full ${KEY}
 
-  mkLUKS "$disk_dev" "${KEY}"
+  mkLUKS "$DISK" "${KEY}"
 }
 
 # Add a key to the LUKS partition. This is a recovery key, not the main key - allows owner to open the disk 
 # without TPM.
 luks_add_key() {
-  local disk_dev=$1
+  local DISK=$1
 
-  cryptsetup luksAddKey $disk_dev ${SECRETS}/key
+  cryptsetup luksAddKey $DISK ${SECRETS}/key
 }
 
 luks_add_pass() {
-  local disk_dev=$1
+  local DISK=$1
   local key_file=$2
 
-  cat $SECRETS/key | cryptsetup luksAddKey $disk_dev
+  cat $SECRETS/key | cryptsetup luksAddKey $DISK
 }
 
 genpass() {
@@ -246,15 +294,23 @@ genpass() {
 init_pass() {
   #export KEY=$(openssl rand -base64 32)
   export KEY=$(genpass)
+
   mkdir -p $SECRETS
   echo -n "${KEY}" > $SECRETS/key
+  encrypt_key $KEY
+}
+
+encrypt_key() {
+  local KEY=$1 
 
   if [ -f /boot/root.pem ]; then
     echo -n "${KEY}" | openssl pkeutl -encrypt \
          -pubin -inkey /boot/root.pem \
          -pkeyopt rsa_padding_mode:oaep \
          -pkeyopt rsa_oaep_md:sha256 \
-         -out /boot/efi/DISK_RECOVERY_KEY
+         -out /x/initos/DISK_RECOVERY_KEY
+
+    cp /x/initos/DISK_RECOVERY_KEY /boot/efi/initos/${HOSTNAME}.recovery 
   fi
 }
 
@@ -311,7 +367,7 @@ ext4btrfs() {
 
 # Run a command in a recovery chroot
 recovery() {
-  /initos/recovery/usr/bin/arch-chroot /initos/recovery $*
+  /initos/recovery/usr/bin/arch-chroot /initos/recovery "$@"
 }
 
 # On debian, find the explicitly installed packages
@@ -368,17 +424,21 @@ set_pass() {
   # Shows the same output every time, probably fine to repeat.
   #tpm2_createpolicy --policy-pcr -l sha256:0,1,2,3 -L policy.digest
   #tpm2_createpolicy --policy-pcr -l sha256:8 -L policy.digest
-
+  
   tpm2_createpolicy --policy-pcr -l sha256:7 -L policy.digest
-
+  cp policy.digest /boot/efi/initos/tpm_policy.digest
     # not setting -L makes the key accessible in all cases
     # -i - -- stdin, max 128 bytes
     # -u and -r seem to be used to allow the object to be moved to another TPM
     # -C context (parent object) - not sure how to list
     # -r and -u - where to store the output
 
+  PRIMARY=$(cat /boot/efi/initos/tpm_primary)
+
   # primary.tr or 0x81000000 - the eviccontrol handle
   echo ${KEY} | tpm2_create -u key.pub -r key.priv -C ${PRIMARY} -L policy.digest -i -
+
+  cp key.pub /boot/efi/initos/tpm_key.pub
 
   tpm2_evictcontrol -c ${HANDLE} # Delete the key. key.ctx too
   # Can use primary.ctx instead of handle ID. 
@@ -387,11 +447,13 @@ set_pass() {
     # tpm2_create generates the 'export' files.
   tpm2_load -C ${PRIMARY} -u key.pub -r key.priv -c key.ctx -n key.name
   tpm2_evictcontrol -c key.ctx ${TPM_KIND}
-#   tpm2_print -t TPMS_CONTEXT key.ctx # -> Handle: 0x80000000
+  tpm2_print -t TPMS_CONTEXT key.ctx > /boot/efi/initos/tpm_handle # -> Handle: 0x80000000
 #   # persistent-handle: 0x81000001
 }
 
 create_primary() {
+  mkdir /boot/efi/initos
+
   # On Chromebook, only -C p works. On another laptop - default only (owner), -C e also works .
     # -C hierarch - e for endorsement, default is owner, also platform
     # -g sha256 - default
@@ -399,6 +461,8 @@ create_primary() {
     # -c file - where to store the 'context' (info about key)
   tpm2_createprimary  -c primary.ctx --format=pem \
      --output=primary_pub.pem ${TPM_KIND}
+ 
+
     # displays info - including key handle (it seems to be temporary )
   tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
     ### Handle: 0x80000000, sequence: 2, 6, 10, etc - size 1914
@@ -408,13 +472,17 @@ create_primary() {
   tpm2_evictcontrol -c primary.ctx -o primary.tr ${TPM_KIND} # Save the key - should have the same ID
   # persistent-handle: 0x8100...0
   tpm2 print -t ESYS_TR primary.tr
+  tpm2 print -t ESYS_TR primary.tr > /boot/efi/initos/tpm_primary
 }
 
+# Mokutil requires a corresponding EFI.
+# /usr/share/efitools contains a set of EFI programs.
+# efi-readvar shows the keys in the system.
 mok() {
   mokutil --sb-state
   mokutil --list-enrolled
-  mokutil --pk
-  mokutil --kek
+  mokutil --pk /boot/efi/initos/KEYS/PK.cer
+  mokutil --kek 
   mokutil --db
   # Looks for /var/lib/sbctl/keys/db/db.key
   # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
@@ -453,4 +521,4 @@ find_mac() {
 
 
 
-$*
+"$@"

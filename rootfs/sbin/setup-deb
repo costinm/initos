@@ -526,4 +526,4 @@ function add_golang() {
 
 C=${1}
 shift
-$C $*
+$C "$@"

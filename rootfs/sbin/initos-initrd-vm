@@ -192,5 +192,5 @@ if [ "$$" = "1" ]; then
   initramfs_mods_vm
   initramfs_init_vm
 else
-  $*
+  "$@"
 fi

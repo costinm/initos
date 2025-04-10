@@ -5,3 +5,18 @@
 # - generate startup scripts
 
 
+fix() {
+    setcap cap_net_admin+ep /opt/virt/cloud-hypervisor
+}
+
+from() {
+    local img=$1
+
+    mkdir -p /x/vol/${POD}
+
+}
+
+vm() {
+    cd /x/vol/${POD}
+    
+}

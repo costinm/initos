@@ -1,6 +1,6 @@
 #!/bin/sh
 
-export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+source /sbin/initos
 
 # Initialization in 'secure' (signed) mode with manual unlock.
 # 
@@ -16,42 +16,18 @@ initos_init() {
   
   # Additional drivers with the real firmware and modules mounted. 
   # Wil the drivers are loaded/settiling, asks for a key - set as MODE - which determines how to load persistent disk.
-  /sbin/initos-init-tpm2 load_drivers
+  load_drivers
 
-  mount_persistent
+  open_luks_manual
+  
+  mount_btrfs_raw /dev/mapper/c /x
+  if [ $? -eq 0 ]; then
+      logi "BTRFS mounted"
+  else
+      lfatal "Failed to mount btrfs"
+  fi
 
-  exec /sbin/initos-init-tpm2 start_os
-}
-
-# Different options and environments for mounting a sysroot:
-# Defaults:
-# - from a LUKS btrfs, using TPM (for secure)
-# - a regular btrfs (label 'install' or 'x') for 'usb' and 'insecure' images
-# Key on startup:
-# - LUKS+btrfs opened manually, if 'c' or 'a' option was selected
-# - remote recovery - if 'r' was selected or other options fail
-# 
-mount_persistent() {
-    # LUKS on /x, if user types the password
-    open_luks_manual
-    mount_btrfs_raw /dev/mapper/c /x
-    if [ $? -eq 0 ]; then
-        logi "BTRFS mounted using user key"
-        return 0
-    fi
-
-    lfatal "Failed to open LUKS"
-}
-
-# Info log - shown on console, logged.
-logi() {
-	last_emsg="$*"
-	echo "INITOS: $last_emsg..." > /dev/kmsg
-	echo "$last_emsg\n"
-}
-
-lfatal() {
-  /sbin/initos-init-tpm2 lfatal $*
+  start_os
 }
 
 # open LUKS drive using keyboard
@@ -62,30 +38,40 @@ lfatal() {
 open_luks_manual() {
   cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
   if [ -n "$cryptd" ]; then
-    logi Attempting to mount LUKS using keyboard $cryptd
+    echo
+    echo "Enter unlock password (LUKS for $cryptd)"
+    echo
+
     cryptsetup luksOpen $cryptd c
     if [ $? -eq 0 ]; then
-      logi "Manual LUKS ok ${cryptd}" 
+      echo
+      echo
+      logi "Manual unlock worked ${cryptd}" 
       return 0
     fi
   fi
   return 1
 }
 
-mount_btrfs_raw() {
-  local root_device=${1}
-  local dst=${2}
+open_luks_manual2() {
+  echo -n "Enter the disk (LUKS) password"
+  read -s KEY
+  open_disks "$KEY"
+}
 
-  BTRFS_OPTS="-o nobarrier"
-  #  -o compress
-
-  mkdir -p ${dst}
-
-  mount -t btrfs "${root_device}" ${dst}
-  if [ $? -ne 0 ]; then
-      logi "Error: Failed to mount BTRFS partition"
-      return 1
-  fi
+open_disks() {
+  local KEY=$1
+  #parts=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
+  parts=$(blkid -t TYPE=crypto_LUKS -o device )
+  
+  echo "$parts" | while read -r part; do 
+    echo -n "$KEY" | cryptsetup open $part luks-$(basename "$part") -
+    if [ $? -eq 0 ]; then
+      logi "Opened $part"
+    else 
+      echo "Attempt to unlock $part failed"
+    fi
+  done
 }
 
 # If running as PID=1 (from initrd): run initos_init or
@@ -95,8 +81,8 @@ if [ "$$" = "1" ]; then
     initos_init
   else 
     # Run one of the functions
-    $*
+    "$@"
   fi
 else
-  $*
+  "$@"
 fi

@@ -182,10 +182,10 @@ vm() {
 }
 
 if [ -z ${1+x} ] ; then
-  echo Starting default: $*
+  echo Starting default: "$@"
   vm
 else
   C=${1}
   shift
-  $C $*
+  $C "$@"
 fi

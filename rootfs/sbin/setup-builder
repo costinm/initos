@@ -94,9 +94,9 @@ all() {
 }
 
 clean() {
-  buildah rm initos-base initos kernel || true
-  buildah rmi ${REPO}/initos-base:latest || true
-  buildah rmi ${REPO}/initos:latest || true
+  buildah rm initos-base initos kernel >/dev/null 2>&1  || true
+  buildah rmi ${REPO}/initos-base:latest >/dev/null 2>&1  || true
+  buildah rmi ${REPO}/initos:latest  >/dev/null 2>&1 || true
   # rmi -a # all images
   rm -rf ${WORK}
 }
@@ -129,7 +129,7 @@ _build_cmd() {
   buildah pull ${BASE}
   buildah --name ${POD} ${VOLS} from ${BASE}
   buildah copy ${POD} rootfs/sbin /sbin
-  buildah run ${POD} -- $*
+  buildah run ${POD} -- "$@"
 
   buildah commit ${POD} ${POD}
 }
@@ -176,7 +176,7 @@ initos_efi_add() {
   VOLS="$VOLS -v ${WORK}/lib_cache:/var/lib/cache"
   VOLS="$VOLS -v ${WORK}/apkcache:/etc/apk/cache"
 
-  buildah run ${VOLS} ${POD} -- $*
+  buildah run ${VOLS} ${POD} -- "$@"
 
 }
 
@@ -185,6 +185,7 @@ initos_efi_update() {
 
   buildah copy ${POD} rootfs/sbin /sbin
   buildah copy ${POD} rootfs/bin /bin
+  buildah copy --chown build ${POD} rootfs/home /home
   buildah copy ${POD} rootfs/etc /etc
 
   # This could be done in the container with debootstrap
@@ -280,6 +281,6 @@ if [ -z ${1+x} ] ; then
   # the scripts in the image.
   initos_efi_builder
 else
-  $*
+  "$@"
 fi
 

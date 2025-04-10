@@ -116,11 +116,15 @@ sqfs_add() {
 
   cd /
 
+  # in case they are still around
+  rm -rf /etc/uefi-keys 
+  
   # Doesn't include /boot files (kernel is separate)
   # Includes both normal and cloud modules
   mksquashfs . ${DIR}/${name}.sqfs \
      -regex \
      -e "x/.*" \
+     -e "etc/uefi-keys" \
      -e ".dockerenv" \
      -e "boot/.*" \
      -e "proc/.*" \
@@ -256,4 +260,4 @@ vinit() {
 #   debootstrap --variant=minbase --print-debs sid  /tmp/deb
 # }
 
-$*
+"$@"
