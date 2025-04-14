@@ -1,0 +1,4 @@
+export POD=${POD:-initos}
+export REPO=${REPO:-git.h.webinf.info/costin}
+export TAG=${TAG:-latest}
+export WORK=${WORK:-${HOME}/.cache/${POD}}

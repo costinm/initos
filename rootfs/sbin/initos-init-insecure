@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/bin/bash
 
-source /sbin/initos
+. /sbin/initos common
 
 export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -22,33 +22,84 @@ initos_init() {
   
   logi "Starting INSECURE INITOS $(uname -r) ${SECURE_MODE}"
   
-  # Additional drivers with the real firmware and modules mounted. 
-  # Wil the drivers are loaded/settiling, asks for a key - set as MODE - which determines how to load persistent disk.
+
   load_drivers
 
-  patch_rootfs /boot/efi/install /
-
-  if [ -f /etc/hostname ]; then
-    export HOSTNAME=$(cat /etc/hostname) 
-    logi "Setting hostname $HOSTNAME"
-    hostname "${HOSTNAME}"
-  fi
-
-  if [ -f /boot/efi/install/autosetup.sh ]; then 
-    source /boot/efi/install/autosetup.sh init
-    source /boot/efi/install/autosetup.sh install
+  echo "Insecure boot - before switch root, enter 'a' for admin shell"
+  read -t 4 -n 1 key
+  if [ "$key" = "a" ]; then
+    sh 
   fi 
 
-  run_installer
+  # This may init the /x drive for testing (credentials on the EFI dir instead
+  # of TPM or user input).
+  # 
+  if [ -f /boot/efi/install/autosetup.sh ]; then
+    # May call open_disks, mount_btrfs_raw 
+    bash -x /boot/efi/install/autosetup.sh init
+  fi 
+
+  # If Initos is not already installed - use the files on EFI partition to 
+  # configure networking/ssh. 
+  if [ -d /x/initos/etc ]; then
+    echo "BTRFS mounted on /x using secrets on EFI partition"
+   
+    # The SQFS image is debian.
+    if [ -f /etc/debian_version ]; then
+      echo "Debian image detected, preparing to start systemd"
+      run_standalone
+  
+      # From local files - should not be included on local
+      if [ -f /x/initos/etc/wpa_supplicant/wpa_supplicant.conf ]; then
+        cp /x/initos/etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+        systemctl enable wpa_supplicant@wlan0.service
+      fi
+      
+      exec /usr/bin/systemd --system
+    fi
+    start_os # May switch root !
+    sh
+  else
+    echo "Installer mode"
+    sh
+    # Copy files from install.
+    patch_rootfs /boot/efi/install /
+
+    # Init networking, SSH, etc - using the EFI configs
+    run_standalone_start 
+  
+    # #start_ui
+
+    # # Experimenting with different ways to autologin and 
+    # # start sway on an old insecure laptop.
+    # getty 38400 /dev/tty5 -n -l /bin/sh &
+    # getty 38400 /dev/tty3 -n -l /sbin/autologin &
+    # getty 38400 /dev/tty4 -n -l /sbin/autologin.build &
+  
+    if [ -f /boot/efi/install/autosetup.sh ]; then 
+      sh -x /boot/efi/install/autosetup.sh autoinstall | tee  /tmp/setup.log 2>&1
+    
+    fi 
+  fi 
+
+
+  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
+  /etc/init.d/agetty.tty1 start
+  sh
+  exec tini -s sleep -- infinity 
+
 }
 
-# Add the files from the EFI /install dir to the InitOS rootfs
+# Add the networking files from the EFI /install dir to the
+# InitOS rootfs
 # 
 # The installer will start as a normal InitOS, but without 
-# /x mounted
+# /x mounted. It can do unattended install - but may also 
+# wait for the control plane to provision it.
 # 
 # Normally this is run once, the first time - there is no 
-# need to ssh to the machine.
+# need to ssh to the machine, someone needs to set the verification
+# keys in BIOS/EFI anyways.
 patch_rootfs() {
   # In insecure mode and recovery, /boot/efi/install can keep 
   # network config (physical access would allow root and any config)
@@ -67,38 +118,6 @@ patch_rootfs() {
   if [ -f ${dir}/wpa_supplicant.conf ]; then
     cp ${dir}/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf
   fi
-
 }
 
-
-# If 'INSECURE' partition is not found - start in-memory
-# User can manually run the host setup - or use the script.
-run_installer() {
-
-
-
-  run_standalone_start 
- 
-
-  # Experimenting with different ways to autologin and 
-  # start sway on an old insecure laptop.
-  getty 38400 /dev/tty5 -n -l /bin/sh &
-  getty 38400 /dev/tty3 -n -l /sbin/autologin &
-  getty 38400 /dev/tty4 -n -l /sbin/autologin.build &
-
-  # exec /bin/sh
-  /bin/sh
-}
-
-# If running as PID=1 (from initrd): run initos_init or
-# a different function (like vm_init)
-if [ "$$" = "1" ]; then
-  if [ -z ${1+x} ] ; then
-    initos_init
-  else 
-    # Run one of the functions
-    "$@"
-  fi
-else
-  "$@"
-fi
+initos_init

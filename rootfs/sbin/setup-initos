@@ -22,9 +22,9 @@ set -e
 # May include additional files to bake into images.
 # Signing the images also requires a volume holding the signing keys
 # and configs.
-WORK=${WORK:-/x/initos}
+WORK=${WORK:-/data}
 
-mkdir -p ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
+mkdir -p ${WORK}/efi/EFI/BOOT /opt/virt
 
 
 # Build the initramfs for the real kernel
@@ -87,9 +87,11 @@ build_initrd() {
 # The '@firmware' and '@modules' subvolumes must also be created
 # if using separate volumes - for now they're in @recovery rootfs.
 
-recovery_sqfs() {
-  local name=${1:-recovery}
-  local DIR=${2:-/boot}
+# Add the current docker image to an existing SQFS file.
+# This is useful if the kernel+modules+firmware is created independently.
+sqfs() {
+  local name=initos
+  local DIR=${1:-/data/efi/initos}
 
   # -one-file-system also works on the host - but not so well in a container.
 
@@ -104,15 +106,7 @@ recovery_sqfs() {
   # However the cloud kernel is needed for VM
 
   mkdir -p ${DIR}
-  rm -f ${DIR}/${name}.sqfs
-  sqfs_add ${name} ${DIR}
-}
-
-# Add the current docker image to an existing SQFS file.
-# This is useful if the kernel+modules+firmware is created independently.
-sqfs_add() {
-  local name=${1:-recovery}
-  local DIR=${2:-/boot}
+  rm -f ${DIR}/${name}.*
 
   cd /
 
@@ -127,28 +121,41 @@ sqfs_add() {
      -e "etc/uefi-keys" \
      -e ".dockerenv" \
      -e "boot/.*" \
+     -e "data/.*" \
      -e "proc/.*" \
      -e "sys/.*" \
      -e "run/.*" \
      -e "work/.*" \
      -e "ws/.*" \
      -e "tmp/.*" \
+     -e "var/cache/apt/.*" \
      -e "etc/apk/cache.*"
+    
+  echo "Created ${DIR}/${name}.sqfs"
 }
 
-# sqfs_add_kernel() {
-#   local name=${1:-recovery}
-#   local DIR=${2:-/x/initos/img}
+sqfs_linux() {
+  local name=${1:-recovery}
+  local DIR=${2:-/boot}
 
-#   cd /
+  cd /
 
-#   mksquashfs . ${DIR}/${name}.sqfs \
-#      -regex \
-#      -i "boot/.*" \
-#      -i "lib/modules/.*" \
-#      -i "lib/firmware/.*" 
-     
-# }
+  # in case they are still around
+  rm -rf /etc/uefi-keys 
+  
+  # Doesn't include /boot files (kernel is separate)
+  # Includes both normal and cloud modules
+  mksquashfs . ${DIR}/kernel.sqfs /lib/modules /lib/firmware 
+}
+
+# Assuming /mnt/img is mounted with another container (like debian+kernel), create 
+# a SQFS image with the entire image..
+sqfs_img() {
+  OUT=${1:-/data/efi/initos/initos}
+  cd /mnt/img
+  rm -f ${OUT}.*
+  mksquashfs . ${OUT}.sqfs  
+}
 
 alpine_clear() {
   rm /var/lib/dbus/machine-id || true
@@ -160,17 +167,82 @@ alpine_clear() {
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
 
+debian_rootfs() {
+  add_deb_kernel
+  
+  add_deb_core
+
+  add_deb_kernel_nvidia
+  
+  save_lib
+  sqfs
+}
+
+add_deb_core() {
+  $APTINSTALL ca-certificates curl gpg  \
+     linux-headers-$(cat /boot/version) 
+
+
+  $APTINSTALL  tpm2-tools  \
+     tini  bsdutils dosfstools fdisk \
+    gdisk hdparm file findutils fuse3 btrfs-progs lsof \
+    \
+    rsync wpasupplicant ifupdown ifupdown-extra \
+     wireless-tools bridge-utils net-tools tcpdump iptables iproute2  \
+    nftables iperf3 openssh-server  iw \
+    \
+    cryptsetup efibootmgr squashfs-tools 
+
+}
+
 # Adds Kernel, firmware, Nvidia driver.
 # Builds the initrd images for intel/amd uCode.
 # This adds X
+# 
+# Since nvidia also has libraries and docker/podman support - will use 
+# this debian image as the 'sidecar OS', so including more packages.
 add_deb_kernel_nvidia() {
 
-  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
 
+  # Will use systemd or script - may start it as 'main' as well, without 
+  # an actual sidecar.
+
+
+  # Not the current kernel on the builder machine
+ 
+
+  curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+  dpkg -i /tmp/cuda.deb
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
+  
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    
   apt update
-  export INITRD=No
-  apt install -y --no-install-recommends \
-    nvidia-driver
+  
+  # The debian kernel (old) can be instlled with:
+  #$APTINSTALL nvidia-driver 
+
+  # This has systemd as a dependency...
+  $APTINSTALL cuda-drivers
+  $APTINSTALL nvidia-container-toolkit  
+ 
+}
+
+# Save_lib is used in the debian image to save the kernel and modules on 
+# /data, to be used by the 'sign' image.
+#
+# The other choice is to have a large 'sign' image that bundles the kernel
+# and modules and is updated with every kernel release. 
+# Since one way or another we need /data and /config for signing, we may 
+# as well use a separate step of creating the boot/ and lib/modules which
+# don't change except on new kernel releases.
+save_lib() {
+  mkdir -p /data/lib /data/boot
+  cp -a /boot/* /data/boot
+  cp -a /lib/modules /data/lib
+  cp -a /lib/firmware /data/lib
 }
 
 # Adds Kernel, firmware
@@ -217,7 +289,7 @@ add_deb_kernel() {
      linux-image-cloud-amd64
 
   # Can't stop the creation - but not used. Just need the kernel and modules.
-  rm -rf /boot/initrd.img* /tpm/* || true
+  rm -rf /boot/initrd.img* /tpm/* /tmp/* || true
 }
 
 add_virt_kernel() {
@@ -244,6 +316,7 @@ vinit() {
   #fi
   mkdir -p ${WORK}/vimg/
 
+  ls -l /opt/virt
   cp /boot/vmlinuz-${VER} /opt/virt/vmlinuz
   # btrfs is pretty slow for a VM - the rootfs may have all the modules
   # and load it as needed.
@@ -252,8 +325,16 @@ vinit() {
   mkinitfs -k  -i /sbin/initos-initrd-vm \
      -F "base btrfs virtio initosvm" \
      -o /opt/virt/initramfs ${VER}
+  ls -l /opt/virt
 }
 
+vinitl() {
+  VER=$(ls /lib/modules | grep cloud | tail)
+  mkinitfs -k  -i /sbin/initos-initrd-vm \
+     -F "base btrfs virtio initosvm" \
+     -o /opt/virt/initramfs ${VER}
+
+}
 
 # debootstrap_kernel() {
 #   mkdir /tmp/deb

@@ -30,6 +30,3 @@ iface br-lan inet auto
 
 iface br-lan inet6 auto
 
-allow-hotplug eth0
-iface eth0 inet manual
-  up /usr/sbin/brctl addif br-lan eth0

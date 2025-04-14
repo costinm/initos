@@ -9,6 +9,11 @@
 
 SUBSYSTEM=="net", ACTION=="add", KERNEL=="vm-*", RUN+="/usr/sbin/brctl addif br-lan %k"
 
+# Want any eth device added to br-lan, along with the VMs. 
+# that's the simplest way to configure the raw networking, with Istio or equivlent 
+# on top.
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="eth*", RUN+="/usr/sbin/brctl addif br-lan %k"
+
 # Doesn't work:
 #SUBSYSTEM=="net", ACTION=="add", KERNEL=="/devices/virtual/net/vm-devvm-1", RUN+="touch /tmp/udevnet"
 #SUBSYSTEM=="net", ACTION=="add", KERNEL=="vm-devvm-1", RUN+="touch /tmp/usevnet"

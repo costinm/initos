@@ -43,3 +43,5 @@ logi() {
 	echo "INITOS: $last_emsg..." > /dev/kmsg
 	echo "$last_emsg\n"
 }
+
+"$@"

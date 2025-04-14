@@ -291,33 +291,7 @@ vm_console() {
 # Expose ch-remote control
 vm_ctrl() {
   ${VIRT}/ch-remote --api-socket ${WORK}/ch.sock "$@"
-
 }
-
-# mkdisk will create (or overrite) a BTRFS image and pre-populate it with a rootfs.
-mkdisk() {
-  local img=$1
-
-  mkdir -p ${IMGDIR}
-  truncate -s ${vm_disk} ${IMGDIR}/${VM}.img
-  # Same as - but simpler/faster than
-  # qemu-img create -f raw ${WORK}/disk.img 10G
-
-  # Can be mounted using:
-  #dev=$(losetup -f ${WORK}/disk.img --show)
-
-  mkdir -p ${WORK}/rootfs
-
-  mkfs.btrfs ${IMGDIR}/${VM}.img --rootdir ${WORK}/rootfs
-  #parted $dev mklabel gpt
-
-  # --shrink will keep the image at the required size - can be used for a base image.
-}
-
-stop_vm() {
-  ch-remote --api-socket=${WORK}/ch.sock shutdown-vmm
-}
-
 
 ### CHROOT BASED (full access to host)
 
@@ -351,7 +325,7 @@ run_chroot() {
     R=/sysroot
   fi
 
- chroot ${WORK} "$@"
+ chroot ${R} "$@"
 }
 
 run_unshare() {
@@ -361,7 +335,7 @@ run_unshare() {
 }
 
 stop_chroot() {
-  X=${1:-/sysroot}
+  X=${WORK:-/sysroot}
 
   umount ${X}/dev/pts
   umount  ${X}/dev/
@@ -415,6 +389,14 @@ start_buildah() {
 
 stop_buildah() {
   buildah rm $POD
+}
+
+buildah_stats() {
+  buildah inspect ${POD} 
+}
+
+buildah_dir() {
+  buildah inspect ${POD} |jq -r .MountPoint
 }
 
 # Run a single command in a pod (or VM, container).

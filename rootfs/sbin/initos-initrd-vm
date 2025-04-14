@@ -58,7 +58,7 @@ initramfs_init_vm() {
     exec switch_root /sysroot /z/sbin/initos vm_init     
   fi
 
-  cp /sbin/initos /sysroot/sbin/initos
+  cp /sbin/initos-* /sysroot/sbin
   move_mounted_to_sysroot
   #switch_root /sysroot /bin/sh --  -c "${KOPT_cmd} && poweroff -f"
   exec switch_root /sysroot /sbin/initos-init-vm vm_init

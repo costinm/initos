@@ -52,7 +52,7 @@ scrub() {
 # This should be called explicitly by the user - it will normally not be done automatically.
 # In practice we need ~100M on the EFI, and some btrfs volume.
 #
-wipe_disk() {
+install_wipe_disk() {
   DISK=${1:-/dev/nvme0n1}
 
   # if disk contains 'nvme', add 'p'
@@ -77,25 +77,46 @@ wipe_disk() {
   # 512M would fit - but painful, better to have some
   # space.
   # a single partition is hard to manage.
-  parted "$DISK" mkpart primary fat32 0 1024
+  parted "$DISK" mkpart primary fat32 1 2048
   parted "$DISK" set 1 boot on
   parted "$DISK" set 1 esp on
   parted "$DISK" name 1 "BOOTA"
 
-  parted "$DISK" mkpart primary fat32 1024 2048
+  parted "$DISK" mkpart primary fat32 2048 4096
   parted "$DISK" name 2 "BOOTB"
   parted "$DISK" set 2 esp on
   
   # Create the LUKS partition
-  parted "$DISK" mkpart primary ext4 2048 -1
-  parted "$DISK" name 3 "LUKS"
+  parted "$DISK" mkpart primary ext4 4096 100%
+  parted "$DISK" name 3 "INITOSLUKS"
 
   partprobe $DISK
 
   bootd ${DISK}${suffix}1 BOOTA
   bootd ${DISK}${suffix}2 BOOTB
 
-  addEFI ${DISK}
+  #install_boot_options ${DISK}
+}
+
+install_wipe_usb() {
+  DISK=${1:-/dev/sda}
+
+  parted --script --machine -- "${DISK}" mklabel gpt
+
+  parted "$DISK" mkpart primary fat32 1 4096
+  parted "$DISK" set 1 boot on
+  parted "$DISK" set 1 esp on
+  parted "$DISK" name 1 "BOOTUSB"
+  
+  # Create the LUKS partition
+  parted "$DISK" mkpart primary ext4 4096 100%
+  parted "$DISK" name 2 "INITOSLUKSUSB"
+
+  partprobe $DISK
+
+  bootd ${DISK}1 BOOTUSB
+
+  #install_boot_options ${DISK}
 }
 
 # Initialize the boot partition - make filesystem, copy the 
@@ -110,9 +131,13 @@ bootd() {
   cp -a /boot/efi/* /mnt/$LABEL
 }
 
+boot() {
+  install_boot_options "$@"
+}
+
 # This must be called after changing the partition tables.
 # 
-addEFI() {
+install_boot_options() {
   d=${1:-/dev/nvme0n1}
   efibootmgr -B -b 1001
   efibootmgr -B -b 1002
@@ -126,11 +151,11 @@ addEFI() {
   #     -u 'console=ttyS0 rdinit=/sbin/initos-initrd console=tty1 net.ifnames=0 panic=5 initos=USB loglevel=6 debug iomem=relaxed' \
   #     -L "InitOS InsecureB" -l "\initosA.EFI"
 
-  efibootmgr -c -d ${d} -p 2 \
+  efibootmgr -c -d ${d} -p 1 \
       -b 1003 \
       -L "InitOS InSecureA" -l "\EFI\BOOT\BOOTx64.EFI"
 
-  efibootmgr -c -d ${d} -p 1 \
+  efibootmgr -c -d ${d} -p 2 \
       -b 1004 \
       -L "InitOS InSecureB" -l "\EFI\BOOT\BOOTx64.EFI"
 
@@ -163,16 +188,45 @@ bootNext() {
   reboot -f
 }
 
+# Run before the upgrade - mounts the 'next' EFI partition, 
+# remove old files if the SQFS has changed (small disk, rsync doesn't work
+# very well)
 upgrade_start() {
-  mkdir -p /boot/b
+  local newh=${1}
+  local clabel=${2}
+
+  # Created by InitRD based on the label it used for the current boot.
+  # If it used BOOTA - BOOT_NEXT will be B
   local next=$(cat /var/initos/BOOT_NEXT)
+  local label=BOOT${next:-B}
 
-  echo "Mounting BOOT{$next} to /boot/b and accepting new version"
+  if [ "$clabel" != "" ]; then 
+    label=$clabel
+  fi
 
-  mount LABEL=BOOT${next:-B} /boot/b
+  mkdir -p /boot/b
+  mount LABEL=$label /boot/b
+  if [ $? -ne 0 ]; then
+    echo "Failed to mount $label to /boot/b"
+    return 1
+  fi
+
+  local eh=$(cat /boot/b/initos/initos.hash )
+
+  if [ "$eh" = "$newh" ]; then
+    echo "Mounting $label to /boot/b - same SQFS $newh"
+  else
+    echo "Mounting $label to /boot/b and accepting new version $newh existing $eh"
+    ###### XXX After all are upgraded rm -f /boot/b/initos/initos.*
+  fi
 }
 
-upgrade_finish() {
+# Finish the upgrade. Optional 'reboot' CLI to restart, otherwise on next
+# boot the new image will be used.
+# 
+# After the new image is healthy, a 'swapNext' needs to be called to make 
+# it default.
+upgrade_end() {
   umount /boot/b
 
   rm  /sys/firmware/efi/efivars/dump-*
@@ -190,7 +244,19 @@ upgrade_finish() {
   fi
 
   sync
-  reboot -f &
+  if [ "$1" = "reboot" ]; then 
+    /sbin/setup-initos-host upgrade_reboot &
+    echo "Rebooting in 5 seconds"
+  fi
+
+  return 0
+}
+
+upgrade_reboot() {
+  sync
+  sleep 5
+  reboot -f
+  
 }
 
 # swapNext is useful for switching A and B as first. 
@@ -227,21 +293,31 @@ mkLUKS() {
 
 mkbtrfs() {
   local MAPPER=${1:-c}
+  local DPATH=${2:-/x}
 
   mkfs.btrfs /dev/mapper/${MAPPER}
   # Doesn't really matter, visible after encyption unlock.
-  btrfs filesystem label /dev/mapper/${MAPPER} "ROOT"
+  btrfs filesystem label /dev/mapper/${MAPPER} "INITOSROOT"
 
-  mount /dev/mapper/${MAPPER} /x
+  mount /dev/mapper/${MAPPER} ${DPATH}
 }
 
 addbtrfs() {
-  local MAPPER=${1:-c1}
-  btrfs device add /dev/mapper/${MAPPER} /x
+  local MAPPER=${1:-luks-2}
+  local DPATH=${2:-/x}
+
+  btrfs device add /dev/mapper/${MAPPER} ${DPATH}
 
 }
 
+# Initialize the /x BTRFS disk with expected volumes and files
 xinit() {
+  mksubvol
+
+
+}
+
+mksubvol() {
     btrfs subvol create /x/vol
     btrfs subvol create /x/@home
     btrfs subvol create /x/@cache
@@ -518,7 +594,5 @@ find_mac() {
   MAC=${MAC//:/-}
 
 }
-
-
 
 "$@"

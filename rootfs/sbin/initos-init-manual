@@ -18,9 +18,22 @@ initos_init() {
   # Wil the drivers are loaded/settiling, asks for a key - set as MODE - which determines how to load persistent disk.
   load_drivers
 
-  open_luks_manual
+  for i in 1 2 3; do
+    echo
+    echo -n "Enter the disk (LUKS) password (attempt $i of 3): "
+    read -s KEY
+
+    open_disks "$KEY"
+    
+    if [ -e /dev/mapper/luks-1 ]; then
+      break
+    fi
+
+    echo
+    echo "Failed to unlock the disk. Please try again."
+  done
   
-  mount_btrfs_raw /dev/mapper/c /x
+  mount_btrfs_raw /dev/mapper/luks-1 /x
   if [ $? -eq 0 ]; then
       logi "BTRFS mounted"
   else
@@ -28,61 +41,13 @@ initos_init() {
   fi
 
   start_os
+  #start_ui
+
+  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
+  /etc/init.d/agetty.tty1 start
+
+  exec tini -s sleep -- infinity 
+
 }
 
-# open LUKS drive using keyboard
-# If successful, /x will be mounted as btrfs, and an /x/initos will
-# exist.
-# 
-# TODO: ask for pass, use the pass to unlock all disks
-open_luks_manual() {
-  cryptd=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
-  if [ -n "$cryptd" ]; then
-    echo
-    echo "Enter unlock password (LUKS for $cryptd)"
-    echo
-
-    cryptsetup luksOpen $cryptd c
-    if [ $? -eq 0 ]; then
-      echo
-      echo
-      logi "Manual unlock worked ${cryptd}" 
-      return 0
-    fi
-  fi
-  return 1
-}
-
-open_luks_manual2() {
-  echo -n "Enter the disk (LUKS) password"
-  read -s KEY
-  open_disks "$KEY"
-}
-
-open_disks() {
-  local KEY=$1
-  #parts=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
-  parts=$(blkid -t TYPE=crypto_LUKS -o device )
-  
-  echo "$parts" | while read -r part; do 
-    echo -n "$KEY" | cryptsetup open $part luks-$(basename "$part") -
-    if [ $? -eq 0 ]; then
-      logi "Opened $part"
-    else 
-      echo "Attempt to unlock $part failed"
-    fi
-  done
-}
-
-# If running as PID=1 (from initrd): run initos_init or
-# a different function (like vm_init)
-if [ "$$" = "1" ]; then
-  if [ -z ${1+x} ] ; then
-    initos_init
-  else 
-    # Run one of the functions
-    "$@"
-  fi
-else
-  "$@"
-fi
+initos_init

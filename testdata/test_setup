@@ -1,0 +1,125 @@
+#!/bin/sh
+
+# File to be set on USB or disk EFI partition on a test machine
+# with secure boot disabled. The 'test' machine will only use the insecure
+# image - no secrets can be stored - it runs install tests, public images, etc.
+# 
+# The test machine should have a USB disk attached.
+# 
+# Location: (EFI partitions)/install/autosetup.sh
+
+# Using old chromebook for testing.
+export DISK=/dev/mmcblk0
+# Dummy key (no manual password entry)
+export KEY=11111111
+
+# When running from usb, wipe the disk and do the full installation.
+usb_wipe_disk() {
+  setup-initos-host wipe_disk $DISK
+}
+
+# Not wiping the entire disk - keep BOOTA and BOOTB. 
+setup_disk() {
+  set -x
+
+  # On the test machine I don't have 2 NVME disks.
+  parted $DISK rm 3
+  parted $DISK rm 4
+
+  # Create the LUKS partition
+  parted "$DISK" mkpart LUKS ext4 2048 50%
+  #parted "$DISK" name 3 "LUKS"
+
+  # Create the LUKS partition2 (testing multiple open)
+  parted "$DISK" mkpart LUKS2 ext4 50% 100%
+  #parted "$DISK" name 4 "LUKS2"
+
+  partprobe $DISK
+ 
+  setup-initos-host mkLUKS ${DISK}p3 $KEY luks-1
+  setup-initos-host mkbtrfs luks-1 /x
+
+  # On a server - this would be the second nvme disk
+  setup-initos-host mkLUKS ${DISK}p4 "$KEY" luks-2
+  setup-initos-host addbtrfs luks-2 /x
+ 
+  # After mkbtrfs - /x is mounted
+ 
+  #   
+  setup-initos-host xinit
+
+  setup-initos-host encrypt_key ${KEY}
+}
+
+# test_mode
+luks_test() {
+    echo "Removing LUKS partitions and creating them again (2 on one disk for testing)"
+    setup_disk
+
+    echo "Disks created and install done"
+    btrfs filesystem show /x
+
+    # TODO: restore device from backup using control plane
+
+    umount /x
+    cryptsetup close c
+    cryptsetup close c1
+
+    # Now we can test manual setup
+    initos open_disks "11111111"
+    # home will be bind mounted, hide /home/build
+    mount_btrfs_raw /dev/mapper/luks-1 /x
+}
+
+# Instead of installing - get a shell
+autoinstall() {
+  echo "Skipping format"
+
+  initos open_disks "11111111"
+  initos mount_btrfs_raw /dev/mapper/luks-1 /x
+
+  cp -a /initos/ro/home/build /home/build
+
+  if [ -f /boot/efi/install/install.tar.gz ]; then
+    tar xfz -C / /boot/efi/install/install.tar.gz
+  fi
+
+  #initos startui
+}
+
+
+echo autosetup > /tmp/autosetup
+
+init() {
+    # The test machine will use saved keys. Insecure, but only 
+    # used while testing.
+
+    # Normally should be on /x/initos.
+    if [ -f /boot/efi/install/${HOSTNAME}.apkovl.tar.gz ]; then
+      tar xfz -C / /boot/efi/install/${HOSTNAME}.apkovl.tar.gz
+    fi
+
+
+    # Now we can test manual setup
+    initos open_disks $KEY
+    # home will be bind mounted, hide /home/build
+    initos mount_btrfs_raw /dev/mapper/luks-1 /x
+
+    if [ ! -d /x/initos/etc/ssh ]; then
+      if [ -d /boot/efi/install/ssh ]; then
+          cp -a /boot/efi/install/ssh /etc
+          chmod 700 /etc/ssh/*_key
+      fi
+    fi
+
+
+    # #start_ui
+
+    # # Experimenting with different ways to autologin and 
+    # # start sway on an old insecure laptop.
+    # getty 38400 /dev/tty5 -n -l /bin/sh &
+    # getty 38400 /dev/tty3 -n -l /sbin/autologin &
+    # getty 38400 /dev/tty4 -n -l /sbin/auto
+}
+
+"$@"

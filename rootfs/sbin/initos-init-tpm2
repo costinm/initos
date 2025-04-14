@@ -1,6 +1,6 @@
 #!/bin/sh
 
-source /sbin/initos
+. /sbin/initos common
 
 # Separate script for setting up server machines with TPM2
 # All servers should have TPM2 in order to start automatically.
@@ -20,16 +20,18 @@ initos_init() {
   # Additional drivers with the real firmware and modules mounted. 
   load_drivers
 
-  # LUKS mounted on /x, secure mode.
-  open_luks
+  unlock_tpm
+
+  open_disks "$KEY"
         
+  # LUKS mounted on /x, secure mode.
 
   # At this point we may have a tpm and may be able to mount
   # encrypted disk.
   # If insecure - the TPM should NOT have the key
   # Without TPM2 - will ask for a password - if it can open the
   # disk - ok, otherwise panic
-  mount_btrfs_raw /dev/mapper/c /x
+  mount_btrfs_raw /dev/mapper/luks-1 /x
   if [ $? -eq 0 ]; then
       logi "BTRFS mounted"
   else
@@ -37,6 +39,12 @@ initos_init() {
   fi
 
   start_os
+
+  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
+  /etc/init.d/agetty.tty1 start
+
+  exec tini -s sleep -- infinity 
+
 }
 
 # unlock the encrypted disk using the TPM. 'c' mapper will be used.
@@ -67,10 +75,11 @@ unlock_tpm() {
 
   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
   
-  # if [ -z $PASSPHRASE ]; then 
-  #   logi "Handle $handle PCR7 failed, try PCR8" 
-  #   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8 2>/dev/null)
-  # fi 
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle PCR7 failed, try PCR8" 
+    PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8 2>/dev/null)
+  fi 
+  
   # if [ -z $PASSPHRASE ]; then 
   #   logi "Handle $handle failed PCR8 try 8100..2 PCR7" 
   #   handle=0x81000002
@@ -83,49 +92,13 @@ unlock_tpm() {
   fi 
   
   if [ -z $PASSPHRASE ]; then
+    # TODO: Try all other handles
+    HANDLES=$(tpm2_getcap handles-persistent)
+    logi "Persistent handles $HANDLES" 
     echo "Failed to unlock TPM, fallback to recovery" 
     return
   fi
-  export PASSPHRASE
-
-  # Try all other handles
-  HANDLES=$(tpm2_getcap handles-persistent)
-  logi "Persistent handles $HANDLES" 
-  
-
-
-  if [ -z "$part" ]; then
-    parts=$(blkid | grep 'TYPE="crypto_LUKS"' | cut -d: -f1 )
-    echo "$parts" | while read -r part; do 
-      echo -n "$PASSPHRASE" | cryptsetup open $part c -
-      if [ $? -eq 0 ]; then
-        logi "Opened $part"
-        return 0
-      fi
-    done
-  else
-    echo -n "$PASSPHRASE" | cryptsetup open $part c -
-  fi
-
-}
-
-
-# open LUKS using TPM2.
-# TODO: attempt to open all LUKS devices (multiple NVMEs)
-# Mointing the /x and rootfs after, btrfs may span multiple 
-# disks.
-open_luks() {
-  local crypted=$1
-  
-  echo "Found LUKS device: ${cryptd}"
-  
-  unlock_tpm $cryptd
-  if [ $? -eq 0 ]; then
-    logi "TPM unlocked ${cryptd}"
-    return 0
-  fi
-
-  return 1
+  export KEY=$PASSPHRASE
 }
 
 # If running as PID=1 (from initrd): run initos_init or

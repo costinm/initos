@@ -65,6 +65,9 @@ export REPO=${REPO:-git.h.webinf.info/costin}
 # For the docker build variant.
 export DOCKER_BUILDKIT=1
 
+
+TAG=${TAG:-v250410}
+
 set -e
 
 
@@ -95,8 +98,10 @@ all() {
 
 clean() {
   buildah rm initos-base initos kernel >/dev/null 2>&1  || true
+  buildah rmi ${REPO}/kernel:latest >/dev/null 2>&1  || true
   buildah rmi ${REPO}/initos-base:latest >/dev/null 2>&1  || true
   buildah rmi ${REPO}/initos:latest  >/dev/null 2>&1 || true
+  buildah rmi initos initios-base kernel  >/dev/null 2>&1 || true
   # rmi -a # all images
   rm -rf ${WORK}
 }
@@ -119,19 +124,49 @@ _build_cmd() {
   local POD=$2
   shift; shift
 
-  # Cache directories - deb and alpine
-  mkdir -p ${WORK}/apkcache ${WORK}/lib_cache
-  VOLS="$VOLS -v ${WORK}/lib_cache:/var/lib/cache"
-  VOLS="$VOLS -v ${WORK}/apkcache:/etc/apk/cache"
-
   buildah rm ${POD} || true
 
   buildah pull ${BASE}
+
+  # Cache directories - deb and alpine
+  mkdir -p ${WORK}/apkcache ${WORK}/lib_cache ${WORK}/apt
+  VOLS="$VOLS -v ${WORK}/lib_cache:/var/lib/cache"
+  VOLS="$VOLS -v ${WORK}/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/apt:/var/cache/apt/archives"
+
+  VOLS="$VOLS -v ${WORK}:/data"
+
   buildah --name ${POD} ${VOLS} from ${BASE}
+
   buildah copy ${POD} rootfs/sbin /sbin
+  buildah copy ${POD} rootfs/bin /bin
+  buildah copy ${POD} rootfs/etc /etc
+
   buildah run ${POD} -- "$@"
 
+  echo "Commiting as ${REPO}/${POD}:${TAG}"
+  buildah commit ${POD} ${REPO}/${POD}:${TAG}
   buildah commit ${POD} ${POD}
+}
+
+_run_cmd() {
+  local POD=$1
+  shift
+
+  # Cache directories - deb and alpine
+  mkdir -p ${WORK}/apkcache ${WORK}/lib_cache ${WORK}/apt
+  VOLS="$VOLS -v ${WORK}/lib_cache:/var/lib/cache"
+  VOLS="$VOLS -v ${WORK}/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/apt:/var/cache/apt/archives"
+
+  VOLS="$VOLS -v ${WORK}:/data"
+
+  buildah copy ${POD} rootfs/sbin /sbin
+  buildah copy ${POD} rootfs/bin /bin
+  buildah copy ${POD} rootfs/etc /etc
+
+  buildah run ${VOLS} ${POD} -- "$@"
+
 }
 
 # Only the kernel and drivers (no nvidia - install on the partition)
@@ -140,34 +175,53 @@ debkernel() {
   _build_cmd debian:bookworm-slim kernel /sbin/setup-initos add_deb_kernel
 }
 
-debui() {
-  _build_cmd debian:bookworm-slim kernel /sbin/setup-deb ui
-}
-
+# Use the initos-base image to copy $1 image to $2 local dir.
+# Alternative to 'crane export' - without remote push.
 exportfs() {
   buildah --name orig from $1
   buildah run \ 
      -v $2:/data
      --mount=type=bind,from=orig,src=/,dst=/mnt \
-    initios -- cp -a /mnt/ /data
+    initios-base -- cp -a /mnt/ /data
   buidah rm orig
 }
 
-# Clean build using initos image
+efi() {
+  initos_efi_builder "$@"
+}
+
+# Using the base image and the kenel, build a container that
+# adds a layer containing the initrd and sqfs files.
+# 
+# This can also be generated on a cache dir - and used for 
+# signing.
 initos_efi_builder() {
-  local POD=initos
+  local POD=${POD:-initos}
+
+
+  # if ! buildah images | grep -q "${REPO}/initos-base:${TAG}"; then
+  #   echo "Image ${REPO}/initos-base:${TAG} not found locally. Pulling from repository..."
+  #   buildah pull ${REPO}/initos-base:${TAG}
+  #   buildah tag ${REPO}/initos-base:${TAG} initos-base
+  # fi
+  set -x 
 
   buildah rm ${POD} || true
-  buildah --name ${POD} from initos-base 
-  # ${REPO}/initos-base:latest
- 
-  initos_efi_update 
+  KIMG=kernel # ${REPO}/kernel:${TAG}
 
-  buildah commit ${POD} ${REPO}/initos-efi-builder:latest
+ buildah --name ${POD} from initos-base
+ 
+  # This could be done in the container with debootstrap
+  buildah copy --from ${KIMG} ${POD} /boot/ /boot/
+
+  initos_efi_update "$@"
+
+  buildah commit ${POD} ${REPO}/initos-efi-builder:${TAG}
+  buildah commit ${POD} ${POD}
 }
 
 initos_efi_add() {
-  local POD=initos
+  local POD=${POD:-initos}
 
   buildah copy ${POD} rootfs/sbin /sbin
   buildah copy ${POD} rootfs/bin /bin
@@ -180,35 +234,70 @@ initos_efi_add() {
 
 }
 
-initos_efi_update() {
-  local POD=initos
+update() {
+  initos_efi_update "$@"
+}
 
+updatesqfs() {
+  local POD=${POD:-initos}
+  echo "Updating SQFS for ${POD}"
+  
   buildah copy ${POD} rootfs/sbin /sbin
   buildah copy ${POD} rootfs/bin /bin
-  buildah copy --chown build ${POD} rootfs/home /home
+  #buildah copy --chown build ${POD} rootfs/home /home
   buildah copy ${POD} rootfs/etc /etc
 
-  # This could be done in the container with debootstrap
-  buildah copy --from kernel ${POD} /boot/ /boot/
+  MOUNTS="-v ${WORK}/lib/modules:/lib/modules \
+  -v ${WORK}/lib/firmware:/lib/firmware \
+  -v ${WORK}/boot:/boot"
+  MOUNTS="$MOUNTS -v ${WORK}:/data"
+
+  buildah run ${MOUNTS} \
+    ${POD} --  setup-initos vinit
+
+  buildah run ${MOUNTS} \
+     ${POD} -- setup-initos sqfs /data/efi/initos
+
+  buildah run ${MOUNTS} \
+    ${POD}  setup-initos build_initrd
+
+}
+
+# Use the existing 'initos' (or $POD) container to update the sqfs.
+# Will not commit it - can be used locally
+# 
+# The pod can be updated with more packages, after changes 'update' must
+# be called
+# 
+initos_efi_update() {
+  local POD=${POD:-initos}
+  local DEST=${1:-/boot}
+
+  echo "Updating ${POD} sqfs "
+  buildah copy ${POD} rootfs/sbin /sbin
+  buildah copy ${POD} rootfs/bin /bin
+  #buildah copy --chown build ${POD} rootfs/home /home
+  buildah copy ${POD} rootfs/etc /etc
+
 
   # Build roimage and verity signature, directly on the out img dir.
   #
   # Will create SQFS files for the EFI images - smaller than including
   # the files directly and easier to use.
+  KIMG=kernel # ${REPO}/kernel:${TAG}
 
-  buildah run \
-    --mount=type=bind,from=kernel,src=/lib/modules,dst=/lib/modules \
-    --mount=type=bind,from=kernel,src=/lib/firmware,dst=/lib/firmware \
-    ${POD} -- setup-initos vinit
+  MOUNTS="--mount=type=bind,from=${KIMG},src=/lib/modules,dst=/lib/modules \
+    --mount=type=bind,from=${KIMG},src=/lib/firmware,dst=/lib/firmware"
 
-  buildah run \
-    --mount=type=bind,from=kernel,src=/lib/modules,dst=/lib/modules \
-    --mount=type=bind,from=kernel,src=/lib/firmware,dst=/lib/firmware \
-    ${POD} -- setup-initos recovery_sqfs recovery /boot
+  MOUNTS="$MOUNTS -v ${WORK}:/data"
 
-  buildah run \
-    --mount=type=bind,from=kernel,src=/lib/modules,dst=/lib/modules \
-    --mount=type=bind,from=kernel,src=/lib/firmware,dst=/lib/firmware \
+  buildah run ${MOUNTS} \
+    ${POD} --  setup-initos vinit
+
+  # buildah run ${MOUNTS} \
+  #    ${POD} -- setup-initos sqfs ${DEST}
+
+  buildah run ${MOUNTS} \
     ${POD}  setup-initos build_initrd
 
 }
@@ -216,6 +305,8 @@ initos_efi_update() {
 # It still needs an initrd.
 # The image needs to be saved as a .img or sqfs.
 virt() {
+  POD=${POD:-initos}
+
   VER=$(ls /lib/modules | grep cloud | tail)
   # Virt files. 
   VIRT=${VIRT:-${WORK}/vimg}
@@ -228,13 +319,13 @@ virt() {
     cp /boot/vmlinuz-$VER ${VIRT}/vmlinuz
   fi
   # Build the initrd used by sign
-  buildah copy initos rootfs/sbin /sbin
+  buildah copy ${POD} rootfs/sbin /sbin
 
   buildah run -t \
     -v ${VIRT}:/opt/virt \
     --mount=type=bind,src=/lib/modules,dst=/lib/modules \
     --mount=type=bind,src=/lib/firmware,dst=/lib/firmware \
-      initos -- \
+      ${POD} -- \
     setup-initos vinit $VER
 
   # May want to add the modules from the host image (for virt), but seems
@@ -243,11 +334,13 @@ virt() {
 
 # will create the images from the running containers.
 commit() {
-  # About 500MB
-  buildah push ${REPO}/initos:latest
-  
   # About 200MB
-  buildah push ${REPO}/initos-base:latest
+  buildah push ${REPO}/initos-base:${TAG}
+
+  buildah push ${REPO}/kernel:${TAG}
+
+  # About 500MB
+  buildah push ${REPO}/initos:${TAG}  
 }
 
 ##### Dockerfile

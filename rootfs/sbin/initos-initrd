@@ -78,7 +78,10 @@ boot_initos() {
   cp /sbin/initos* /sbin/setup-initos* /sysroot/sbin/
   rm -f /sysroot/.dockerenv
 
-  
+  if [ -d /local/modprobe.d ]; then
+    cp -a /local/modprobe.d /sysroot/etc
+  fi
+
   # Expect a TPM file containing the handle to be present, otherwise use manual unlock.
   # In both cases a LUKS partition is required - it must be set in insecure mode or 
   # while creating the hard disk image.
@@ -93,6 +96,7 @@ boot_initos() {
    move_mounted_to_sysroot
    exec switch_root /sysroot /sbin/initos-init-manual
   fi
+  # TODO: update the scripts for debian (may use bash on the main rootfs)
   lfatal "Failed to switch root"
 }
 
@@ -219,6 +223,7 @@ mount_initos() {
   mount_overlay initos /initos/rootfs
 
   kernel_ver=$(uname -r)
+ 
   mkdir -p /lib/firmware
   mkdir -p /lib/modules/${kernel_ver}
   mount -o bind /initos/rootfs/lib/firmware /lib/firmware
@@ -253,6 +258,8 @@ mount_overlay() {
   if [ $? -ne 0 ]; then
      lfatal "Error: Failed to mount overlay ${name}"
   fi
+
+
 }
 
 # All remaining mounted dirs will be moved under same dir in /sysroot,
@@ -275,23 +282,22 @@ move_mounted_to_sysroot() {
 # Info log - shown on console, logged.
 logi() {
 	last_emsg=""$@""
-	echo "INITOS: $last_emsg" > /dev/kmsg
-	echo "$last_emsg"
+	echo "INITOSRD: $last_emsg" > /dev/kmsg
+	echo "INITOSRD: $last_emsg"
 }
 
 lfatal() {
   echo "FAILED: "$@""
   local save=/boot/efi/log
   mkdir -p $save
-  if [ -d $save ]; then
-    blkid > $save/blkid.log
-    dmesg > $save/dmesg.log
-    cat /proc/filesystems > $save/filesystems
-    cat /proc/devices > $save/devices
-    lsmod > $save/lsmod.log
-  fi
 
-  echo "Rebooting in 20 sec"
+  blkid > $save/blkid.log
+  dmesg > $save/dmesg.log
+  cat /proc/filesystems > $save/filesystems
+  cat /proc/devices > $save/devices
+  lsmod > $save/lsmod.log
+
+  echo "Rebooting in 20 sec. Block devices:"
 
   # TODO: if /boot/efi is mounted, save to the EFI partition
   blkid
@@ -362,20 +368,33 @@ find_boot() {
   local hashf=${4:-$(cat /local/initos.hash)}
 
   # findfs doesn't work well if multiple partitions with same label are present.
+  # This just waits for the expected label to show up, will try all of them
   retry 4 findfs LABEL=$first >/dev/null 2>&1
-
-  # Find all block devices of type EFI
-  # Doesn't seem to work with TYPE=EFI type, vfat is ok
-  # Using EFI UUID -t UUID=DE32-BBB1 doesn't work on alpine blkid...
-  #efi_devices1=$(blkid | grep 'TYPE="vfat"' | cut -d: -f1)
 
   local temp_mount_point=/boot/efi
   
-  # for kind in /dev/nvme /dev/mmc /dev/sd ;  do 
+  for diskt in /dev/nvme /dev/mmc /dev/sd ;  do 
+    device=$(blkid | grep "LABEL=\"$first\"" | cut -d: -f1 | grep $diskt)
+    echo "$device" | while read -r d; do 
+      if [ -z "$d" ]; then
+        continue
+      fi
+      logi "Attemptint to open $d using $vname"
+      try_disk "$d" "$hashf" "$mountp" "$vname"
+      if [ $? -eq 0 ]; then
+        export BOOT_LABEL=$first
+        break
+      fi
+    done
+    if [ -e /dev/mapper/$vname ]; then
+      return 0
+    fi
+  done
 
   for kind in $first BOOTA BOOTB ;  do
     # This selects only one if the label is used on multiple disk. 
     #device=$(findfs LABEL=$kind)
+    # This is busybox blkid, lacks '-l'
     device=$(blkid | grep "LABEL=\"$kind\"" | cut -d: -f1)
     echo "Looking for signed bootstrap on $kind $device"
     if [ -z "$device" ]; then
@@ -384,6 +403,7 @@ find_boot() {
     echo "$device" | while read -r d; do 
       try_disk "$d" "$hashf" "$mountp" "$vname"
       if [ $? -eq 0 ]; then
+        export BOOT_LABEL=$kind
         break
       fi
     done
@@ -391,6 +411,10 @@ find_boot() {
       return 0
     fi
   done
+
+  echo "XXXX TEMPORARY DEBUG - INITRD FAILED, check efi partitions"
+  sh
+
   return 2
 }
 

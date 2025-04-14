@@ -33,6 +33,22 @@ Instead, each stage is a standalone 'run' operation, with mounted volumes.
 Instead of Dockerfile syntax, regular shell is used (or any other language).
 Images are pushed and manipulated with 'crane'.
 
+# OCI images
+
+The build generates 2 main images:
+- debkernel - containing debian slim plus kernel/modules, including the cloud version.
+- initos-base - the (almost) minimal image required to boot.
+
+The boot disk (EFI) is generated from the 2 images, combined with a local volume that 
+includes the root keys for signing and additional (small) configurations to bundle in the signed EFI.
+
+First build is slow, as it generates SQFS and initrd images. Signing different EFI images and configs
+is fast, only packs and signs the required files.
+
+## Alternative layout - SQFS included
+
+Another approach that seems to work very well for quick generation of the EFI files at the expense of flexibility is
+to pre-generate the SQFS file containing the debian modules, firmware and the Alpine image that will be used.
 
 
 # Signing the EFI and adding root certs
@@ -137,7 +153,7 @@ Similarly, exposing the network namespace would allow dynamic changes. In the ca
 and handling the host size is possible - for the guest side some agent is needed, or just using ssh and running
 some commands.
 
-# Buildah 
+## Buildah 
 
 A K8S Pod or typical container will run as long as the 'init' runs, and typically has a 'sleep' that
 holds is alive. "Exec", "copy" and exporting current layer to images are done on the live container.
@@ -178,7 +194,7 @@ How it works:
 - for every command, generate a 'userdata/buildah.json' with the command
 - buildah-oci-runtime to run that command
 
-# EFI stubs
+## EFI stubs
 
 Currently Alpine is using the old gummiboot-stub.
 

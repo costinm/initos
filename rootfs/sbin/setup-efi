@@ -1,12 +1,15 @@
 #!/bin/sh
 
 # Setup for the files going into the EFI partition.
-# 
-# Without any args, will build the USB image, with an additional signed EFI for BOOTA.
-# "A" and "B" will only boot the images for the A and B partitions. 
-# 
-# It will start by generating Verity signatures for the .sqfs image that is generated part of the
+#
+# The /config directory is expected to contain uefi-keys (will be created if missing) 
+#
+# It will start by generating Verity signatures for the .sqfs images in
+# /data/efi/initios (generated as part of the rootfs)
 # built, and create the EFI UKI with corresponding flags.
+#
+# /boot, /lib/modules and /lib/firmware are expected to be mounted from another
+# image or disk, or part of the signer image.
 # 
 # Create the final disk by copying to the unused existing EFI partition - the active boot can't be 
 # changed, the files will be in use.
@@ -18,9 +21,8 @@ set -e
 # May include additional files to bake into images.
 # Signing the images also requires a volume holding the signing keys
 # and configs.
-WORK=${WORK:-/x/initos}
 
-mkdir -p ${WORK}/efi/initos ${WORK}/efi/EFI/BOOT ${WORK}/usb/EFI/BOOT
+mkdir -p /data/efi/initos /data/efi/EFI/BOOT /data/efi/keys
 
 # Generate the key pairs for signing the kernel and the disk image.
 # This is done before install - as a separate step/process - the rest can be automated easily,
@@ -50,7 +52,7 @@ sign_init() {
 
 # Copy the efi keys to the EFI partition
 efi_keys() {
-  DEST=/data
+  DEST=/data/efi
 
   cp /etc/uefi-keys/*.auth ${DEST}/keys
   cp /etc/uefi-keys/*.cer ${DEST}/keys
@@ -79,14 +81,14 @@ efi_keys() {
 # They go to /opt/initos/local
 # 
 # It is intended to run from a container with /etc/uefi-keys mounted
-# to a disk on an encrypted partition or 'secrets', and /x/initos
+# to a disk on an encrypted partition or 'secrets', and /data
 # mounted with the destination disk, where efi image will be 
 # created. It can also be used from recovery.
 efi() {
   local host=${1:-default}
     
   # Mounted dir
-  DEST=/data
+  DEST=/data/efi
   set -e
 
   # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
@@ -104,7 +106,7 @@ efi() {
   # Initos image includes the recovery. It can also be built or manipulated on the
   # host.
   if [ ! -f ${DEST}/initos/initos.sqfs ]; then
-    cp /boot/recovery.sqfs ${DEST}/initos/initos.sqfs
+    cp /boot/initos.sqfs ${DEST}/initos/initos.sqfs
   fi
 
   # If hash is missing, use verity to sign it now
@@ -118,11 +120,16 @@ efi() {
       ${DEST}/initos/initos.sqfs.verity
   fi
 
+  cat  ${DEST}/initos/initos.hash
+
+
   # /local dir will be baked into the initrd and propagated. Include critical security files.
   # Also add fresh scripts from the image.
   cp ${DEST}/initos/initos.hash /local/initos.hash 
+
   cp /etc/uefi-keys/authorized_keys /local/
   cp /etc/uefi-keys/root.pem /local/
+  
   if [ -d /config/local ]; then
     cp -a /config/local/* /local/
   fi
@@ -174,10 +181,25 @@ efi() {
       --output ${DEST}/initosA.EFI \
       /tmp/tmp.EFI
 
+  ls -l ${DEST}/
+
   rm /tmp/tmp.EFI
   chmod -R 755 ${DEST}
   rm -rf /etc/uefi-keys
 }
+
+signer() {
+  apk add ca-certificates-bundle curl \
+   efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
+  cryptsetup mkinitfs zstd \
+  openssl openssh openssh-keygen
+
+  echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
+
+  # To create IMGs:   dosfstools parted 
+}
+
+
 
 #    sigfile=${hashfile}.sig
 #    cat $hashfile | xxd -r -p | openssl dgst \

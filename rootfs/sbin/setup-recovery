@@ -3,7 +3,9 @@
 # TODO: rename to setup-initos-sidecar or setup-initos-base
 # it was originally for 'recovery' only
 
-### Alpine specific packages for the recovery image.
+### Alpine specific packages for:
+# - alpine-based rootfs - servers without Nvidia
+# - rootfs with UI for laptops.
 #
 # Not using "--no-cache" - the cache dir should be mounted
 # to /var/cache/apk/[INDEX] and /etc/apk/cache 
@@ -17,20 +19,13 @@ install() {
   # Podman + cloud hypervisor
   alpine_add_virt
  
-  # TODO: make it conditional. For now I'm testing on
-  # various laptops and want to check how it works - not
-  # very useful on a server
-  wui
-
-  # Add the config files
-  
-  #(cd /etc/init.d && ln -s agetty agetty.tty1)
+  (cd /etc/init.d && ln -s agetty agetty.tty1)
   (cd /etc/init.d && ln -s agetty agetty.tty2)
-  # Using busybox init
+  
   #rc-update add agetty.tty1 boot
-  #rc-update add agetty.tty2 default
-#  rc-update add agetty.ttyS0 boot
-#  rc-update add agetty.hvc0 boot
+  rc-update add agetty.tty2 default
+  rc-update add agetty.ttyS0 boot
+  rc-update add agetty.hvc0 boot
 
   rc-update add devfs sysinit
   rc-update add dmesg sysinit
@@ -94,7 +89,10 @@ alpine_add_common() {
   #apk add alpine-base # Installs openrc
   apk add ifupdown-ng libcap2  openrc \
     alpine-conf  alpine-release  busybox-openrc \
-    busybox-suid dhcpcd
+    busybox-suid bash
+
+  # Not sure: this seems to take over some interfaces  
+  # dhcpcd
   
   #setup-devd udev
 
@@ -258,7 +256,7 @@ alpine_add_virt() {
   df -h
 
   # For OCI interaction - podman can also pull, for building use dev image.
-  apk add crane
+  apk add crane runc
     # podman instead of docker: no daemon. Adds ~70M
 
   # Deps: crun container, gpg, etc
@@ -304,26 +302,28 @@ virt_install() {
 
 # Optional - using alpine kernel instead of debian kernel.
 # Doesn't work well with debian rootfs (module loading issues, different gcc)
-linux_alpine() {
-  df -h 
-  #apk add linux-lts
-  #apk add intel-ucode amd-ucode
-  #KERNEL_VERSION=$(cat /usr/share/kernel/lts/kernel.release)
-  # echo $KERNEL_VERSION > /boot/version
-  # Versioned name, matching the modules dir.
-  #mv /boot/vmlinuz-lts /boot/vmlinuz-${KERNEL_VERSION}
-  #ln -s /boot/vmlinuz-${KERNEL_VERSION}  /boot/vmlinuz
+# so can't load Nvidia module. Since one of the main goals is to run on servers
+# with nvidia cards - not used.
+# linux_alpine() {
+#   df -h 
+#   apk add linux-lts
+#   apk add intel-ucode amd-ucode
+#   KERNEL_VERSION=$(cat /usr/share/kernel/lts/kernel.release)
+#   echo $KERNEL_VERSION > /boot/version
+#   Versioned name, matching the modules dir.
+#   mv /boot/vmlinuz-lts /boot/vmlinuz-${KERNEL_VERSION}
+#   ln -s /boot/vmlinuz-${KERNEL_VERSION}  /boot/vmlinuz
 
-  # For a VM using alpine kernel: 'linux-virt' package.
-  apk add linux-virt
+#   # For a VM using alpine kernel: 'linux-virt' package.
+#   apk add linux-virt
 
-  #du -sh /lib/firmware
-  # Decompress all zst files (debian kernel + alpine firmware ?)
-  #(cd /lib/firmware; find . -name "*.zst" -exec zstd -d --rm -f {} \;  || true) 2>/dev/null
-  #echo "Expanded zst"
-  #du -sh /lib/firmware
-  df -h
-}
+#   #du -sh /lib/firmware
+#   # Decompress all zst files (debian kernel + alpine firmware ?)
+#   #(cd /lib/firmware; find . -name "*.zst" -exec zstd -d --rm -f {} \;  || true) 2>/dev/null
+#   #echo "Expanded zst"
+#   #du -sh /lib/firmware
+#   df -h
+# }
 
 # Wayland UI. Using alpine setup-desktop, which adds 
 # - dbus, elogind, firefox, foot.
@@ -331,29 +331,24 @@ linux_alpine() {
 # The build time also increases from 7 to 9 min 
 wui() {
   #  apk add mesa-dri-gallium
+
+  # Built in option in Alpine.
   setup-desktop sway
   
   # Conflicts with rofi - host will not expose X11/kasm anyway,
   # that should be only in VMs/pods.
   apk add rofi-wayland rofi-pass rofi-top
 
-  # TODO: try labwc (pi) instead of sway
+  # labwc (pi) can be used instead of sway, OpenBox-based with ALT-TAB
   apk add labwc
 
-  # As root: start seatd
-  # make sure video, input groups match
-  apk add seatd
+  # make sure video, input, seat groups are added to the UI user
+  apk add seatd polkit 
+  addgroup build seat
+
+  apk add sway mc bash bash-completion
 }
 
-# Common additional packages for UI
-ui2() {
-  apk add bash bash-completion
-  apk add kitty kitty-kitten # required
-
-  apk add firefox # esr is the less updated long term
-
-  #apk add chromium
-}
 
 # Native X UI
 xui_alpine() {
@@ -361,6 +356,10 @@ xui_alpine() {
   apk add tint2 rofi alttab i3status
   apk add xorg-server
   apk add xinit
+  
+  apk add kitty kitty-kitten # required
+  apk add firefox # esr is the less updated long term
+
 #  apk add xset
 #  apk add xrandr
 #  apk add xmodmap

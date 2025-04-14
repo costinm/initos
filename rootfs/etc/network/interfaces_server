@@ -1,0 +1,24 @@
+# Do not mix wlan0 and br-lan on the same network !!!
+# In server mode - use a bridge with the eth interface(s) as well as 
+# any VM
+
+auto lo
+iface lo inet loopback
+
+# Using DHCP 
+auto br-lan
+iface br-lan inet auto
+ bridge_ports enp.*
+ bridge_ports pod.*
+ bridge_ports eth0
+ bridge_ports eth.*
+ bridge_stp off
+ bridge_maxwait 5
+ post-up /usr/sbin/brctl setfd br-lan 0
+ #address 192.168.1.98
+ #netmask 255.255.128.0
+ #gateway 192.168.1.250
+ #dns-nameservers 1.1.1.1
+
+iface br-lan inet6 auto
+

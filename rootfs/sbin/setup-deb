@@ -427,7 +427,7 @@ chrome_firmware() {
 
 
 
-function add_dev_tools() {
+add_dev_tools() {
 
     # 46M, brings perl
     DEBIAN_FRONTEND=noninteractive \
@@ -444,7 +444,7 @@ function add_dev_tools() {
   #     autoconf  automake libtool
 }
 
-function add_k8s() {
+add_k8s() {
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
     install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 
@@ -481,7 +481,7 @@ function add_k8s() {
     echo 'complete -o default -F __start_kubectl k' >>~/.bashrc
 }
 
-function add_docker() {
+add_docker() {
   sudo apt-get update
   sudo apt-get install ca-certificates curl
   sudo install -m 0755 -d /etc/apt/keyrings
@@ -506,7 +506,7 @@ function add_docker() {
 #    usermod -G docker ${USERNAME}
 }
 
-function add_tinygo() {
+add_tinygo() {
   TINYGO_RELEASE=0.36.0
   wget https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_RELEASE}/tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz && \
       tar xf tinygo${TINYGO_RELEASE}.linux-amd64.tar.gz -C /opt && \
@@ -514,7 +514,7 @@ function add_tinygo() {
 }
 
 
-function add_golang() {
+add_golang() {
   local GOLANG_VERSION=1.22.2
   local GOLANG_DOWNLOAD_URL=https://golang.org/dl/go$GOLANG_VERSION.linux-amd64.tar.gz
 
@@ -522,6 +522,8 @@ function add_golang() {
   	&& tar -C /usr/local -xzf golang.tar.gz \
   	&& rm golang.tar.gz
 }
+
+
 
 
 C=${1}
