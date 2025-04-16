@@ -152,6 +152,58 @@ open_disks() {
   done
 }
 
+# Read the KEY from TPM. The handle should be in /boot/efi/initos/tpm_handle
+unlock_tpm() {
+  # Arch recommends: 1,2,5,7 ( firmware, firmware options, GPT layout, secure
+  #  boot status)
+  #PCRS="0,1,7"
+  # 2 = pluggable executable code
+  # 3 = pluggable firmware data
+  # 4 = boot manager code
+  # 5 = boot manager data, include GPT partitions
+  # 6 = resume events
+  # 7 = secure boot status, certificates -> This is what 
+  #  we want, gpt layout is not relevant, firmware can be
+  #  upgraded.
+
+  # The setup script makes sure this handle is set - we may try multiple handles or
+  # list nv persistent and try all.
+
+  handle=0x81000001
+
+  if [ -f /boot/efi/initos/tpm_handle ]; then
+    handle=$(cat /boot/efi/initos/tpm_handle)
+  fi
+
+  PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
+  
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle PCR7 failed, try PCR8" 
+    PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8 2>/dev/null)
+  fi 
+  
+  # if [ -z $PASSPHRASE ]; then 
+  #   logi "Handle $handle failed PCR8 try 8100..2 PCR7" 
+  #   handle=0x81000002
+  #   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
+  # fi 
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle:8 failed, try 81800001" 
+    handle=0x81800001
+    PASSPHRASE=$(tpm2_unseal -c 0x81800001 -p pcr:sha256:7 2>/dev/null)
+  fi 
+  
+  if [ -z $PASSPHRASE ]; then
+    # TODO: Try all other handles. 
+    # The first should be the public key, the seond the disk encryption key
+    HANDLES=$(tpm2_getcap handles-persistent)
+    logi "Persistent handles $HANDLES" 
+    echo "Failed to unlock TPM, fallback to recovery" 
+    return
+  fi
+  export KEY=$PASSPHRASE
+}
+
 mount_btrfs_raw() {
   local root_device=${1:-/dev/mapper/luks-1}
   local dst=${2:-/x}
@@ -160,7 +212,10 @@ mount_btrfs_raw() {
   #  -o compress -o nobarrier 
 
   mkdir -p ${dst}
+ 
+  btrfs device scan --all-devices
 
+  # TODO: use LABEL=INITOSROOT instead of mapper name
   mount -t btrfs "${root_device}" ${dst}
   if [ $? -ne 0 ]; then
       logi "Error: Failed to mount BTRFS partition"
@@ -456,5 +511,9 @@ common() {
 # TODO: check lbu (for USB-only OS, can be encrypted)
 # Not clear if better - want to run pods.
 
-"$@"
+if [ "$$" = "1" ]; then
+  initos_init
+else
+  "$@"
+fi
 

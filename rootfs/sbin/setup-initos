@@ -90,8 +90,8 @@ build_initrd() {
 # Add the current docker image to an existing SQFS file.
 # This is useful if the kernel+modules+firmware is created independently.
 sqfs() {
-  local name=initos
   local DIR=${1:-/data/efi/initos}
+  local name=${2:-initos}
 
   # -one-file-system also works on the host - but not so well in a container.
 
@@ -134,29 +134,6 @@ sqfs() {
   echo "Created ${DIR}/${name}.sqfs"
 }
 
-sqfs_linux() {
-  local name=${1:-recovery}
-  local DIR=${2:-/boot}
-
-  cd /
-
-  # in case they are still around
-  rm -rf /etc/uefi-keys 
-  
-  # Doesn't include /boot files (kernel is separate)
-  # Includes both normal and cloud modules
-  mksquashfs . ${DIR}/kernel.sqfs /lib/modules /lib/firmware 
-}
-
-# Assuming /mnt/img is mounted with another container (like debian+kernel), create 
-# a SQFS image with the entire image..
-sqfs_img() {
-  OUT=${1:-/data/efi/initos/initos}
-  cd /mnt/img
-  rm -f ${OUT}.*
-  mksquashfs . ${OUT}.sqfs  
-}
-
 alpine_clear() {
   rm /var/lib/dbus/machine-id || true
   rm /etc/hostname || true
@@ -176,6 +153,14 @@ debian_rootfs() {
   
   save_lib
   sqfs
+}
+
+debian_rootfs_base() {
+  add_deb_kernel
+  
+  add_deb_core
+
+  add_deb_kernel_nvidia
 }
 
 add_deb_core() {
@@ -303,6 +288,7 @@ add_virt_kernel() {
   rm -rf /boot/initrd.img*  || true
 }
 
+
 # vinit updates the initram-Fs for the virt kernel
 # Expectes /boot, /lib/modules, /lib/firmware to have the right
 # mounts and /boot/version-virt to hold the desired kernel version.
@@ -310,22 +296,19 @@ add_virt_kernel() {
 # This runs in an alpine container (for now) - the init will be based
 # on the ligher musl binaries.
 vinit() {
-  # VER=${1:-$(cat /boot/version-virt)}
-  # if [ -z ${VER} ]; then
-    VER=$(ls /lib/modules | grep cloud | tail)
-  #fi
-  mkdir -p ${WORK}/vimg/
+  VER=$(ls /lib/modules | grep cloud | tail)
 
-  ls -l /opt/virt
-  cp /boot/vmlinuz-${VER} /opt/virt/vmlinuz
+  mkdir -p /data/virt
+
+  cp /boot/vmlinuz-${VER} /data/virt/vmlinuz
   # btrfs is pretty slow for a VM - the rootfs may have all the modules
   # and load it as needed.
   # squashfs may not be needed if modules/firmware are on the ext4 rootfs
   # or on virtio.
   mkinitfs -k  -i /sbin/initos-initrd-vm \
      -F "base btrfs virtio initosvm" \
-     -o /opt/virt/initramfs ${VER}
-  ls -l /opt/virt
+     -o /data/virt/initramfs ${VER}
+
 }
 
 vinitl() {
@@ -333,7 +316,11 @@ vinitl() {
   mkinitfs -k  -i /sbin/initos-initrd-vm \
      -F "base btrfs virtio initosvm" \
      -o /opt/virt/initramfs ${VER}
+}
 
+setup_initrd() {
+  build_initrd 
+  vinit
 }
 
 # debootstrap_kernel() {

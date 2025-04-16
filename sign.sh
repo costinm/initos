@@ -18,7 +18,7 @@ POD=${POD:-initos}
 # Output generated here
 WORK=${HOME}/.cache/${POD}
 
-IMAGE_SIGNER=${REPO}/initos-efi-signer:latest
+IMAGE_SIGNER=${REPO}/initos-builder:latest
 
 mkdir -p ${SECRET}/uefi-keys ${WORK}
 
@@ -48,14 +48,14 @@ echo "Signer image: ${IMAGE_SIGNER}"
 efi() {
   # The pod containing the image to be signed and the utils.
 
-  buildah containers --format {{.ContainerName}} | grep ${POD} > /dev/null
+  buildah containers --format {{.ContainerName}} | grep initos-builder > /dev/null
   if [ $? -ne 0 ]; then
-     buildah --name ${POD} from ${IMAGE_SIGNER}
+     buildah --name initos-builder from ${IMAGE_SIGNER}
      echo starting 
   fi
 
   # Update with latest files, optional
-  buildah copy ${POD} rootfs /
+  buildah copy initos-builder rootfs /
 
   # Create signed UKI (and unsigned one)
   VOLS="$VOLS -v ${SECRET}:/config" 
@@ -64,8 +64,7 @@ efi() {
   if [ -d ${WORK}/boot ]; then
     VOLS="$VOLS -v ${WORK}/boot:/boot -v ${WORK}/lib/modules:/lib/modules -v ${WORK}/lib/firmware:/lib/firmware "
   fi
-  buildah run $VOLS \
-     ${POD} -- setup-efi efi $*
+  buildah run $VOLS initos-builder -- setup-efi efi $*
 }
 
 # Build the EFI using docker.

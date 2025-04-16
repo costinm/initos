@@ -63,21 +63,29 @@ fi
 
 export SRCDIR=${SRCDIR:-$(pwd)}
 
+# Defaults to the name of the working directory.
+# This is the application name (may have multiple pod).
+POD=${POD:-$(basename $PWD)}
+
+VM=${VM:-${POD}}
+NAME=${NAME:-$POD}
+APP=${APP:-${POD}}
+
 # If the script is named vrun-devvm -> the VM will be devvm
 # Otherwise the current working dir will be used as VM dir. 
 # Images are still in /x/vol/images 
-if [ -z ${VM} ]; then
-  vmsuffix="${0#*vrun-}"
+#if [ -z ${VM} ]; then
+#   vmsuffix="${0#*vrun-}"
 
-  if [ -z "$vmsuffix" ]; then
-    VM=$(basename $PWD)
-  else
-    VM=$vmsuffix
-  fi
-fi
+#   if [ -z "$vmsuffix" ]; then
+#  VM=$(basename $PWD)
+  # else
+  #   VM=$vmsuffix
+  # fi
+#fi
 
-if [ -z ${VM} ]; then 
-  echo "VM must be set to the target workload"
+if [ -z ${POD} ]; then 
+  echo "POD must be set to the target container or VM name"
   exit 1
 fi
 
@@ -91,19 +99,11 @@ VOLS=${VOLS:-/x/vol}
 # Directory with hypervisor binaries, kernel, initrd, recovery
 VIRT=${VIRT:-/opt/virt}
 IMGDIR=${IMGDIR:-/x/vol/images}
-WORK=${WORK:-${VOLS}/${VM}}
 
-# Defaults to the name of the working directory.
-# This is the application name (may have multiple pod).
-NAME=${NAME:-$(basename $PWD)}
-APP=${APP:-${NAME}}
-# Name of the container (--name)
-POD=${POD:-$NAME}
 
-export REPO=${REPO:-git.h.webinf.info/costin}
-TAG=${TAG:-latest}
-IMAGE=${IMAGE:-${REPO}/${APP}:${TAG}}
+WORK=${WORK:-${VOLS}/${POD}}
 
+# IMAGE and other parameters loaded from this file
 if [ -f ${WORK}/env ]; then 
   . ${WORK}/env
 fi
@@ -176,7 +176,10 @@ start() {
 }
 
 # Start will run run the pod (VM) in background, like a container.
-# There is no command - just init.
+# 
+# Few env variables impact the startup:
+#  - DEBUG=init - will run a shell in the initrd
+#  - 'cmd' - will run a command in the VM after startup in the rootfs, foreground.
 start_vm() {
   BASE=2
 
@@ -261,10 +264,6 @@ start_vm() {
   
     ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" &
     echo $! > ${WORK}/vm.pid
-
-    #sleep 1
-    # TODO: wait for vm-$VM to show up
-    #brctl addif br-lan vm-$VM
   fi
 
   # --net .. mac=...

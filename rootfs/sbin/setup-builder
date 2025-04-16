@@ -79,7 +79,7 @@ set -e
 all() {
   clean
 
-  # Get the latest kernel.
+  # Get the latest kernel. 'kernel' container
   # When kernel changes, rebuild everything.
   debkernel
 
@@ -93,13 +93,13 @@ all() {
  
   # Base + kernel + generated initrd + sqfs including debkernel modules.
   # Used to build signed EFI images. 
-  initos_efi_builder
+  #initos_efi_builder
 }
 
 clean() {
   buildah rm initos-base initos kernel >/dev/null 2>&1  || true
-  buildah rmi ${REPO}/kernel:latest >/dev/null 2>&1  || true
-  buildah rmi ${REPO}/initos-base:latest >/dev/null 2>&1  || true
+  buildah rmi ${REPO}/initos-debian:latest >/dev/null 2>&1  || true
+  buildah rmi ${REPO}/initos-builder:latest >/dev/null 2>&1  || true
   buildah rmi ${REPO}/initos:latest  >/dev/null 2>&1 || true
   buildah rmi initos initios-base kernel  >/dev/null 2>&1 || true
   # rmi -a # all images
@@ -114,7 +114,7 @@ clean() {
 #
 # The mkinitfs and other tools can also be ported to debian - WIP.
 initos_base() {
-  _build_cmd alpine:edge initos-base  setup-recovery install
+  _build_cmd alpine:edge initos-builder  setup-efi install
 }
 
 # Run a single command in a container than commit it.
@@ -169,8 +169,9 @@ _run_cmd() {
 
 }
 
-# Only the kernel and drivers (no nvidia - install on the partition)
-# The recovery is based on musl/alpine to keep it small.
+# The debian + kernel container. This will be the rootfs.
+# In the past it didn't include nvidia and packages - but simpler to have
+# them.
 debkernel() {
   _build_cmd debian:bookworm-slim kernel /sbin/setup-initos add_deb_kernel
 }

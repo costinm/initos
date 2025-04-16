@@ -2,8 +2,6 @@
 
 export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
-source /sbin/initos-initrd source
-
 # Same as initos-initrd, but for insecure / unsigned EFI.
 # Will still verify the sqfs - mostly for integrity and 
 # consistency.
@@ -12,7 +10,7 @@ source /sbin/initos-initrd source
 # Separate file to avoid subtle security bugs where a secure
 # boot would get a shell.
 
-initramfs_init() {
+ins_initramfs_init() {
   logi "Starting INITOS INSECURE initramfs $(uname -r) $(cat /local/initos.hash)"
 
   mkdir -p /sysroot /z /x /initos /boot/efi \
@@ -21,19 +19,19 @@ initramfs_init() {
 
   # Load a set of core modules we use to load the VERITY
   # image. Udev will not load them by default, only modules for devices.
-  ins_initramfs_mods
+  initramfs_mods
 
-  if [ -d /local/modprobe.d ]; then
-    cp -a /local/modprobe.d /etc
-  fi
+  # Already included
+  ls /local/modprobe.d
+  # if [ -d /local/modprobe.d ]; then
+  #   cp -a /local/modprobe.d /etc
+  # fi
 
   # Mount the rest of the modules - usually finding the root is not
   # possible without this.
   udev_start
 
-  set -x
   ins_find_and_mount_efi
-  set +x
   
   # At this point, /boot/efi is mounted, and /dev/mapper/initos has the
   # verified rootfs (SQFS)
@@ -59,13 +57,10 @@ ins_find_and_mount_efi() {
   elif [ "$BOOT_CURRENT" = "1004" ]; then 
     find_boot BOOTB
     NEXT="A"
-  elif [ "$SECURE_MODE" != "1" ]; then 
+  else 
     # Insecure also checks BOOTUSB (can be USB disk or recovery partition)
     find_boot BOOTUSB
     NEXT="A"
-  else
-    find_boot BOOTA
-    NEXT="B"
   fi
   export NEXT
 
@@ -78,12 +73,12 @@ ins_boot_initos() {
   # the labeled partition, usually the EFI disk (but can be a different
   # one if upgrading a machine with a very small EFI).
 
-  if [ ! -d /initos/rootfs/etc ]; then
+  if [ ! -d /initos/sidecar/etc ]; then
     lfatal "partition containing boot image not found. Use alternate boot or USB disk for recovery"
   fi
 
   # Chroot into the Initos main
-  mount -o bind /initos/rootfs /sysroot
+  mount -o bind /initos/sidecar /sysroot
 
   # The files from the signed initrd can override files in the 
   # initos sqfs. It is also possible to append to or rebuild the 
@@ -104,40 +99,16 @@ ins_boot_initos() {
   rm -f /sysroot/.dockerenv
 
   echo "Insecure boot - before switch root, enter 'a' for admin shell"
-  read -t 4 -n 1 key
+  read -t 2 -n 1 key
   if [ "$key" = "a" ]; then
     busybox ash 
   fi 
+
   move_mounted_to_sysroot
-  exec switch_root /sysroot /sbin/initos-init-insecure
+  exec switch_root /sysroot /sbin/initos-init-ins
   lfatal "Failed to switch root"
 }
 
-# Load modules we may need - modules are also loaded if we get to udev
-# or nlplug-findfs, but we may skip that if the core modules are enough.
-ins_initramfs_mods() {
-  # Not including USB drivers.
+export INSECURE=1
 
-  # Required on alpine kernel - without this there is no display
-  # Debian appears to have it compiled in the kernel.
-  modprobe -a simpledrm scsi_mod sd_mod \
-    squashfs loop dm-verity mmc_block efivarfs
-
-  # For loading recovery from USB disk
-  modprobe -a usbcore ehci-hcd ohci-hcd xhci-hcd usb-storage
-
-  # Support scsi disks - needed for sata 
-  # nvme appears to be linked in both deb and alpine
-  # for loading recovery, modules, firmware
-  # btrfs, vfat are are normally present - but may be loaded if missing
-}
-
-
-if [ "$$" = "1" ]; then
-  initramfs_1st
-  mount_proc
-
-  initramfs_init
-else
-  "$@"
-fi
+. /sbin/initos-initrd 

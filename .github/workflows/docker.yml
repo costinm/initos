@@ -23,17 +23,30 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Does not use the checked out files - but the git directly
-      - name: push recovery
+      - name: push kernel
         uses: docker/build-push-action@v6
         with:
           push: true
-          tags: ghcr.io/costinm/initos/initos:latest
+          target: kernel
+          tags: ghcr.io/costinm/initos/initos-rootfs:latest
 #          username: ${{ github.actor }}
 #          password: ${{ secrets.GITHUB_TOKEN }}
 #          registry: docker.pkg.github.com
 #          repository: costinm/ugate/ugate/initos
           #tag_with_ref: true
-
+      - name: push sidecar
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          target: sidecar
+          tags: ghcr.io/costinm/initos/initos-sidecar:latest
+      - name: push builder
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          target: builder
+          tags: ghcr.io/costinm/initos/initos-builder:latest
+  
 #      - name: Upload EFI image
 #        uses: actions/upload-artifact@v2
 #        with:

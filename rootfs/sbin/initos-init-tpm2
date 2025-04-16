@@ -1,7 +1,5 @@
 #!/bin/sh
 
-. /sbin/initos common
-
 # Separate script for setting up server machines with TPM2
 # All servers should have TPM2 in order to start automatically.
 # Without TPM2 - it is possible to start in a locked mode and 
@@ -20,10 +18,27 @@ initos_init() {
   # Additional drivers with the real firmware and modules mounted. 
   load_drivers
 
-  unlock_tpm
+  if [ -f /boot/efi/initos/tpm_handle ]; then 
+    unlock_tpm
 
-  open_disks "$KEY"
-        
+    open_disks "$KEY"
+  else
+    for i in 1 2 3; do
+      echo
+      echo -n "Enter the disk (LUKS) password (attempt $i of 3): "
+      read -s KEY
+
+      open_disks "$KEY"
+      
+      if [ -e /dev/mapper/luks-1 ]; then
+        break
+      fi
+
+      echo
+      echo "Failed to unlock the disk. Please try again."
+    done
+  fi 
+
   # LUKS mounted on /x, secure mode.
 
   # At this point we may have a tpm and may be able to mount
@@ -47,69 +62,6 @@ initos_init() {
 
 }
 
-# unlock the encrypted disk using the TPM. 'c' mapper will be used.
 
-unlock_tpm() {
-  local part=$1
+. /sbin/initos
 
-  # Arch recommends: 1,2,5,7 ( firmware, firmware options, GPT layout, secure
-  #  boot status)
-  #PCRS="0,1,7"
-  # 2 = pluggable executable code
-  # 3 = pluggable firmware data
-  # 4 = boot manager code
-  # 5 = boot manager data, include GPT partitions
-  # 6 = resume events
-  # 7 = secure boot status, certificates -> This is what 
-  #  we want, gpt layout is not relevant, firmware can be
-  #  upgraded.
-
-  # The setup script makes sure this handle is set - we may try multiple handles or
-  # list nv persistent and try all.
-
-  handle=0x81000001
-
-  if [ -f /boot/efi/initos/tpm_handle ]; then
-    handle=$(cat /boot/efi/initos/tpm_handle)
-  fi
-
-  PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
-  
-  if [ -z $PASSPHRASE ]; then 
-    logi "Handle $handle PCR7 failed, try PCR8" 
-    PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8 2>/dev/null)
-  fi 
-  
-  # if [ -z $PASSPHRASE ]; then 
-  #   logi "Handle $handle failed PCR8 try 8100..2 PCR7" 
-  #   handle=0x81000002
-  #   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
-  # fi 
-  if [ -z $PASSPHRASE ]; then 
-    logi "Handle $handle:8 failed, try 81800001" 
-    handle=0x81800001
-    PASSPHRASE=$(tpm2_unseal -c 0x81800001 -p pcr:sha256:7 2>/dev/null)
-  fi 
-  
-  if [ -z $PASSPHRASE ]; then
-    # TODO: Try all other handles
-    HANDLES=$(tpm2_getcap handles-persistent)
-    logi "Persistent handles $HANDLES" 
-    echo "Failed to unlock TPM, fallback to recovery" 
-    return
-  fi
-  export KEY=$PASSPHRASE
-}
-
-# If running as PID=1 (from initrd): run initos_init or
-# a different function (like vm_init)
-if [ "$$" = "1" ]; then
-  if [ -z ${1+x} ] ; then
-    initos_init
-  else 
-    # Run one of the functions
-    "$@"
-  fi
-else
-  "$@"
-fi

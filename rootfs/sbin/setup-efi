@@ -103,12 +103,6 @@ efi() {
 
   efi_keys
 
-  # Initos image includes the recovery. It can also be built or manipulated on the
-  # host.
-  if [ ! -f ${DEST}/initos/initos.sqfs ]; then
-    cp /boot/initos.sqfs ${DEST}/initos/initos.sqfs
-  fi
-
   # If hash is missing, use verity to sign it now
   # If making changes to the img (on the mounted disk), remove hash.recovery to force
   # regeneration.
@@ -120,12 +114,20 @@ efi() {
       ${DEST}/initos/initos.sqfs.verity
   fi
 
+  if [ ! -f ${DEST}/initos/sidecar.hash ]; then
+    ls -l ${DEST}/initos
+    veritysetup format \
+      --root-hash-file=${DEST}/initos/sidecar.hash \
+      ${DEST}/initos/sidecar.sqfs \
+      ${DEST}/initos/sidecar.sqfs.verity
+  fi
+
   cat  ${DEST}/initos/initos.hash
 
 
   # /local dir will be baked into the initrd and propagated. Include critical security files.
   # Also add fresh scripts from the image.
-  cp ${DEST}/initos/initos.hash /local/initos.hash 
+  cp ${DEST}/initos/*.hash /local/ 
 
   cp /etc/uefi-keys/authorized_keys /local/
   cp /etc/uefi-keys/root.pem /local/
@@ -188,11 +190,19 @@ efi() {
   rm -rf /etc/uefi-keys
 }
 
-signer() {
+# To check: gzip -dc ../initos-initrd.img | cpio -idmv
+install() {
   apk add ca-certificates-bundle curl \
    efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
-  cryptsetup mkinitfs zstd \
-  openssl openssh openssh-keygen
+   cryptsetup mkinitfs zstd \
+  openssl openssh openssh-keygen \
+     eudev eudev-hwids udev-init-scripts \
+      udev-init-scripts-openrc \
+      dosfstools
+  
+  # Udev used in initrd
+  
+  apk del busybox-mdev-openrc mdev-conf || true
 
   echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
 

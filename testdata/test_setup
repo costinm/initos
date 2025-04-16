@@ -21,7 +21,8 @@ usb_wipe_disk() {
 # Not wiping the entire disk - keep BOOTA and BOOTB. 
 setup_disk() {
   set -x
-
+  
+  printf '\x07\x00\x00\x00YourDataHere' > MyVar-8be4df61-1156-4f91-91aa-05ed68301830
   # On the test machine I don't have 2 NVME disks.
   parted $DISK rm 3
   parted $DISK rm 4

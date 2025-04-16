@@ -8,8 +8,36 @@ ARG BASE=alpine:edge
 # Will add UI, etc on top.
 ARG DEBBASE=debian:bookworm-slim
 
+
+FROM ${BASE} as data
+
+RUN mkdir /data
+
+######## Debian: kernel
+FROM ${DEBBASE} as kernel
+
+COPY ./rootfs/sbin /sbin
+
+RUN --mount=target=/var/lib/cache,id=apt,type=cache \
+  --mount=target=/data,from=data,rw \
+   setup-initos debian_rootfs_base
+
+
+######## TODO: Arch
+# Arch 
+#FROM arch:latest as kernel
+#
+#RUN pacman -Syu linux linux-firmware
+
+
+### Generate the binary images - can be used with the basic recovery 
+# to sign and generate the USB
+FROM scratch as out
+COPY --link --from=initos /boot ./
+
+
 #################
-FROM ${BASE} as initos-base
+FROM ${BASE} as builder
 
 # Required if base is setting a different user ( like sunshine )
 # USER root
@@ -25,37 +53,15 @@ FROM ${BASE} as initos-base
 # ENV NO_AT_BRIDGE 1
 
 # Rest of the files added in the last step (to avoid rebuilds)
-COPY ./rootfs/sbin/setup-recovery /sbin/setup-recovery
+COPY ./rootfs /
 
 # Cache the APKs
 RUN  --mount=target=/etc/apk/cache,id=apk,type=cache \
-    /sbin/setup-recovery install 
+    /sbin/setup-efi install 
     
-COPY ./rootfs /
-
-######## Debian: kernel
-FROM ${DEBBASE} as kernel
-
-COPY ./rootfs/sbin/setup-initos /sbin/setup-initos
-
-RUN --mount=target=/var/lib/cache,id=apt,type=cache \
-  setup-initos add_deb_kernel
-
-
-######## TODO: Arch
-# Arch 
-#FROM arch:latest as kernel
-#
-#RUN pacman -Syu linux linux-firmware
-
-
-### Generate the binary images - can be used with the basic recovery 
-# to sign and generate the USB
-FROM scratch as out
-COPY --link --from=initos /boot ./
 
 #################
-FROM initos-base as tmp
+FROM initos-builder as tmp
 
 COPY --from=kernel --link /lib/modules/ /lib/modules
 COPY --from=kernel --link /boot/ /boot/
@@ -65,6 +71,8 @@ RUN /sbin/setup-initos build_initrd
 RUN /sbin/setup-initos recovery_sqfs recovery /boot
 
 #################
-FROM initos-base as initos
+FROM ${BASE} as sidecar
 
-COPY --from=tmp --link /boot/ /boot/
+COPY ./rootfs /
+RUN setup-sidecar install
+

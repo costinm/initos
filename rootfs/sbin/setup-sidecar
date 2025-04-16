@@ -298,6 +298,10 @@ virt_install() {
   unzip /tmp/virtiofsd.zip -d /tmp
   mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd ${d}/virtiofsd
   rm -rf /tmp/target /tmp/virtiofsd.zip
+
+  # Sidecar should be built after the initrd files are generated.
+  # The lib/modules are in the debian file.
+  cp /data/virt/* /opt/virt/
 }
 
 # Optional - using alpine kernel instead of debian kernel.

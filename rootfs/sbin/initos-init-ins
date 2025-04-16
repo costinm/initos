@@ -1,7 +1,5 @@
 #!/bin/bash
 
-. /sbin/initos common
-
 export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # This script runs in the recovery image, after initrd mounts the 
@@ -25,7 +23,7 @@ initos_init() {
 
   load_drivers
 
-  echo "Insecure boot - before switch root, enter 'a' for admin shell"
+  echo "Insecure boot - before switch root, enter 'a' for admin shell at start, b at end"
   read -t 4 -n 1 key
   if [ "$key" = "a" ]; then
     sh 
@@ -34,19 +32,34 @@ initos_init() {
   # This may init the /x drive for testing (credentials on the EFI dir instead
   # of TPM or user input).
   # 
+  # This replaces open_disks using TPM or prompt, may set USE_SYSTEMD for testing debian
+  # as root. If it doesn't mount the disks - will run the installer and wipe the rest of the disk.
   if [ -f /boot/efi/install/autosetup.sh ]; then
     # May call open_disks, mount_btrfs_raw 
     bash -x /boot/efi/install/autosetup.sh init
   fi 
 
-  # If Initos is not already installed - use the files on EFI partition to 
-  # configure networking/ssh. 
+  btrfs device scan --all-devices
+
+  # TODO: use LABEL=INITOSROOT instead of mapper name
+  mount -t btrfs LABEL=INITOSROOT /x
+
+  mount -t btrfs /dev/mapper/luks-1 /x
+
+
+
+  if [ "$key" = "b" ]; then
+    sh 
+  fi 
+
+  # If the test script mounted initos - run it.
+  # otherwise - unatended install.
   if [ -d /x/initos/etc ]; then
     echo "BTRFS mounted on /x using secrets on EFI partition"
    
     # The SQFS image is debian.
-    if [ -f /etc/debian_version ]; then
-      echo "Debian image detected, preparing to start systemd"
+    if [ "$USE_SYSTEMD" = "1" ]; then
+      echo "Starting in debian/systemd mode"
       run_standalone
   
       # From local files - should not be included on local
@@ -57,8 +70,17 @@ initos_init() {
       
       exec /usr/bin/systemd --system
     fi
+
     start_os # May switch root !
-    sh
+
+    echo "After start_os"
+
+    if [ -f /boot/efi/install/autosetup.sh ]; then
+      # May call open_disks, mount_btrfs_raw 
+      bash -x /boot/efi/install/autosetup.sh end
+    fi 
+    # TODO: run autosetup.sh again to do checks or get a shell.
+    exec bash
   else
     echo "Installer mode"
     sh
@@ -120,4 +142,6 @@ patch_rootfs() {
   fi
 }
 
-initos_init
+
+export INSECURE=1
+. /sbin/initos

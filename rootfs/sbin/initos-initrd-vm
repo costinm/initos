@@ -21,23 +21,23 @@ initramfs_init_vm() {
   else
       # kitty and other apps don't work on virtiofs
       mount -t virtiofs /dev/root /sysroot
+      mount -o bind /sysroot /z
   fi
 
   if [ -e /dev/vdb ]; then
     mount -t btrfs -o nobarrier /dev/vdb /x
   fi
 
-  if [ -f /sysroot/swap ]; then
-    swapon /sysroot/swap
-  fi
   
   ifconfig lo up
   ifconfig eth0 up
   ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
   route add default gw $KOPT_initos_gw
 
-  # Test the time to do a start, init, cmd, poweroff
-  if [ -n "$KOPT_initos_cmd1"  ]; then
+  # initcmd is used to debug/test the pre-switch root portion.
+  # It can be a shell or a command to display info and exit (to check startup time to this point)
+  # /sysroot is mounted.
+  if [ -n "$KOPT_initos_initcmd"  ]; then
     ${KOPT_initos_cmd1}
     poweroff -d 0 -f
   fi
@@ -45,23 +45,25 @@ initramfs_init_vm() {
       echo "No rootfs found"
       poweroff -f
   fi
-  cp /sbin/initos* /sysroot/sbin
-  rm -f /sysroot/.dockerenv
+  # cp /sbin/initos* /sysroot/sbin
+  # rm -f /sysroot/.dockerenv
 
+  if [ ! -f /z/sbin/initos-init-vm ]; then
+    mkdir -p /z/sbin
+    cp /sbin/initos* /z/sbin
+  fi
+
+  # Run a single command in the rootfs. Can't poweroff - the command needs to do that (can be a script)
   if [ -n "$KOPT_cmd"  ]; then
-      ${KOPT_cmd} ; poweroff -f 
+      move_mounted_to_sysroot
+      #switch_root /sysroot /bin/sh --  -c "${KOPT_cmd} && poweroff -f"
+      #exec switch_root /sysroot ${KOPT_cmd} 
+      exec switch_root /sysroot /z/sbin/initos-init-vm vm_init ${KOPT_cmd}    
   fi
 
-  if [ -f /z/sbin/initos ]; then 
-    move_mounted_to_sysroot
-    #switch_root /sysroot /bin/sh --  -c "${KOPT_cmd} && poweroff -f"
-    exec switch_root /sysroot /z/sbin/initos vm_init     
-  fi
-
-  cp /sbin/initos-* /sysroot/sbin
   move_mounted_to_sysroot
   #switch_root /sysroot /bin/sh --  -c "${KOPT_cmd} && poweroff -f"
-  exec switch_root /sysroot /sbin/initos-init-vm vm_init
+  exec switch_root /sysroot /z/sbin/initos-init-vm-init-vm vm_init
 }
 
 ## First step - expand busybox and mount the basic filesystems.
