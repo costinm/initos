@@ -3,16 +3,7 @@
 touch /tmp/rc.local
 # Running in a debian systemd .
 # TODO: convert this to a unit
-if [ -d /initos/rootfs ]; then
-    echo "starting initos as sidecar"
-    /initos/rootfs/sbin/initos sidecar
-else 
-    # Fix docker - if it detects a 'router', it'll disable accept.
-    #iptables -I DOCKER-USER -j ACCEPT
-    iptables -P FORWARD ACCEPT
 
-    echo "rc.local started"
-    ifconfig -a
-
-fi
+echo "starting initos as sidecar"
+/initos/sidecar/sbin/initos sidecar
 

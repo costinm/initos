@@ -1,0 +1,485 @@
+#!/bin/bash
+
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Main entry point - called by the init script
+initos_init() {  
+  logi "Starting INITOS TPM2 $(uname -r)"
+
+  # Additional drivers with the real firmware and modules mounted. 
+  load_drivers
+
+  if [ -f /boot/efi/initos/tpm_handle ]; then 
+    unlock_tpm
+
+    open_disks "$KEY"
+  else
+    for i in 1 2 3; do
+      echo
+      echo -n "Enter the disk (LUKS) password (attempt $i of 3): "
+      read -s KEY
+
+      open_disks "$KEY"
+      
+      if [ -e /dev/mapper/luks-1 ]; then
+        break
+      fi
+
+      echo
+      echo "Failed to unlock the disk. Please try again."
+    done
+  fi 
+
+  # LUKS mounted on /x, secure mode.
+
+  # At this point we may have a tpm and may be able to mount
+  # encrypted disk.
+  # If insecure - the TPM should NOT have the key
+  # Without TPM2 - will ask for a password - if it can open the
+  # disk - ok, otherwise panic
+  mount_btrfs_raw /dev/mapper/luks-1 /x
+  if [ $? -eq 0 ]; then
+      logi "BTRFS mounted"
+  else
+      # XXX debug
+      bash 
+      lfatal "Failed to mount btrfs"
+  fi
+
+  start_os
+
+  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
+  /etc/init.d/agetty.tty1 start
+
+  exec tini -s sleep -- infinity 
+}
+
+
+# In case of problems (forgot LUKS, can't ssh):
+# -disable secure mode, this should also clean the LUKS passwords
+# -boot from a USB image.
+#
+# The LUKS image should have a recovery password set.
+# TODO: find a way to identify locked boot loader.
+
+# After mounting /lib/modules and firmware, load all drivers.
+load_drivers() {
+  sysctl -w kernel.printk="0 4 1 7" > /dev/null 2>&1
+
+    # this is normally done by sysinit - we want tpm2 to be loaded
+  # Needs to happen after full firmware and modules are in place
+  hwdrivers > /tmp/hwdrivers.log 2>&1
+
+  #logi "hwdrivers loaded $(ls -l /dev/tpm*)"
+
+  udevadm trigger
+  # echo "Press 'r' for remote recovery"
+  # echo "      'c' for manual LUKS unlock" 
+  # # Also: "a" for admin boot - will enable shells during init
+  # # "s" for starting a shell in the rootfs. Both only in insecure mode.
+  # read -t 4 -n 1 key
+
+  # export MODE=$key
+
+  udevadm settle
+
+  #logi "udevadm settle $(ls -l /dev/tpm*)"
+
+  hwdrivers > /tmp/hwdrivers2.log 2>&1 # TPM seems to need some time to init
+  
+  #logi "hwdrivers2 $(ls -l /dev/tpm*)"
+
+  sysctl -w kernel.printk="2 4 1 7" > /dev/null 2>&1
+}
+
+# All remaining mounted dirs will be moved under same dir in /sysroot,
+# ready to switch_root
+move_mounted_to_sysroot() {
+  # Will be started again in sysroot
+  udevadm control --exit || true
+
+  mkdir -p /initos/rootfs
+  mkdir -p /initos/ro /initos/rw /initos/old /initos/work
+
+  # Will be moved to /sysroot/initos
+  mount -o bind / /initos/rootfs
+  mount -o bind /initos/ro/rootfs /initos/ro/rootfs
+  mount -o bind /initos /initos/old
+
+  # Issues:
+  # /dev/pts
+  # /sysroot/run
+  # /dev/shm
+  # 
+  # From original alpine init
+  cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
+    if [ "$DIR" != "/" -a \
+         "$DIR" != "/sysroot" -a \
+         -d "$DIR" ]; then
+      mkdir -p /sysroot$DIR
+      mount -o move $DIR /sysroot$DIR
+    fi
+  done
+
+  sync
+}
+
+# Info log - shown on console, logged.
+logi() {
+	last_emsg=""$@""
+	echo "INITOS: $last_emsg" > /dev/kmsg
+	echo "INITOS: $last_emsg"
+}
+
+lfatal() {
+  echo "FAILED: "$@""
+  edump
+
+  echo "Rebooting in 20 sec"
+  blkid
+  
+  sleep 20
+  reboot -f
+}
+
+# dump info to the EFI partition (which exists if we managed to get the
+#  kernel running). One goal is to support machines without display/keyboard,
+# install state will be saved on the USB disk.
+# Log destinations:
+# - before 'boot' is mounted: in memory, console on failure to mount boot
+# - after 'boot' is mounted: /z/initos/log on failure, recovery /var/log/boot
+# - after 'rootfs' is mounted, on tmpfs if it works, /boot/efi if not.
+#
+# All 'fatal' logs go to /boot/efi if it is mounted.
+edump() {
+  if [ -d /x/initos ]; then 
+    dst=/x/initos/log
+  else 
+    dst=/boot/efi/log
+  fi
+  mkdir -p $dst
+  
+  # current date and time
+  export LOG_DIR=${dst}/$(date +"%Y-%m-%d-%H-%M-%S")
+  mkdir -p ${LOG_DIR}
+
+  echo "$ORIG_DEVICES" > ${LOG_DIR}/devices_before_mods
+
+  blkid > ${LOG_DIR}/blkid
+  cat /proc/filesystems > ${LOG_DIR}/filesystems
+  cat /proc/devices > ${LOG_DIR}/devices
+
+  mount > ${LOG_DIR}/initrafms.mounts
+  lsmod > ${LOG_DIR}/lsmod.log
+
+  dmesg > ${LOG_DIR}/dmesg.log
+
+  env > ${LOG_DIR}/env.log
+}
+
+# With the KEY from TPM or user input, open any disk that is locked with that key.
+# The disks will use luks-1... IDs - and are expected to have a single multi-disk
+# btrfs root filesystem.
+open_disks() {
+  local KEY=$1
+  # Real blkid - not the busybox one which lacks '-t'
+  # TODO: use a PARTLABEL
+  parts=$(blkid -t TYPE=crypto_LUKS -o device )
+  
+  local cnt=1
+  echo "$parts" | while read -r part; do 
+    echo -n "$KEY" | cryptsetup open $part luks-${cnt} -
+    if [ $? -eq 0 ]; then
+      logi "Opened $part"
+      cnt=$((cnt + 1))
+    else 
+      echo "Attempt to unlock $part failed"
+    fi
+  done
+}
+
+# Read the KEY from TPM. The handle should be in /boot/efi/initos/tpm_handle
+unlock_tpm() {
+  # Arch recommends: 1,2,5,7 ( firmware, firmware options, GPT layout, secure
+  #  boot status)
+  #PCRS="0,1,7"
+  # 2 = pluggable executable code
+  # 3 = pluggable firmware data
+  # 4 = boot manager code
+  # 5 = boot manager data, include GPT partitions
+  # 6 = resume events
+  # 7 = secure boot status, certificates -> This is what 
+  #  we want, gpt layout is not relevant, firmware can be
+  #  upgraded.
+
+  # The setup script makes sure this handle is set - we may try multiple handles or
+  # list nv persistent and try all.
+
+  handle=0x81000001
+
+  if [ -f /boot/efi/initos/tpm_handle ]; then
+    handle=$(cat /boot/efi/initos/tpm_handle)
+  fi
+
+  PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
+  
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle PCR7 failed, try PCR8" 
+    PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8 2>/dev/null)
+  fi 
+  
+  # if [ -z $PASSPHRASE ]; then 
+  #   logi "Handle $handle failed PCR8 try 8100..2 PCR7" 
+  #   handle=0x81000002
+  #   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
+  # fi 
+  if [ -z $PASSPHRASE ]; then 
+    logi "Handle $handle:8 failed, try 81800001" 
+    handle=0x81800001
+    PASSPHRASE=$(tpm2_unseal -c 0x81800001 -p pcr:sha256:7 2>/dev/null)
+  fi 
+  
+  if [ -z $PASSPHRASE ]; then
+    # TODO: Try all other handles. 
+    # The first should be the public key, the seond the disk encryption key
+    HANDLES=$(tpm2_getcap handles-persistent)
+    logi "Persistent handles $HANDLES" 
+    echo "Failed to unlock TPM, fallback to recovery" 
+    return
+  fi
+  export KEY=$PASSPHRASE
+}
+
+mount_btrfs_raw() {
+  local root_device=${1:-/dev/mapper/luks-1}
+  local dst=${2:-/x}
+
+  BTRFS_OPTS=" -o noatime -o nodiratime"
+  #  -o compress -o nobarrier 
+
+  mkdir -p ${dst}
+ 
+  btrfs device scan --all-devices
+
+  # TODO: use LABEL=INITOSROOT instead of mapper name
+  mount -t btrfs LABEL=INITOSROOT ${dst}
+  if [ $? -ne 0 ]; then
+    mount -t btrfs "${root_device}" ${dst}
+    if [ $? -ne 0 ]; then
+        logi "Error: Failed to mount BTRFS partition ${root_device}"
+        return 1
+    fi
+  fi
+}
+
+
+# Persistent disk mounted on /x
+# Mount /sysroot from the BTRFS subvolume, mount additional volumes.
+mount_sysroot() {
+  # This is the first LUKS device open
+  root_device=/dev/mapper/luks-1
+  x=/x
+
+  if [ -f ${x}/swap ]; then
+    swapon ${x}/swap
+  fi
+
+  if [ -z $INITOS_ROOT ]; then
+    if [ -d "${x}/@" ]; then
+      INITOS_ROOT="@"
+    else
+      INITOS_ROOT="NOTFOUND"
+    fi
+  fi
+
+  mkdir -p /sysroot
+  if [ -d ${x}/${INITOS_ROOT} ]; then
+    logi "USING /x/$INITOS_ROOT as 'main' OS"
+
+    mount -t btrfs "${root_device}" /sysroot -o subvol=${INITOS_ROOT} \
+      -o noatime -o nodiratime
+    if [ $? -ne 0 ]; then
+      logi "Error: Failed to mount BTRFS partition ${INITOS_ROOT}, fallback to recovery"
+    fi
+  fi
+
+  if [ -d ${x}/@home ] ; then
+    mount -o bind ${x}/@home /home
+  fi
+  if [ -d /x/containers ]; then
+    mount -o bind /x/containers /var/lib/containers
+  fi
+  if [ -d ${x}/@cache ]; then
+    mount -o bind ${x}/@cache /var/cache
+  fi
+  if [ -d ${x}/@log ]; then
+    mount -o bind ${x}/@log /var/log
+  fi
+  
+  if [ -d ${x}/initos/etc ] ; then
+    cp -a ${x}/initos/etc /etc
+  fi
+
+  if [ -d ${x}/initos/root ] ; then
+    mount -o bind ${x}/initos/root /root
+  fi
+
+}
+
+upstamp() {
+  # 10 ms precision
+  read up rest </proc/uptime
+  t1="${up%.*}${up#*.}0"
+  echo $t1
+}
+
+# Scan /sys for 'modalias', sort and load the modules.
+# This should load TPM if it is available
+hwdrivers() {
+  find /sys -name modalias -type f -print0 | xargs -0 sort -u | xargs modprobe -b -a
+}
+
+# Called after the /x partition has been mounted.
+start_os() {
+  # At this point we have an encrypted disk (or we need to load recovery)
+  if [ -f /x/initos/initos.env ]; then
+    . /x/initos/initos.env
+  fi
+  
+  mount_sysroot
+
+  if [ ! -d /sysroot/etc ]; then
+    logi "INITOS_ROOT not set, running as primary - additional OS as VMs/pods"
+    run_standalone
+    # TPM will sleep, insecure will have a shell
+    return
+  fi
+
+  logi "INITOS_ROOT set and mounted, prepare to switch_root and restart as InitOS sidecar"
+
+  ver=$(uname -r)
+  # if [ ! -d /sysroot/lib/modules/$ver ]; then 
+  #    # should also be done at install time - but kernel may change.
+  #    # Nvidia drivers need to be re-installed on the main OS
+  #    cp -a /lib/modules/${ver} /sysroot/lib/modules
+  #    touch /sysroot/lib/modules/${ver}/FROM_EFI
+  # fi
+  
+  # Don't forget to clean /etc/machine-id, systemd, etc before switching
+  set -x 
+  # The EFI may push updates. 
+  cp /sbin/setup-initos* /sysroot/sbin
+  cp /sbin/initos* /sysroot/sbin
+  mkdir -p /sysroot/var/initos # Local files and boot next
+  cp -a /var/initos /sysroot/var/
+
+  # This works if the debian includes the kernel modules (copy above)
+  # commented out for now to test the sqfs modules
+  # umount /lib/modules/${ver}
+  # # May need to do it 
+  # mount -o bind /x/${INITOS_ROOT}/usr/lib/modules/${ver} /lib/modules/${ver}
+  set +x
+
+  # requires rc-local systemd service, since systemd kills all processes
+  # This will run 'sidecar', which starts initos in a chroot.
+  #cp /etc/rc.local ${rootfs}/etc
+
+  if [ -f /sysroot/init ]; then
+    logi "Preparing to switch root $INITOS_ROOT - custom init"
+    move_mounted_to_sysroot
+    exec switch_root /sysroot /init
+  elif [ -f /sysroot/lib/systemd/systemd ]; then
+    logi "Preparing to switch root $INITOS_ROOT (systemd)"
+    move_mounted_to_sysroot
+    exec switch_root /sysroot /usr/bin/systemd --system 
+    #  systemd --log-level=err --unit=rescue.target --system --default-standard-output=tty --default-standard-error=tty
+  elif [ -f /sysroot/sbin/init ]; then
+    logi "Preparing to switch root $INITOS_ROOT"
+    move_mounted_to_sysroot
+    exec switch_root /sysroot /sbin/init
+  fi
+
+  lfatal "Failed to switch root"
+}
+
+
+
+# After the LUKS has been opened and /x mounted - we can either run another (debian, arch) OS as 'root' 
+# with full access to hardware or run it in VMs/jails, keeping InitOS as the main OS.
+run_standalone() {
+  echo
+  echo
+  logi "Starting INITOS standalone"
+  
+  # Configs baked into EFI /local dir 
+  if [ -d /var/intos/local/etc ]; then
+    cp -a /var/initos/local/etc/* /etc
+  fi
+
+  if [ -d /x/initos/root ]; then
+    mount -o bind /x/initos/root /root 
+  fi
+  mkdir -p /root/.ssh
+  if [ ! -f /root/.ssh/authorized_keys ]; then
+    # Allow local override (to add more keys usually). This is for 
+    # the 'sidecar' OS.
+    cp /var/initos/local/authorized_keys /root/.ssh/authorized_keys
+  fi
+
+  # The encrypted disk is trusted.
+  if [ -d /x/initos/etc ]; then
+    cp -a /x/initos/etc/* /etc
+  fi
+  cp /var/initos/local/root.pem /etc 
+
+  if [ -f /etc/hostname ]; then 
+    hostname $(cat /etc/hostname)
+  fi
+
+  if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
+      ssh-keygen -q -f /etc/ssh/ssh_host_ecdsa_key -N '' -t ecdsa
+  fi
+
+  chown -R root /root
+  if [ ! -f /etc/resolv.conf ]; then
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+  fi
+
+  # Otherwise screen saver doesn't unlock... PAM
+  chmod u+s /usr/sbin/unix_chkpwd
+ 
+  # Not using init - openrc (like s5) is just a launcher for 
+  # initialization scripts.
+  /sbin/openrc sysinit
+  /sbin/openrc boot
+  
+  # Normall init starts this with 'wait'
+  /sbin/openrc default
+
+  # Started by openrc
+  # busybox syslogd -C1024
+
+  # Show the interfaces
+  ifconfig -a
+  cat /etc/ssh/*.pub 
+
+  if [ -f /x/initos/start ]; then 
+    # This can start VMs/docker images/etc
+    # Remember: this is insecure, unprotected - no secrets or 
+    # important stuff. Anyone who has access to the machine can
+    # do whatever they want and read everything - just like any
+    # unencrypted machine, regardless of OS.
+    sh -x /x/initos/start
+  fi
+}
+
+if [ "$$" = "1" ]; then
+  if [ "$INSECURE" = "1" ]; then
+    ins_initos_init
+  else
+    initos_init
+  fi
+else
+  "$@"
+fi
+

@@ -1,0 +1,7 @@
+{
+    "cpus":{"boot_vcpus": 4, "max_vcpus": 4},
+    "payload":{"kernel":"/opt/virt/vmlinuz", "cmdline":"console=ttyS0 console=hvc0 rw net.ifnames=0 initos.ip=172.17.3.2 initos.gw=172.17.3.1"},
+    "rng":{"src":"/dev/urandom"},
+    "fs":{"tag": "/dev/root", "num_queues": 1, "socket": "/run/vm-1/ch.sock"},
+    "net":[{"ip":"172.17.3.1", "mask":"255.255.128.0", "mac":"12:34:56:78:90:01", "tap": "vm-1", "iommu": "on"}]
+}

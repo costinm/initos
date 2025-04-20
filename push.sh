@@ -26,12 +26,32 @@ POD=${POD:-initos}
 
 # The builder generates output to /data/efi, which is mapped to $WORK
 # on the host
-WORK=${HOME}/.cache/${POD}/efi
+WORK=${HOME}/.cache/${POD}
 
+# Update the scripts and kernel for running virtual machines (and containers)
+# The sidecar includes this as well, but may change independently
+# (at least while dev in progress)
+# 
+# This may become a separate container - pulled with crane/docker export.
+# The kernel for VM can be different from the distro kernel.
+push_virt() {
+  host=$1
+
+  rsync -ruvz -I --inplace ${WORK}/virt/  $host:/x/opt/virt/
+  rsync -ruvz -I --inplace ./virt/  $host:/x/opt/virt/
+
+
+}
 
 push() {
   host=${1:-${CANARY}}
   shift
+
+  if [ "$host" = "virt" ]; then
+    push_virt "$@"
+    return
+  fi
+
   set -xe
 
   # Build the EFI for the host, including host-specific configs
@@ -39,20 +59,20 @@ push() {
   # Should not be large, just signing keys and core configs
   ${SRCDIR}/sign.sh $host
 
-  newh=$(cat ${WORK}/initos/initos.hash )
+  newh=$(cat ${WORK}/efi/initos/initos.hash )
 
-  mkdir -p ${WORK}/install
-  echo ${host} > ${WORK}/install/hostname
+  mkdir -p ${WORK}/efi/install
+  echo ${host} > ${WORK}/efi/install/hostname
 
   # Temp while testing, should go to .ssh/initos/hosts/NAME
-  cp testdata/test_setup ${WORK}/install/autosetup.sh
+  cp testdata/test_setup ${WORK}/efi/install/autosetup.sh
 
   # TODO: this should go to the sidecar, should use the script
   # to mount the alternate partition
   ssh $host /sbin/setup-initos-host upgrade_start ${newh}
   
   # Ignore the timestamp, inplace because the EFI is small (default creates a copy)
-  rsync -ruvz -I --inplace ${WORK}/  $host:/boot/b
+  rsync -ruvz -I --inplace ${WORK}/efi/  $host:/boot/b
 
   ssh $host cat /boot/b/initos/initos.hash
   

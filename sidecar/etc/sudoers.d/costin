@@ -1,0 +1,3 @@
+
+# TODO: move to ~/.ssh/initos/... along with other private settings
+costin ALL=(ALL:ALL) NOPASSWD: ALL

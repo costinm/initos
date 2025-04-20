@@ -1,4 +1,0 @@
-#!/bin/sh
-
-export HOME=/home/build
-exec login -f build -p

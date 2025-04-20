@@ -71,24 +71,11 @@ build_initrd() {
 }
 
 
-# Generate an unsigned efi image, based on alpine with a custom init script.
-# alpine_initrd is run in an alpine container, rescue or chroot.
+# Creat a sqfs under $1 with the name $2, containing all files in this 
+# container. 
 #
-# The init image will be generated in /boot/initramfs.
-# Modules are expected to be in /lib/modules/modules-KERNEL_VERSION
-# Kernel is expected to be in /boot/vmlinux-KERNEL_VERSION
-#
-# For secure mode, kernel+initrd+cmdline are signed, but the rootfs needs to
-# be either signed or on a LUKS partition ( where encryption+signing happens as well).
-#
-# In the first case, normally the SHA of the rootfs needs to be passed as an argument
-# either in kernel cmdline or as a file in initrd.
-#
-# The '@firmware' and '@modules' subvolumes must also be created
-# if using separate volumes - for now they're in @recovery rootfs.
-
-# Add the current docker image to an existing SQFS file.
-# This is useful if the kernel+modules+firmware is created independently.
+# Another way is to export (pull and export or using crane) and create 
+# the sqfs externally.
 sqfs() {
   local DIR=${1:-/data/efi/initos}
   local name=${2:-initos}
@@ -110,9 +97,6 @@ sqfs() {
 
   cd /
 
-  # in case they are still around
-  rm -rf /etc/uefi-keys 
-  
   # Doesn't include /boot files (kernel is separate)
   # Includes both normal and cloud modules
   mksquashfs . ${DIR}/${name}.sqfs \
@@ -120,17 +104,16 @@ sqfs() {
      -e "x/.*" \
      -e "etc/uefi-keys" \
      -e ".dockerenv" \
-     -e "boot/.*" \
      -e "data/.*" \
      -e "proc/.*" \
      -e "sys/.*" \
      -e "run/.*" \
-     -e "work/.*" \
-     -e "ws/.*" \
      -e "tmp/.*" \
      -e "var/cache/apt/.*" \
      -e "etc/apk/cache.*"
     
+  # Not excluding boot, lib - work and ws are no longer mounted (old versions)
+
   echo "Created ${DIR}/${name}.sqfs"
 }
 
@@ -144,16 +127,6 @@ alpine_clear() {
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
 
-debian_rootfs() {
-  add_deb_kernel
-  
-  add_deb_core
-
-  add_deb_kernel_nvidia
-  
-  save_lib
-  sqfs
-}
 
 debian_rootfs_base() {
   add_deb_kernel
@@ -215,15 +188,18 @@ add_deb_kernel_nvidia() {
  
 }
 
-# Save_lib is used in the debian image to save the kernel and modules on 
-# /data, to be used by the 'sign' image.
+# Save the kernel and modules on /data, to be used by the 'sign' image and
+# to build the initrd.
+# Dockerfile is bind-mounting from the kernel stage - with buildah it is faster
+# to copy (at least on btrfs, COW) - it can't mount from a container and creating
+# an image involves tar, so no longer COW.
 #
 # The other choice is to have a large 'sign' image that bundles the kernel
 # and modules and is updated with every kernel release. 
 # Since one way or another we need /data and /config for signing, we may 
 # as well use a separate step of creating the boot/ and lib/modules which
 # don't change except on new kernel releases.
-save_lib() {
+save_boot() {
   mkdir -p /data/lib /data/boot
   cp -a /boot/* /data/boot
   cp -a /lib/modules /data/lib
@@ -237,7 +213,7 @@ add_deb_kernel() {
 
   apt update
   export INITRD=No
-  apt install -y --no-install-recommends \
+  $APTINSTALL \
    linux-image-amd64 firmware-misc-nonfree \
      firmware-linux-free \
        firmware-realtek \
@@ -270,7 +246,7 @@ add_deb_kernel() {
   # Also install the cloud kernel - upgrade them at the same cadence, and
   # will be used to run the real root as a VMs for more security.
   # Images grows from 795 -> 909 M, Initos image from 568-> 634
-  apt install -y --no-install-recommends \
+  $APTINSTALL \
      linux-image-cloud-amd64
 
   # Can't stop the creation - but not used. Just need the kernel and modules.
@@ -280,7 +256,7 @@ add_deb_kernel() {
 add_virt_kernel() {
   apt update
   export INITRD=No
-  apt install -y --no-install-recommends \
+  %APTINSTALL  \
      linux-image-cloud-amd64
   ver=$(ls /lib/modules)
   echo -n ${ver} > /boot/versionv
@@ -296,31 +272,38 @@ add_virt_kernel() {
 # This runs in an alpine container (for now) - the init will be based
 # on the ligher musl binaries.
 vinit() {
+  local DEST=${1:-/data/virt}
+
   VER=$(ls /lib/modules | grep cloud | tail)
 
-  mkdir -p /data/virt
+  mkdir -p ${DEST}
 
-  cp /boot/vmlinuz-${VER} /data/virt/vmlinuz
+  cp /boot/vmlinuz-${VER} ${DEST}/vmlinuz
   # btrfs is pretty slow for a VM - the rootfs may have all the modules
   # and load it as needed.
   # squashfs may not be needed if modules/firmware are on the ext4 rootfs
   # or on virtio.
-  mkinitfs -k  -i /sbin/initos-initrd-vm \
+  mkinitfs -k  -i /opt/virt/initos-initrd-vm \
      -F "base btrfs virtio initosvm" \
-     -o /data/virt/initramfs ${VER}
-
+     -o ${DEST}/initramfs ${VER}
 }
 
-vinitl() {
-  VER=$(ls /lib/modules | grep cloud | tail)
-  mkinitfs -k  -i /sbin/initos-initrd-vm \
-     -F "base btrfs virtio initosvm" \
-     -o /opt/virt/initramfs ${VER}
-}
 
 setup_initrd() {
   build_initrd 
   vinit
+}
+
+# Single step (using crate to pull the 2 rootfs), or using docker export
+buildFromExport() {
+  # Check if the files exist (can be created with docker export)
+  #crane export  git.h.webinf.info/costin/initos-sidecar:latest /data/sidecar
+  crane export  ${REPO}/initos-sidecar:${TAG} | tar -C /data/sidecar -xf - 
+  crane export  ${REPO}/initos-rootfs:${TAG} | tar -C /data/rootfs -xf -
+  rm -rf /data/efi/initos/sidecar*
+  (cd /data/sidecar ;  mksquashfs . /data/efi/initos/sidecar.sqfs  ) 
+  rm -rf /data/efi/initos/initos*
+  (cd /data/rootfs ;  mksquashfs . /data/efi/initos/initos.sqfs ) 
 }
 
 # debootstrap_kernel() {

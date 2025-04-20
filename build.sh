@@ -1,8 +1,13 @@
 #!/bin/bash
 
-# Build the InitOS images and EFI files, using Buildah. A separate build
-# using Dockerfile is still available.
+# Build the InitOS images and EFI files, using Buildah, user-space. 
+# A separate build using Dockerfile is also available.
 #
+# Buildah userspace notes:
+# - It is not possible to do mknod on rootless - so inside the 
+# container it won't be able to do debootstrap or similar. 
+# - uses ~/.local/share/containers/ 
+
 
 SRCDIR=$(dirname "$(readlink -f "$0")")
 . ${SRCDIR}/env
@@ -11,6 +16,101 @@ export POD=${POD:-initos}
 # Output generated here
 export WORK=${HOME}/.cache/${POD}
 
+# git.h.webinf.info/costin
+REPO=${REPO:-ghcr.io/costinm/initos}
+TAG=${TAG:-latest}
+
+# For the docker build variant.
+export DOCKER_BUILDKIT=1
+
+set -e
+
+
+# Rebuild the builder image.
+# It cleans and get current kernel and alpine.
+# About 8 min
+all() {
+  rm -rf ${WORK}/*
+  buildah rm kernel | true
+  # Get the latest kernel. 'kernel' container
+  # When kernel changes, rebuild everything.
+  kernel
+  buildah rm initos-sidecar | true
+  sidecar
+
+  # The remaining steps are are using the images built above.
+  # The sidecar requires kernel 'save_boot' to be called first.
+
+  # Generate the copy the kernel+modules to /data
+  gen
+}
+
+# Gen is called after the 2 containers are build or pulled/started
+gen() {
+  _run_cmd kernel /sbin/setup-initos save_boot
+  # Generate the initrd files (on /data), virtual initrd is copied 
+  # over to the sidecar container 
+  initrd
+
+  # Build the SQFS with the kernel.
+  updateDeb
+  updateAlpine
+
+  ./sign.sh
+}
+
+# kernel (on new debian releases, very slow) - includes modules, firmware and nvidia driver, 
+# plus base packages. 
+# Can be extended with more debian packages.
+# This also generates /data/efi/initos/initos.sqfs and /data/lib, boot for later stages.
+kernel() {
+  _build_cmd debian:bookworm-slim kernel /sbin/setup-initos debian_rootfs_base
+
+}
+
+# The image for building and signing the EFI
+# signer() {
+#   _build_cmd alpine:edge initos-builder  setup-efi install
+# }
+
+
+# Generate the initrd images, using initos-builder and the kernel modules
+# Must be regenerated after kernel changes - the scripts are patched when generating the EFI.
+initrd() {
+  buildah copy initos-sidecar rootfs/sbin /sbin
+  buildah copy initos-sidecar sidecar/sbin /sbin
+  buildah copy initos-sidecar virt /opt/virt
+
+  buildah run -v ${WORK}:/data \
+    -v ${WORK}/boot:/boot \
+    -v ${WORK}/lib/modules:/lib/modules \
+    -v ${WORK}/lib/firmware:/lib/firmware \
+    initos-sidecar \
+      setup-initos setup_initrd
+}
+
+# Build the initos alpine rootfs.
+sidecar() {
+  _build_cmd alpine:edge initos-sidecar  setup-sidecar install
+  # Add the sidecar-specific files
+  buildah copy initos-sidecar sidecar/etc /etc
+
+}
+
+
+# Can run commands with 'buildah run kernel' - this updates the sqfs.
+updateDeb() {
+  rm -rf ${WORK}/efi/initos*
+  _run_cmd kernel setup-initos sqfs /data/efi/initos
+  #"$@"
+}
+
+updateAlpine() {
+  rm -rf ${WORK}/efi/sidecar*
+  _run_cmd initos-sidecar setup-initos sqfs /data/efi/initos sidecar
+  #"$@"
+}
+
 # Start a container using $1 image, with the name $2 - rest of the args are run in the container.
 # The work dir is mounted as /data, with additional mounts for apt and apk cache.
 _build_cmd() {
@@ -18,8 +118,8 @@ _build_cmd() {
   local POD=$2
   shift; shift
 
-  buildah containers --format {{.ContainerName}} | grep ${POD} > /dev/null
-  if [ $? -ne 0 ]; then
+  if ! buildah containers --format {{.ContainerName}} | grep ${POD} > /dev/null; then
+ # if [ $? -ne 0 ]; then
      buildah pull ${BASE}
      buildah --name ${POD} from ${BASE}
     # Cache directories - deb and alpine
@@ -43,80 +143,20 @@ _run_cmd() {
   VOLS="$VOLS -v ${WORK}:/data"
 
   buildah copy ${POD} rootfs/sbin /sbin
-  buildah copy ${POD} rootfs/bin /bin
-  buildah copy ${POD} rootfs/etc /etc
 
   buildah run ${VOLS} ${POD} -- "$@"
-}
-
-# Rebuild the builder image.
-# It cleans and get current kernel and alpine.
-all() {
-  buildah rm kernel
-  kernel
-  buildah rm initos-builder
-  signer
-  initrd
-  buildah rm initos-sidecar
-  sidecar
-
-  ./sign.sh
-}
-
-# kernel (on new debian releases, very slow) - includes modules, firmware and nvidia driver, 
-# plus base packages. 
-# Can be extended with more debian packages.
-# This also generates /data/efi/initos/initos.sqfs and /data/lib, boot for later stages.
-kernel() {
-  _build_cmd debian:bookworm-slim kernel /sbin/setup-initos debian_rootfs
-}
-
-# The image for building and signing the EFI
-signer() {
-  _build_cmd alpine:edge initos-builder  setup-efi install
-}
-
-
-# Generate the initrd images, using initos-builder and the kernel modules
-# Must be regenerated after kernel changes - the scripts are patched when generating the EFI.
-initrd() {
-  buildah copy initos-builder rootfs/sbin /sbin
-
-  buildah run -v ${WORK}:/data \
-    -v ${WORK}/boot:/boot \
-    -v ${WORK}/lib/modules:/lib/modules \
-    -v ${WORK}/lib/firmware:/lib/firmware \
-    initos-builder \
-      setup-initos setup_initrd
-}
-
-# Build the initos alpine rootfs.
-sidecar() {
-  _build_cmd alpine:edge initos-sidecar  setup-sidecar install
-  
-  # Build the SQFS.
-  updateAlpine
-}
-
-
-# Can run commands with 'buildah run kernel' - this updates the sqfs.
-updateDeb() {
-  rm -rf ${WORK}/efi/initos*
-  _run_cmd kernel setup-initos sqfs /data/efi/initos
-  #"$@"
-}
-
-updateAlpine() {
-  rm -rf ${WORK}/efi/sidecar*
-  _run_cmd initos-sidecar setup-initos sqfs /data/efi/initos sidecar
-  #"$@"
+  buildah copy ${POD} rootfs/etc /etc
 }
 
 # Experimental targets
 
-dockerb() {
-   docker build --network host --target kernel  . -t costinm/initos-rootfs
+# Build the docker images (normally done by the github actions)
+dockerc() {
+   docker build --network host --target kernel  . -t ${REPO}/initos-rootfs:${TAG}
+   docker build --network host --target builder  . -t ${REPO}/initos-builder:${TAG}
+   docker build --network host --target sidecar  . -t ${REPO}/initos-sidecar:${TAG}
 }
+
 
 if [ -z "${1+x}" ] ; then
   echo "Building the images for InitOS kernel, root and EFI builder"

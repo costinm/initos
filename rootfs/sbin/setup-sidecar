@@ -1,17 +1,9 @@
 #!/bin/sh
 
-# TODO: rename to setup-initos-sidecar or setup-initos-base
-# it was originally for 'recovery' only
-
-### Alpine specific packages for:
-# - alpine-based rootfs - servers without Nvidia
-# - rootfs with UI for laptops.
-#
-# Not using "--no-cache" - the cache dir should be mounted
-# to /var/cache/apk/[INDEX] and /etc/apk/cache 
 
 # Default target for recovery in docker
 install() {
+  add_builder
   alpine_add_common
   alpine_add_base
   alpine_add_recovery
@@ -79,6 +71,29 @@ install() {
   rm -rf /tmp/*
 }
 
+# Packages for generating the initrd.
+# This can be used to create a standalone signer/builder - but 
+# for now moving it back to the sidecar, simpler.
+# 
+# To check: gzip -dc ../initos-initrd.img | cpio -idmv
+add_builder() {
+  apk add ca-certificates-bundle curl \
+   efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
+   cryptsetup mkinitfs zstd \
+  openssl openssh openssh-keygen \
+     eudev eudev-hwids udev-init-scripts \
+      udev-init-scripts-openrc \
+      dosfstools 
+  
+  # Udev used in initrd
+  
+  apk del busybox-mdev-openrc mdev-conf || true
+
+  echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
+
+  # To create IMGs:   dosfstools parted 
+}
+
 # Useful packages for a host. 
 alpine_add_common() {
   echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
@@ -89,7 +104,9 @@ alpine_add_common() {
   #apk add alpine-base # Installs openrc
   apk add ifupdown-ng libcap2  openrc \
     alpine-conf  alpine-release  busybox-openrc \
-    busybox-suid bash
+    busybox-suid bash \
+      crane bash-completions mc
+  
 
   # Not sure: this seems to take over some interfaces  
   # dhcpcd
@@ -117,7 +134,7 @@ alpine_add_common() {
     htop haveged \
     iproute2 \
     sudo strace util-linux bridge \
-    socat tcpdump iputils procps
+    socat tcpdump iputils procps hdparm
   
   # init with a single process. Can reap even if not running as PID1.
   apk add tini
@@ -328,50 +345,6 @@ virt_install() {
 #   #du -sh /lib/firmware
 #   df -h
 # }
-
-# Wayland UI. Using alpine setup-desktop, which adds 
-# - dbus, elogind, firefox, foot.
-# The sqfs moves from ~310M to 580M
-# The build time also increases from 7 to 9 min 
-wui() {
-  #  apk add mesa-dri-gallium
-
-  # Built in option in Alpine.
-  setup-desktop sway
-  
-  # Conflicts with rofi - host will not expose X11/kasm anyway,
-  # that should be only in VMs/pods.
-  apk add rofi-wayland rofi-pass rofi-top
-
-  # labwc (pi) can be used instead of sway, OpenBox-based with ALT-TAB
-  apk add labwc
-
-  # make sure video, input, seat groups are added to the UI user
-  apk add seatd polkit 
-  addgroup build seat
-
-  apk add sway mc bash bash-completion
-}
-
-
-# Native X UI
-xui_alpine() {
-  apk add i3wm dbus-x11
-  apk add tint2 rofi alttab i3status
-  apk add xorg-server
-  apk add xinit
-  
-  apk add kitty kitty-kitten # required
-  apk add firefox # esr is the less updated long term
-
-#  apk add xset
-#  apk add xrandr
-#  apk add xmodmap
-#  apk add xinput
-#  apk add xhost
-#  apk add xkill
-}
-
 
 
 "$@"

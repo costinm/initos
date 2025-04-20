@@ -1,0 +1,107 @@
+#!/bin/sh
+
+# Setup a VM or container.
+# 
+# - starts with an OCI image or already expanded rootfs
+# - generate startup scripts
+
+
+fix() {
+    setcap cap_net_admin+ep /opt/virt/cloud-hypervisor
+}
+
+from() {
+    local img=$1
+
+    mkdir -p /x/vol/${POD}
+
+}
+
+vm() {
+    cd /x/vol/${POD}
+    
+}
+
+# mkdisk will create (or overrite) a BTRFS image and pre-populate it with a rootfs.
+mkdisk() {
+  local img=$1
+
+  mkdir -p ${IMGDIR}
+  truncate -s ${vm_disk} ${IMGDIR}/${VM}.img
+  # Same as - but simpler/faster than
+  # qemu-img create -f raw ${WORK}/disk.img 10G
+
+  # Can be mounted using:
+  #dev=$(losetup -f ${WORK}/disk.img --show)
+
+  mkdir -p ${WORK}/rootfs
+
+  mkfs.btrfs ${IMGDIR}/${VM}.img --rootdir ${WORK}/rootfs
+  #parted $dev mklabel gpt
+
+  # --shrink will keep the image at the required size - can be used for a base image.
+}
+
+# Download the binaries required for running VMs.
+# 
+# Currently using cloud-hypervisor and virtiofsd.
+# 
+# Duplicated in setup-sidecar - remove from there after moving all virt to 
+# separate containers.
+virt_install() {
+  local d=/x/opt/virt
+  mkdir -p $d
+  local latest=v44.0
+  curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/ch-remote \
+    -o ${d}/ch-remote
+  chmod +x ${d}/ch-remote
+  # Tested 
+  curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/cloud-hypervisor-static \
+     -o ${d}/cloud-hypervisor
+  chmod +x ${d}/cloud-hypervisor
+
+  # Alpine lacks wget -L
+  curl -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish \
+     -o /tmp/virtiofsd.zip
+  unzip /tmp/virtiofsd.zip -d /tmp
+  mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd ${d}/virtiofsd
+  rm -rf /tmp/target /tmp/virtiofsd.zip
+
+  # Sidecar should be built after the initrd files are generated.
+  # The lib/modules are in the debian file.
+  cp /data/virt/* /opt/virt/
+}
+
+# Use the initos-base image to copy $1 image to $2 local dir.
+# Alternative to 'crane export' - without remote push.
+exportfs() {
+  buildah --name orig from $1
+  
+  buildah run \ 
+     -v $2:/data
+     --mount=type=bind,from=orig,src=/,dst=/mnt \
+    initios-base -- cp -a /mnt/ /data
+  
+  buidah rm orig
+}
+
+# Makes the VM initrd. Runs inside the initos-sidecar image
+# (or in the real sidecar)
+initrd() {
+  BASE=${BASE:-/initos/rootfs}
+  DEST=${DEST:-/x/opt/virt}
+  #SRC=${SRC:-/x/opt/virt}
+  SRC=${SRC:-/home/costin/ws/initos/virt}
+  
+  VER=$(ls ${BASE}/lib/modules | grep cloud | tail)
+  
+  ln -s ${BASE}/lib/modules/${VER} /lib/modules || true
+  cp ${BASE}/boot/vmlinuz-${VER} ${DEST}/vmlinuz
+
+  mkinitfs -k  -i ${SRC}/initos-initrd-vm \
+     -F "base btrfs virtio initosvm" \
+     -o ${DEST}/initramfs ${VER}
+}
+
+
+"$@"

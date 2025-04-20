@@ -307,7 +307,7 @@ addbtrfs() {
   local DPATH=${2:-/x}
 
   btrfs device add /dev/mapper/${MAPPER} ${DPATH}
-
+  btrfs filesystem show
 }
 
 # Initialize the /x BTRFS disk with expected volumes and files
@@ -489,6 +489,31 @@ get_firmware_info() {
   done
 }
 
+create_primary() {
+  mkdir /boot/efi/initos
+
+  # On Chromebook, only -C p works. On another laptop - default only (owner), -C e also works .
+    # -C hierarch - e for endorsement, default is owner, also platform
+    # -g sha256 - default
+    # -G defaults to rsa2048:null:aes128cfb
+    # -c file - where to store the 'context' (info about key)
+  tpm2_createprimary  -c primary.ctx --format=pem \
+     --output=primary_pub.pem ${TPM_KIND}
+ 
+
+    # displays info - including key handle (it seems to be temporary )
+  tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
+    ### Handle: 0x80000000, sequence: 2, 6, 10, etc - size 1914
+ 
+  tpm2_evictcontrol -c ${PRIMARY} # Delete the old key with this ID
+    # Get a persistent handle
+  tpm2_evictcontrol -c primary.ctx -o primary.tr ${TPM_KIND} # Save the key - should have the same ID
+  # persistent-handle: 0x8100...0
+  tpm2 print -t ESYS_TR primary.tr
+  # TODO: extract hndle - this is a long test
+  tpm2 print -t ESYS_TR primary.tr > /boot/efi/initos/tpm_primary
+}
+
 set_pass() { 
   mkdir -p /initos/tpm
   cd /initos/tpm
@@ -516,40 +541,22 @@ set_pass() {
 
   cp key.pub /boot/efi/initos/tpm_key.pub
 
-  tpm2_evictcontrol -c ${HANDLE} # Delete the key. key.ctx too
+  #tpm2_evictcontrol -c ${HANDLE} # Delete the key. key.ctx too
   # Can use primary.ctx instead of handle ID. 
   # Should save to EFI the handles to avoid loading.
     # -c - the out file for the context for the key
     # tpm2_create generates the 'export' files.
   tpm2_load -C ${PRIMARY} -u key.pub -r key.priv -c key.ctx -n key.name
+  
   tpm2_evictcontrol -c key.ctx ${TPM_KIND}
+
   tpm2_print -t TPMS_CONTEXT key.ctx > /boot/efi/initos/tpm_handle # -> Handle: 0x80000000
+  
+  # TODO: parse the handle only.
+
 #   # persistent-handle: 0x81000001
 }
 
-create_primary() {
-  mkdir /boot/efi/initos
-
-  # On Chromebook, only -C p works. On another laptop - default only (owner), -C e also works .
-    # -C hierarch - e for endorsement, default is owner, also platform
-    # -g sha256 - default
-    # -G defaults to rsa2048:null:aes128cfb
-    # -c file - where to store the 'context' (info about key)
-  tpm2_createprimary  -c primary.ctx --format=pem \
-     --output=primary_pub.pem ${TPM_KIND}
- 
-
-    # displays info - including key handle (it seems to be temporary )
-  tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
-    ### Handle: 0x80000000, sequence: 2, 6, 10, etc - size 1914
- 
-  tpm2_evictcontrol -c ${PRIMARY} # Delete the old key with this ID
-    # Get a persistent handle
-  tpm2_evictcontrol -c primary.ctx -o primary.tr ${TPM_KIND} # Save the key - should have the same ID
-  # persistent-handle: 0x8100...0
-  tpm2 print -t ESYS_TR primary.tr
-  tpm2 print -t ESYS_TR primary.tr > /boot/efi/initos/tpm_primary
-}
 
 # Mokutil requires a corresponding EFI.
 # /usr/share/efitools contains a set of EFI programs.

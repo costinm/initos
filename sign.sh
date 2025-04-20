@@ -18,7 +18,7 @@ POD=${POD:-initos}
 # Output generated here
 WORK=${HOME}/.cache/${POD}
 
-IMAGE_SIGNER=${REPO}/initos-builder:latest
+IMAGE_SIGNER=${REPO}/initos-sidecar:latest
 
 mkdir -p ${SECRET}/uefi-keys ${WORK}
 
@@ -48,14 +48,15 @@ echo "Signer image: ${IMAGE_SIGNER}"
 efi() {
   # The pod containing the image to be signed and the utils.
 
-  buildah containers --format {{.ContainerName}} | grep initos-builder > /dev/null
+  buildah containers --format {{.ContainerName}} | grep initos-sidecar > /dev/null
   if [ $? -ne 0 ]; then
-     buildah --name initos-builder from ${IMAGE_SIGNER}
+     buildah --name initos-sidecar from ${IMAGE_SIGNER}
      echo starting 
   fi
 
   # Update with latest files, optional
-  buildah copy initos-builder rootfs /
+  buildah copy initos-sidecar rootfs /
+  buildah copy initos-sidecar sidecar /
 
   # Create signed UKI (and unsigned one)
   VOLS="$VOLS -v ${SECRET}:/config" 
@@ -64,15 +65,34 @@ efi() {
   if [ -d ${WORK}/boot ]; then
     VOLS="$VOLS -v ${WORK}/boot:/boot -v ${WORK}/lib/modules:/lib/modules -v ${WORK}/lib/firmware:/lib/firmware "
   fi
-  buildah run $VOLS initos-builder -- setup-efi efi $*
+  buildah run $VOLS initos-sidecar -- setup-efi efi $*
 }
 
+# Use the docker images to build the EFI.
+dockerb() {
+  VOLS="--rm -v ${WORK}:/data"
+  
+  docker run ${VOLS}  ${REPO}/intios-rootfs:${TAG} \
+     /sbin/setup-initos save_boot
+
+  docker run ${VOLS}  ${REPO}/intios-rootfs:${TAG} \
+     /sbin/setup-initos sqfs /data/efi/initos initos
+
+  docker run ${VOLS} --network host ${REPO}/intios-builder:${TAG} \
+     /sbin/setup-initos setup_initrd
+
+  docker run ${VOLS}  ${REPO}/intios-sidecar:${TAG} \
+    /sbin/setup-initos sqfs /data/efi/initos sidecar
+
+  defi "$@"
+}
+
+
 # Build the EFI using docker.
+# Sign is the only one with the EFI keys mounted
 defi() {
-  docker run -it --rm  \
-     -v ${SECRET}:/config \ 
-     -v ${WORK}:/data \ 
-    ${IMAGE_SIGNER} setup-efi $*
+  docker run ${VOLS}  -v ${SECRET}:/config ${REPO}/intios-sidecar:${TAG} \
+      /sbin/setup-efi "$@"
 }
 
 

@@ -40,12 +40,12 @@ jobs:
           push: true
           target: sidecar
           tags: ghcr.io/costinm/initos/initos-sidecar:latest
-      - name: push builder
-        uses: docker/build-push-action@v6
-        with:
-          push: true
-          target: builder
-          tags: ghcr.io/costinm/initos/initos-builder:latest
+      # - name: push builder
+      #   uses: docker/build-push-action@v6
+      #   with:
+      #     push: true
+      #     target: builder
+      #     tags: ghcr.io/costinm/initos/initos-builder:latest
   
 #      - name: Upload EFI image
 #        uses: actions/upload-artifact@v2

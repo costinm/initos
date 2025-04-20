@@ -37,7 +37,7 @@ COPY --link --from=initos /boot ./
 
 
 #################
-FROM ${BASE} as builder
+#FROM ${BASE} as builder
 
 # Required if base is setting a different user ( like sunshine )
 # USER root
@@ -53,26 +53,27 @@ FROM ${BASE} as builder
 # ENV NO_AT_BRIDGE 1
 
 # Rest of the files added in the last step (to avoid rebuilds)
-COPY ./rootfs /
+#COPY ./rootfs /
 
 # Cache the APKs
-RUN  --mount=target=/etc/apk/cache,id=apk,type=cache \
-    /sbin/setup-efi install 
+# RUN  --mount=target=/etc/apk/cache,id=apk,type=cache \
+#     /sbin/setup-efi install 
     
 
 #################
-FROM initos-builder as tmp
+# FROM initos-builder as tmp
 
-COPY --from=kernel --link /lib/modules/ /lib/modules
-COPY --from=kernel --link /boot/ /boot/
-COPY --from=kernel --link /lib/firmware/ /lib/firmware
+# COPY --from=kernel --link /lib/modules/ /lib/modules
+# COPY --from=kernel --link /boot/ /boot/
+# COPY --from=kernel --link /lib/firmware/ /lib/firmware
 
-RUN /sbin/setup-initos build_initrd
-RUN /sbin/setup-initos recovery_sqfs recovery /boot
+# RUN /sbin/setup-initos build_initrd
+# RUN /sbin/setup-initos recovery_sqfs recovery /boot
 
 #################
 FROM ${BASE} as sidecar
 
 COPY ./rootfs /
+COPY ./sidecar /
 RUN setup-sidecar install
 

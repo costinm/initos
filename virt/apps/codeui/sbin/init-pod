@@ -1,0 +1,74 @@
+#!/bin/bash
+
+DISPLAYN=5
+export DISPLAY=:${DISPLAYN}
+#    -PublicIP 127.0.0.1 \
+#    -drinode ${DRINODE} \
+#    ${HW3D} \
+
+# 5900 + display for rfb
+# 6800 + display for websocket
+
+export USER=${USER:-build}
+
+adduser() {
+  useradd -u ${USERID:-1002} -g users -G users -s /bin/bash \
+         -d /home/${USER} ${USER} || true
+  usermod -p '*' ${USER} || true
+}
+
+start() {
+    rm -f /tmp/.X*-lock /tmp/.X11-unix/X${DISPLAY}
+    adduser
+    echo "STARTING AS $USER"
+    su - ${USER} /sbin/init-pod startX
+}
+
+startKasm1() {
+ /usr/bin/Xvnc $DISPLAY \
+    -desktop test \
+    -disableBasicAuth \
+    -SecurityTypes None \
+    -AlwaysShared \
+    -http-header Cross-Origin-Embedder-Policy=require-corp \
+    -http-header Cross-Origin-Opener-Policy=same-origin \
+    -geometry 1024x768 \
+    -sslOnly 0 \
+    -RectThreads 0 \
+    -websocketPort 6905 \
+    -interface 0.0.0.0 \
+    -httpd /usr/share/kasmvnc/www \
+    -Log *:stdout:10
+}
+
+startKasm() {
+  # -SecurityTypes None  - testing only, or with UDS
+  # sslOnly ok if L4 security to gateway is provided
+  #  -disableBasicAuth \
+
+ /usr/bin/Xvnc $DISPLAY \
+ -desktop ${USER} \
+    -SecurityTypes None \
+    -AlwaysShared \
+    -http-header Cross-Origin-Embedder-Policy=require-corp \
+    -http-header Cross-Origin-Opener-Policy=same-origin \
+    -geometry 1024x768 \
+    -sslOnly 0 \
+    -RectThreads 0 \
+    -websocketPort 8444 \
+    -interface 0.0.0.0 \
+    -httpd /usr/share/kasmvnc/www \
+    -Log *:stdout:10
+}
+
+startX() {
+ startKasm &
+ sleep 1
+ echo "X STARTED"
+ kitty &
+ i3  &
+ echo DONE
+ sleep infinity
+}
+
+"$@"

@@ -1,7 +1,0 @@
-#!/bin/sh
-
-# Following alpine docs for busybox init autologin
-# ( init doesn't seem to allow the command line args )
-# login will run the
-# /etc/login.defs has settings.
-exec login -f root -p

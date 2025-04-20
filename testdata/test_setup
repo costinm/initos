@@ -102,9 +102,9 @@ init() {
 
 
     # Now we can test manual setup
-    initos open_disks $KEY
+    initos-init open_disks $KEY
     # home will be bind mounted, hide /home/build
-    initos mount_btrfs_raw /dev/mapper/luks-1 /x
+    initos-init mount_btrfs_raw /dev/mapper/luks-1 /x
 
     if [ ! -d /x/initos/etc/ssh ]; then
       if [ -d /boot/efi/install/ssh ]; then
