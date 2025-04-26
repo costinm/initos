@@ -91,9 +91,7 @@ debian_rootfs_base() {
 }
 
 add_deb_core() {
-  $APTINSTALL ca-certificates curl gpg  \
-     linux-headers-$(cat /boot/version) \
-     linux-headers-$(cat /boot/cloud-version) 
+  $APTINSTALL ca-certificates curl gpg  
 
 
   $APTINSTALL  tpm2-tools  \
@@ -140,7 +138,10 @@ add_deb_kernel_nvidia() {
   #$APTINSTALL nvidia-driver 
 
   # This has systemd as a dependency...
-  $APTINSTALL cuda-drivers
+  $APTINSTALL cuda-drivers      linux-headers-$(cat /boot/version) 
+          
+     #linux-headers-$(cat /boot/cloud-version) 
+
   $APTINSTALL nvidia-container-toolkit  
  
   

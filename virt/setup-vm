@@ -7,6 +7,7 @@
 
 IMGDIR=/x/vol/images
 SIZE=${SIZE:-10G}
+WORK=${WORK:-${HOME}/.cache/initos}
 
 fix() {
     setcap cap_net_admin+ep /opt/virt/cloud-hypervisor
@@ -63,6 +64,72 @@ mkdiskX() {
 }
 
 
+vkernel() {
+  buildah --name vkernel from debian:bookworm-slim || true
+
+  buildah copy vkernel setup-vdeb /sbin
+  buildah run vkernel /sbin/setup-vdeb debian_rootfs_base
+
+  buildah commit vkernel vkernel 
+
+  mkdir -p ${WORK}/vkernel
+  buildah run \
+    -v ${WORK}/vkernel:/data \
+      vkernel /sbin/setup-vdeb save_boot 
+
+}
+
+vkerneln() {
+  #buildah --name vkerneln from vkernel || true
+  # Or next 3 lines will do it again - this part is fast
+  buildah --name vkerneln from debian:bookworm-slim || true
+  buildah copy vkerneln setup-vdeb /sbin
+  buildah run vkerneln /sbin/setup-vdeb debian_rootfs_base
+
+  buildah run vkerneln /sbin/setup-vdeb add_deb_kernel_nvidia
+
+  mkdir -p ${WORK}/vkerneln
+
+  buildah run \
+    -v ${WORK}/vkerneln:/data \
+      vkerneln  /sbin/setup-vdeb save_boot 
+
+  #buildah commit vkerneln vkerneln 
+   
+}
+vkernelnsh() {
+  buildah run -t \
+    -v ${WORK}:/data \
+      vkerneln  /sbin/setup-vdeb /bin/bash
+}
+
+vinitrd() {
+  buildah copy initos-sidecar setup-vm initos-initrd-vm /sbin 
+  mkdir -p ${WORK}/virt
+
+  if [ ! -d ${WORK}/vkernen/boot ]; then
+    mkdir -p ${WORK}/vkerneln
+    buildah run \
+      -v ${WORK}/vkerneln:/data \
+        vkerneln  /sbin/setup-vdeb save_boot 
+  fi
+
+  buildah run  \
+    -e BASE=/data/vkerneln \
+    -e DEST=/data/virt \
+    -e SRC=/sbin \
+    -v ${WORK}:/data \
+     initos-sidecar /sbin/setup-vm initrd
+
+  if [ ! -f ${WORK}/virt/cloud-hypervisor ]; then
+    buildah run  \
+      -e DEST=/data/virt \
+      -e SRC=/sbin \
+      -v ${WORK}:/data \
+      initos-sidecar /sbin/setup-vm virt_install
+  fi
+}
+
 # Download the binaries required for running VMs.
 # 
 # Currently using cloud-hypervisor and virtiofsd.
@@ -70,7 +137,7 @@ mkdiskX() {
 # Duplicated in setup-sidecar - remove from there after moving all virt to 
 # separate containers.
 virt_install() {
-  local d=/x/opt/virt
+  local d=${DEST:-/x/opt/virt}
   mkdir -p $d
   local latest=v44.0
   curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/ch-remote \
@@ -88,9 +155,10 @@ virt_install() {
   mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd ${d}/virtiofsd
   rm -rf /tmp/target /tmp/virtiofsd.zip
 
+  cp /usr/bin/ch-remote ${d}/ch-remote.musl
   # Sidecar should be built after the initrd files are generated.
   # The lib/modules are in the debian file.
-  cp /data/virt/* /opt/virt/
+  # cp /data/virt/* /opt/virt/
 }
 
 # Use the initos-base image to copy $1 image to $2 local dir.
