@@ -38,16 +38,6 @@ SECRETS=/run/secrets/luks
 # modified to fit specific needs - without having to add complex config and logic to
 # hide what is actually happening.
 
-# Check all files and meeta checksums. Reports go to /var/lib/btrfs.
-# Docs recommend monthly, from cron. Will use 80% of bw.
-scrub() {
-  btrfs scrub start -B /x
-  btrfs filesystem defrag -v -r -f -t 32M /x
-  duperemove -dhr /x
-  btrfs balance start -m /x
-}
-
-
 # Will wipe a disk a create the partitions needed for initos.
 # This should be called explicitly by the user - it will normally not be done automatically.
 # In practice we need ~100M on the EFI, and some btrfs volume.
@@ -446,12 +436,6 @@ recovery() {
   /initos/recovery/usr/bin/arch-chroot /initos/recovery "$@"
 }
 
-# On debian, find the explicitly installed packages
-find_installed_deb() {
-  dpkg --get-selections | grep -v deinstall | cut -f1
-}
-
-
 chk_firmware() {
   set +x
   # Get a list of all loaded modules - mostly AI generated.
@@ -557,33 +541,6 @@ set_pass() {
 #   # persistent-handle: 0x81000001
 }
 
-
-# Mokutil requires a corresponding EFI.
-# /usr/share/efitools contains a set of EFI programs.
-# efi-readvar shows the keys in the system.
-mok() {
-  mokutil --sb-state
-  mokutil --list-enrolled
-  mokutil --pk /boot/efi/initos/KEYS/PK.cer
-  mokutil --kek 
-  mokutil --db
-  # Looks for /var/lib/sbctl/keys/db/db.key
-  # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
-}
-
-efibackup() {
-  for i in PK KEK db dbx; do efi-readvar -v $i -o $i.esl; done
-
-  # Installing keys:
-  # db.auth,  KEK.auth and PK.auth added to bios from USB disk
-
-  # Alternative:
-  # apk update
-  # apk add sbctl
-  # sbctl create-keys
-  # sbctl sign /boot/efi/Alpine/linux-lts.efi
-  # sbctl enroll-keys -m
-}
 
 # host files identifies the (insecure) host config. It is used for the recovery
 # image customization or for the rootfs configuration.

@@ -22,6 +22,7 @@ initos_init() {
       open_disks "$KEY"
       
       if [ -e /dev/mapper/luks-1 ]; then
+        export MANUAL_UNLOCK=1
         break
       fi
 
@@ -30,6 +31,8 @@ initos_init() {
     done
   fi 
 
+  KEY=""
+  
   # LUKS mounted on /x, secure mode.
 
   # At this point we may have a tpm and may be able to mount
@@ -47,9 +50,25 @@ initos_init() {
   fi
 
   start_os
-
-  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
-  /etc/init.d/agetty.tty1 start
+  echo "InitOS started. Press 't' to start agetty on tty1"
+  read -t 50 -n 1 key
+  if [ "$key" = "t" ]; then
+    ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
+    /etc/init.d/agetty.tty1 start
+  elif [ "$key" = "c" ]; then
+    # This is for testing - need to find a password 
+    echo "WIP: UI for laptop"
+    /etc/init.d/seatd start
+    export XDG_RUNTIME_DIR=/run/user/$(id -u build)
+    mkdir -p $XDG_RUNTIME_DIR
+    chown build $XDG_RUNTIME_DIR
+    if [ "$MANUAL_UNLOCK" = "1" ]; then
+      echo "Manual unlock mode - starting shell"
+      su - build /sbin/initos ui
+    else 
+      login -f build 
+    fi
+  fi
 
   exec tini -s sleep -- infinity 
 }
@@ -306,11 +325,13 @@ mount_sysroot() {
   if [ -d ${x}/@home ] ; then
     mount -o bind ${x}/@home /home
   fi
-  if [ -d /x/containers ]; then
-    mount -o bind /x/containers /var/lib/containers
-  fi
   if [ -d ${x}/@cache ]; then
     mount -o bind ${x}/@cache /var/cache
+
+    mkdir -p /x/@cache/vartmp /x/@cache/containers /var/tmp # For buildah overlay, most be on same disk
+    chmod 1777 /x/@cache/vartmp
+    mount -o bind /x/@cache/vartmp /var/tmp
+    mount -o bind /x/@cache/containers /var/lib/containers
   fi
   if [ -d ${x}/@log ]; then
     mount -o bind ${x}/@log /var/log

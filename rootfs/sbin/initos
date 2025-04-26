@@ -61,9 +61,7 @@ startui() {
   /etc/init.d/agetty.tty2 start
 
 
-  export XDG_RUNTIME_DIR=/run/user/$(id -u build)
-  mkdir -p $XDG_RUNTIME_DIR
-  chown build $XDG_RUNTIME_DIR
+ 
   export HOME=/home/build
 
 
@@ -78,10 +76,57 @@ startui() {
   exec tini -s sleep -- infinity 
 }
 
+ui() {
+  sway &
+}
+
 lspkg() {
   dpkg --get-selections | grep -v deinstall > /tmp/packages1.txt
   apt-mark showmanual > /tmp/packagesm.txt 
   dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n
+}
+
+# Mokutil requires a corresponding EFI.
+# /usr/share/efitools contains a set of EFI programs.
+# efi-readvar shows the keys in the system.
+mok() {
+  mokutil --sb-state
+  mokutil --list-enrolled
+  mokutil --pk /boot/efi/initos/KEYS/PK.cer
+  mokutil --kek 
+  mokutil --db
+  # Looks for /var/lib/sbctl/keys/db/db.key
+  # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
+}
+
+
+efibackup() {
+  for i in PK KEK db dbx; do efi-readvar -v $i -o $i.esl; done
+
+  # Installing keys:
+  # db.auth,  KEK.auth and PK.auth added to bios from USB disk
+
+  # Alternative:
+  # apk update
+  # apk add sbctl
+  # sbctl create-keys
+  # sbctl sign /boot/efi/Alpine/linux-lts.efi
+  # sbctl enroll-keys -m
+}
+
+# On debian, find the explicitly installed packages
+find_installed_deb() {
+  dpkg --get-selections | grep -v deinstall | cut -f1
+}
+
+
+# Check all files and meeta checksums. Reports go to /var/lib/btrfs.
+# Docs recommend monthly, from cron. Will use 80% of bw.
+scrub() {
+  btrfs scrub start -B /x
+  btrfs filesystem defrag -v -r -f -t 32M /x
+  duperemove -dhr /x
+  btrfs balance start -m /x
 }
 
 

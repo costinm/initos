@@ -3,40 +3,28 @@
 # Location of the home template ( configs, etc )
 USER_HOME=${USER_HOME:-${HOME}/ws/home}
 
-build() {
-    buildah --name codeui from debian:bookworm
+POD=${POD:-adev}
 
-    buildah copy codeui sbin/ /sbin
-    buildah run codeui  /sbin/setup-deb all
+build() {
+    buildah --name ${POD} from alpine:edge || true
+
+
+    buildah copy ${POD} sbin/ /sbin
+    buildah run ${POD}  /sbin/setup-ui install
 
     # Normally home is mounted. A vnc password must be set for VNC to
     # work - provisioning the home is a separate operation.
-    buildah copy --chown build codeui  ${USER_HOME} /home/build
-
-    buildah copy codeui ../../../rootfs/etc/ /etc
+    buildah copy --chown build ${POD}  ${USER_HOME} /home/build
 
 }
-
-push() {
-    # About 2GB
-    buildah commit codeui git.h.webinf.info/costin/dev/ui:latest
-    buildah push git.h.webinf.info/costin/dev/ui:latest
-}
-
-pull() {
-  buildah from --name codeui git.h.webinf.info/costin/dev/ui:latest
-}
-USER=costin
-USERID=1002
-
+IMAGE=git.h.webinf.info/costin/dev/adev:latest
 run() {
-  # Temp - share the home\
-  buildah run --network host \
-    -e USER=${USER} \
-    -e USERID=${USERID} \
-    -v $HOME:/home/${USER} \
-    -v $(pwd)/sbin/init:/sbin/init \
-    -t codeui /sbin/init "$@"
+  buildah commit ${POD} ${IMAGE}
+
+  podman run --network host \
+    -v /home/build:/home/build \
+    -v $(pwd)/sbin/init-pod:/sbin/init-pod \
+    -it --rm ${IMAGE} /sbin/init-pod "$@"
 }
 
 "$@"

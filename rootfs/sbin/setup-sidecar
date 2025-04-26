@@ -10,6 +10,12 @@ install() {
 
   # Podman + cloud hypervisor
   alpine_add_virt
+
+  # Getting sway to work in a container is a pain - can't figure 
+  # out the input devices in podman... Also wayland control of the
+  # display belongs under the 'hardware', containers should not
+  # have access to sway control socket for example.
+  add_wui
  
   (cd /etc/init.d && ln -s agetty agetty.tty1)
   (cd /etc/init.d && ln -s agetty agetty.tty2)
@@ -249,7 +255,7 @@ alpine_add_base() {
   addgroup admin kvm
 
   addgroup build users # otherwise swayunlock fails, /etc/shaddow permissions
-  addgroup build video
+
   addgroup build audio
   addgroup build tty
   addgroup build input
@@ -280,12 +286,16 @@ alpine_add_virt() {
   # /var/lib/containers must be a tmpfs or btrfs (not overlayfs)
   # requires fuse-overlayfs
   apk add podman podman-openrc podman-docker fuse-overlayfs 
-  apk add buildah
+  
+  # Buildah is temp until I fix the scripts to use buildah for export
+  # lxc - I have one container that uses it, not migrated yet
+  apk add buildah lxc
   # podman-tui
 
   # About 7M extra - better to let the script download the static version
-  #apk add cloud-hypervisor virtiofsd
-  virt_install
+  apk add cloud-hypervisor virtiofsd
+  # This installs the glibc ch-remote... 
+  # virt_install
 
   # similar to ujail and others - no server.
   # nsjail can listen on a port and start container on connection
@@ -296,30 +306,6 @@ alpine_add_virt() {
   df -h
 }
 
-
-virt_install() {
-  local d=/opt/virt
-  mkdir -p $d
-  local latest=v44.0
-  curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/ch-remote \
-    -o ${d}/ch-remote
-  chmod +x ${d}/ch-remote
-  # Tested 
-  curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/cloud-hypervisor-static \
-     -o ${d}/cloud-hypervisor
-  chmod +x ${d}/cloud-hypervisor
-
-  # Alpine lacks wget -L
-  curl -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish \
-     -o /tmp/virtiofsd.zip
-  unzip /tmp/virtiofsd.zip -d /tmp
-  mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd ${d}/virtiofsd
-  rm -rf /tmp/target /tmp/virtiofsd.zip
-
-  # Sidecar should be built after the initrd files are generated.
-  # The lib/modules are in the debian file.
-  cp /data/virt/* /opt/virt/
-}
 
 # Optional - using alpine kernel instead of debian kernel.
 # Doesn't work well with debian rootfs (module loading issues, different gcc)
@@ -345,6 +331,53 @@ virt_install() {
 #   #du -sh /lib/firmware
 #   df -h
 # }
+
+# Wayland UI. Using alpine setup-desktop, which adds 
+# - dbus, elogind, firefox, foot.
+# The sqfs moves from ~310M to 580M
+# The build time also increases from 7 to 9 min 
+add_wui() {
+  #  apk add mesa-dri-gallium
+
+  # Built in option in Alpine.
+  setup-desktop sway
+  
+  # Conflicts with rofi - host will not expose X11/kasm anyway,
+  # that should be only in VMs/pods.
+  apk add rofi-wayland rofi-pass rofi-top
+
+  # labwc (pi) can be used instead of sway, OpenBox-based with ALT-TAB
+  apk add labwc
+
+  # make sure video, input, seat groups are added to the UI user
+  apk add seatd polkit 
+  addgroup build seat
+
+  apk add sway mc bash bash-completion
+
+  apk add kitty kitty-kitten # required
+  apk add firefox # esr is the less updated long term
+
+  apk add seatd openrc
+
+  addgroup build seatd
+}
+
+
+# Native X UI
+xui_alpine() {
+  apk add i3wm dbus-x11
+  apk add tint2 rofi alttab i3status
+  apk add xorg-server
+  apk add xinit
+
+#  apk add xset
+#  apk add xrandr
+#  apk add xmodmap
+#  apk add xinput
+#  apk add xhost
+#  apk add xkill
+}
 
 
 "$@"
