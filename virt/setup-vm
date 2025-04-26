@@ -109,15 +109,19 @@ exportfs() {
 # Makes the VM initrd. Runs inside the initos-sidecar image
 # (or in the real sidecar)
 initrd() {
+  # Where to find the modules and kernel for creating the initrd.
+  # Set to /data when running in a container, /x/@/vkernel will be used
+  # to upgrade (the rootfs has non-virtual kernel)
   BASE=${BASE:-/initos/rootfs}
+  
   DEST=${DEST:-/x/opt/virt}
-  #SRC=${SRC:-/x/opt/virt}
+  
   SRC=${SRC:-/home/costin/ws/initos/virt}
   
   VER=$(ls ${BASE}/lib/modules | grep cloud | tail)
+  cp ${BASE}/boot/vmlinuz-${VER} ${DEST}/vmlinuz
   
   ln -s ${BASE}/lib/modules/${VER} /lib/modules || true
-  cp ${BASE}/boot/vmlinuz-${VER} ${DEST}/vmlinuz
 
   /sbin/mkinitfs -k  -i ${SRC}/initos-initrd-vm \
      -F "base btrfs virtio initosvm" \

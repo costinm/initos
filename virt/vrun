@@ -264,17 +264,25 @@ run_vm() {
   ssh $VMIP "$@"
 }
 
-stop_vm() {
+stop() {
   vm_ctrl shutdown-vmm
+}
+
+vmkill() {
+  kill -9 $(cat ${WORK}/vm.pid) || true
 }
 
 vm_console() {
   socat UNIX-CONNECT:${WORK}/serial.socket  -
 }
 
+console() {
+  socat UNIX-CONNECT:${WORK}/serial.socket  -
+}
+
 # Expose ch-remote control
 vm_ctrl() {
-  ${VIRT}/ch-remote --api-socket ${WORK}/ch.sock "$@"
+  ch-remote --api-socket ${WORK}/ch.sock "$@"
 }
 
 CMD=$1
