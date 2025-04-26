@@ -1,0 +1,34 @@
+#!/bin/bash
+
+
+export USER=${USER:-build}
+
+adduser() {
+  useradd -u ${USERID:-1002} -g users -G users -s /bin/bash \
+         -d /home/${USER} ${USER} || true
+  usermod -p '*' ${USER} || true
+}
+
+start() {
+    addgroup build seat 
+    addgroup build video
+    openrc default 
+    /etc/init.d/seatd start
+
+    libinput list-devices
+    #rm -f /tmp/.X*-lock /tmp/.X11-unix/X${DISPLAY}
+    #adduser
+    su - ${USER} /sbin/init-pod startX
+}
+
+
+startX() {
+  sway &
+ sleep 1
+ echo "X STARTED"
+ kitty &
+ echo DONE
+ sleep infinity
+}
+
+"$@"

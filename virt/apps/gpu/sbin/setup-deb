@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# Debian as a base, add kernel modules, nvidia.
+# 
+# This is intended as a VM for GPU-related apps, including docker
+# (and lxc for the old wrt until it is moved)
+set -euo pipefail
+set -x 
+
+WORK=${WORK:-/x/initos}
+
+# Will make sure the user exists - useful in pods for
+# running as a custom username.
+USERNAME=${USERNAME:-build}
+
+export DEBIAN_FRONTEND=noninteractive
+APTINSTALL="apt install --assume-yes --no-install-recommends "
+
+img() {
+  truncate -s 10G /data/gpu.img
+  mkdir /tmp/img
+  mount -o bind / /tmp/img
+  mkfs.btrfs /data/gpu.img -r /tmp/img
+}
+
+all() {
+  apt update
+
+  add_base_users
+  tools
+  add_deb_core
+  add_deb_kernel_nvidia
+
+  apt clean
+}
+
+
+add_deb_core() {
+  export INITRD=No
+  $APTINSTALL \
+     linux-image-cloud-amd64
+  ver=$(ls /lib/modules |grep cloud)
+  echo -n ${ver} > /boot/cloud-version
+
+  $APTINSTALL ca-certificates curl gpg  \
+     linux-headers-$(cat /boot/cloud-version) 
+
+
+  $APTINSTALL  tpm2-tools  \
+     tini  bsdutils dosfstools fdisk \
+    gdisk hdparm file findutils fuse3 btrfs-progs lsof \
+    \
+    rsync wpasupplicant ifupdown ifupdown-extra \
+     wireless-tools bridge-utils net-tools tcpdump iptables iproute2  \
+    nftables iperf3 openssh-server  iw \
+    \
+    cryptsetup efibootmgr squashfs-tools pciutils
+
+  $APTINSTALL docker.io lxc 
+
+  systemctl enable ssh.service
+}
+
+# Adds Kernel, firmware, Nvidia driver.
+# Builds the initrd images for intel/amd uCode.
+# This adds X
+# 
+# Since nvidia also has libraries and docker/podman support - will use 
+# this debian image as the 'sidecar OS', so including more packages.
+add_deb_kernel_nvidia() {
+  # Will use systemd or script - may start it as 'main' as well, without 
+  # an actual sidecar.
+  # Not the current kernel on the builder machine
+ 
+  curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+  dpkg -i /tmp/cuda.deb
+  if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ] ; then
+     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+      tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+     apt update
+  fi
+    
+  # This has systemd as a dependency...
+  $APTINSTALL cuda-drivers
+  $APTINSTALL nvidia-container-toolkit  
+ 
+  /usr/lib/dkms/dkms_autoinstaller start $(cat /boot/cloud-version )
+  dkms status
+}
+
+# Users built into the docker image. 
+add_base_users() {
+  local u=${USERNAME:-build}
+  local h=${USER_HOME:-/home/${u}}
+
+  # Template home directory.
+  mkdir -p /home/log
+  mkdir -p /work
+  mkdir -p /home
+
+  # For ubuntu based images - there is a default user with 1000
+  (userdel ubuntu || true)
+
+  useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
+         -d ${h} ${u} || true
+  usermod -p '*' ${u} || true
+
+  groupadd -g 2000 restic || true
+  useradd -u 2000 -g restic -G restic -s /bin/bash \
+         -d /x/backup restic || true
+  # -p takes an encrypted pass - so this disables pass login
+  usermod -p '*' restic || true
+
+  mkdir -p ${h}
+  chown ${u} ${h}
+
+}
+
+
+function tools() {
+  $APTINSTALL wget curl ca-certificates gpg \
+     net-tools vim mc tmux \
+   git less bash-completion \
+   openssh-server  rsync
+
+  # SSH: used by code
+}
+
+C=${1}
+shift
+$C "$@"

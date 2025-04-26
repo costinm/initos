@@ -1,0 +1,355 @@
+#!/bin/sh
+
+# Run a command in a virtual or remote envirnment ('Pod', container, VM, ssh remote, kubectl).
+# 
+# This is an 'opinionated' wrapper on multiple tools. It takes the name of the target as 
+# an POD env variable (not in the CLI params), and the name is mapped to specific 'workload config' which determines
+# how to run the command.
+# 
+# If the env is not set, current working dir or the name of the script is used.
+# 
+# "start"/"stop" can be used to explicitly start/stop the environment.
+# "run ..." will be executed in the environment, may start it if not running.
+#
+# A separate process may stop/reclaim unused VMs/containers.
+# 
+# The setup is done by setup-vm.
+# 
+# Most of the time the 'run' will use `ssh` or `kubectl` or one of the local
+# container tools.
+#
+# The configs and rootfs are expected to be under ${VOLS}/${POD} (/x/vol or ~/vol) 
+# 
+# Inside the pod config dir:
+# Defaults:
+# - if ./rootfs/ is present - will be used with a VM
+#    - if ./disk.img - will be mounted as well
+
+
+# TODO:
+# - add ssh, kubectl
+# - add running the command on multiple workloads. 
+# - get configs on-demand from a control plane (k8s or istio for example)
+
+#set -x
+set -e
+
+if [ -f ${HOME}/.config/vrun/env ]; then 
+  source ${HOME}/.config/vrun/env
+fi
+
+export SRCDIR=${SRCDIR:-$(pwd)}
+
+# Defaults to the name of the working directory.
+# This is the application name (may have multiple pod).
+POD=${POD:-$(basename $PWD)}
+
+VM=${VM:-${POD}}
+NAME=${NAME:-$POD}
+APP=${APP:-${POD}}
+
+# If the script is named vrun-devvm -> the VM will be devvm
+# Otherwise the current working dir will be used as VM dir. 
+# Images are still in /x/vol/images 
+#if [ -z ${VM} ]; then
+#   vmsuffix="${0#*vrun-}"
+
+#   if [ -z "$vmsuffix" ]; then
+#  VM=$(basename $PWD)
+  # else
+  #   VM=$vmsuffix
+  # fi
+#fi
+
+if [ -z ${POD} ]; then 
+  echo "POD must be set to the target container or VM name"
+  exit 1
+fi
+
+# If set, will be added as a prefix to the command
+#TIME="time "
+TIME=""
+
+# Base directory for all VM files.
+VOLS=${VOLS:-/x/vol}
+
+# Directory with hypervisor binaries, kernel, initrd, recovery
+VIRT=${VIRT:-/x/opt/virt}
+IMGDIR=${IMGDIR:-/x/vol/images}
+
+
+WORK=${WORK:-${VOLS}/${POD}}
+
+# IMAGE and other parameters loaded from this file
+if [ -f ${WORK}/env ]; then 
+  . ${WORK}/env
+fi
+
+# Each VM is expected to have a SSH server. Just SSH and run the command.
+# This is the same as 'remote pods'.
+run_vm() {
+  ssh $VMIP "$@"
+}
+
+stop_vm() {
+  vm_ctrl shutdown-vmm
+}
+
+vm_console() {
+  socat UNIX-CONNECT:${WORK}/serial.socket  -
+}
+
+# Expose ch-remote control
+vm_ctrl() {
+  ${VIRT}/ch-remote --api-socket ${WORK}/ch.sock "$@"
+}
+
+### CHROOT BASED (full access to host)
+
+# Setup a chroot env
+start_chroot() {
+
+  R=${1:-${WORK}}
+  if [ "$POD" = "/sysroot" ]; then
+    R=/sysroot
+  fi
+
+  # https://wiki.gentoo.org/wiki/Chroot/en
+  mount --rbind /dev ${R}/dev
+  mount --make-rslave ${R}/dev
+  mount -t proc /proc ${R}/proc
+  mount --rbind /sys ${R}/sys
+  mount --make-rslave ${R}/sys
+  mount --rbind /tmp ${R}/tmp
+
+  mount -o bind /lib/modules ${R}/lib/modules
+  mount -o bind /lib/firmware ${R}/lib/firmware
+
+  #mount -o bind /ws/initos ${R}/ws/initos
+  #mount -o bind /x/vol/devvm-1/initos ${R}/x/initos/
+  #mount -o bind /x/vol/devvm-1/initos/boot ${R}/boot
+}
+
+run_chroot() {
+  R=${WORK}
+  if [ "$POD" = "/sysroot" ]; then
+    R=/sysroot
+  fi
+
+ chroot ${R} "$@"
+}
+
+run_unshare() {
+ # No --net
+ unshare --root=${WORK} --pid --mount --fork --mount-proc \
+     --uts --ipc --cgroup --propagation shared  -- "$@"
+}
+
+stop_chroot() {
+  X=${WORK:-/sysroot}
+
+  umount ${X}/dev/pts
+  umount  ${X}/dev/
+  umount  ${X}/proc/
+  umount  ${X}/tmp/
+  umount  ${X}/sys/
+}
+
+### Buildah
+# Will run buildah/podman, with files in HOME/.local/share/containers
+# vfs-layers contains tgz layers (tar-split.gz)
+# 
+# Useful commands:
+# - images, containers
+# - inspect ${POD}, --type=image 
+# - info - runtime (runc), dirs
+# - commit - create OCI image
+# - config (--cmd, entrypoint), manifest - image config
+# - from, copy, run, rm
+# - mount - mount container to dir
+# - login, pull, push, tag
+# - push docker-daemon:...
+# 
+# Less useful:
+# - add - use copy instead
+# - build - what's the point (Dockerfile)
+# - rename, rmi, source(?)
+# - unshare: after unshare buildah mount works for user
+
+start_buildah() {
+  img=${1}
+
+  # Source files
+  VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
+
+  # APK cache - to avoid downloading files.
+  mkdir -p ${WORK}/work/apkcache
+  mkdir -p ${WORK}/work/cache
+
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/${APP}"
+  #DOCKER_OPTS="--net br-lan"
+
+  buildah --name ${POD} \
+      ${VOLS} \
+      from ${img}
+}
+
+stop_buildah() {
+  buildah rm $POD
+}
+
+buildah_stats() {
+  buildah inspect ${POD} 
+}
+
+buildah_dir() {
+  buildah inspect ${POD} |jq -r .MountPoint
+}
+
+# Run a single command in a pod (or VM, container).
+# First param is the name of the pod.
+run_buildah() {
+  buildah ${VOLS} run ${POD} -- "$@"
+}
+
+sh_buildah() {
+  buildah ${VOLS} run -t ${POD} -- "$@"
+}
+
+copy_buildah() {
+  buildah copy ${POD} "$@"
+}
+
+commit_buildah() {
+  buildah commit ${POD} "$@"
+}
+
+### Direct ctr
+
+# crun_setup() {
+#   echo oci-runtime-tool - create spec
+#   echo umoci - like crane
+#   echo expand to /x/vol/NAME/rootfs
+
+#   # Need /opt/cni/bin and /etc/cni/net.d/ to be setup
+
+#   ctr run -t --cni --rootfs ./rootfs/ devvm /bin/bash
+#   ctr c delete devvm
+# }
+
+### Docker pod 
+
+# A docker pod is like a k8s pod or VM - sleeps or run a long lived app, 
+# and exec can be called. 
+# It is also similar to buildah - except buildah doesn't need a long-running
+# process, can enter the namespaces when it needs.
+
+run_docker() {
+  docker exec -it ${POD} "$@"
+}
+
+copy_docker() {
+    docker cp ${POD} ${1}:$2
+}
+
+start_docker() {
+  img=${1}
+
+  # Source files
+  VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
+
+  # APK cache - to avoid downloading files.
+  mkdir -p ${WORK}/work/apkcache
+  mkdir -p ${WORK}/work/cache
+
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/${APP}"
+  #DOCKER_OPTS="--net br-lan"
+
+  docker run $DOCKER_OPTS --name ${POD} -d \
+    ${VOLS} \
+    ${IMAGE} \
+      sleep infinity
+}
+
+stop_docker() {
+  docker stop $POD
+}
+
+# docker export -> tar file that can be piped
+# crane export -> same
+
+# podman_in_recovery() {
+#   # if running on recovery
+#   mount -t tmpfs /var/lib/containers
+
+#   #crane pull --format oci git.h.webinf.info/costin/initos-recovery:latest /tmp/r
+#   podman run $DOCKER_OPTS --privileged -it --net host \
+#      git.h.webinf.info/costin/initos-recovery:latest /bin/sh
+# }
+
+
+### Docker run
+# Like buildah - but containers go away after each command.
+# works if containers only operate on the mounted volumes.
+
+start_drun() {
+  echo drun
+}
+
+# Run a short lived command in docker, remove the container after.
+# 'docker start' can only restart a container - because docker is designed
+# around 'a single long running service'.
+run_drun() {
+  local n=${POD}
+  # Source files
+  VOLS="$VOLS -v ${SRCDIR}:/ws/${APP}"
+
+  # APK cache - to avoid downloading files.
+  VOLS="$VOLS -v ${WORK}/work/apkcache:/etc/apk/cache"
+  VOLS="$VOLS -v ${WORK}/work/cache:/var/lib/cache"
+
+  # Separate volumes - at runtime will also be mounted here.
+  #VOLS="$VOLS -v ${WORK}/modules:/lib/modules"
+  #VOLS="$VOLS -v ${WORK}/boot:/boot"
+  #VOL$VOLS -v ${WORK}/firmware:/lib/firmware"
+
+  # /x will be the rootfs btrfs, with subvolumes for recovery, root, modules, etc
+  VOLS="$VOLS -v ${WORK}:/x/${APP}"
+  #DOCKER_OPTS="--net br-lan"
+
+  docker run $DOCKER_OPTS -it --rm \
+    ${VOLS} \
+    ${IMAGE} \
+    "$@"
+}
+
+
+## Support functions 
+_ip_base() {
+  local num=$1
+  local ip=192.168.19.$(( num & 255 ))
+  echo $ip
+}
+
+
+docker_extract() {
+  img=${1}
+  mkdir ${WORK}/rootfs
+
+  docker export $img | \
+    (cd ${WORK}/rootfs && tar -xf  - )
+}
+
+
+
+CMD=$1
+shift
+$CMD "$@"
