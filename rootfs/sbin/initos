@@ -1,6 +1,133 @@
 #!/bin/bash
 
-# Helpers and utils for initos. Mostly used in the host sideacar.
+# Various small scripts to automate post-boot use in the host sidecar. 
+# 
+
+# Sidecar is run at startup from rc.local, after swap_root, once.
+# 
+# chroot /initos/sidecar can be used after.
+# Not needed if the 'real' rootfs is running in a container or VM.
+# Systemd is killing all processes - so this is started from systemd (or native OS).
+sidecar() {
+  # Using chroot to run a different image, not to isolate.
+  mount -o bind /x /initos/sidecar/x
+  mount -o bind / /initos/sidecar/sysroot
+  
+  # The arch script takes care of sys, etc.
+  /initos/sidecar/usr/bin/arch-chroot \
+    /initos/sidecar /sbin/initos init_sidecar &
+
+  # alternative: docker/podman/direct crun to keep it in a 
+  # priv container. 
+}
+
+# init_sidecar is called in a chroot or privileged container, from
+# a systemd-rootfs. 
+init_sidecar() {
+  logi "Starting InitOS as a sidecar"
+
+  # TODO: start a ssh on 15022 or similar, to not interfere with 
+  # host (if any)
+  # 
+  # TODO: maybe start tini if running as 1 (container)
+  sleep infinity
+}
+
+# StartUI is called as root.
+startui() {
+   # TODO: may execute some startup from /x
+  if [ -f /etc/init.d/seatd ]; then
+    addgroup build seat
+    /etc/init.d/seatd start
+    /etc/init.d/polkit start
+  fi
+
+  /etc/init.d/agetty.tty2 start
+
+  ui
+
+  #libinput list-devices
+
+  # TODO: loop showing the interface in secure mode, maybe with
+  # a small shell to read a set of commands.
+
+  # DEBUG ONLY
+  #su - build -c 'labwc -s foot' &
+
+  #sh
+    # Takes care of zombies
+  exec tini -s sleep -- infinity 
+}
+
+ui() {
+  # As user build (can customize it) 
+  export HOME=/home/build
+  export XDG_RUNTIME_DIR=/run/user/$(id -u build)
+    
+  #sway &
+  labwc -s foot &
+}
+
+lsgrp() {
+  for d in /sys/kernel/iommu_groups/*/devices/*; do
+     n=${d#*/iommu_groups/*}; 
+     n=${n%%/*}; 
+     printf 'IOMMU Group %s ' "$n"; 
+     lspci -nns "${d##*/}"; 
+  done;
+}
+
+
+lspkg() {
+
+  dpkg --get-selections | grep -v deinstall > /tmp/packages1.txt
+  apt-mark showmanual > /tmp/packagesm.txt 
+  dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n
+}
+
+# Mokutil requires a corresponding EFI.
+# /usr/share/efitools contains a set of EFI programs.
+# efi-readvar shows the keys in the system.
+mok() {
+  mokutil --sb-state
+  mokutil --list-enrolled
+  mokutil --pk /boot/efi/initos/KEYS/PK.cer
+  mokutil --kek 
+  mokutil --db
+  # Looks for /var/lib/sbctl/keys/db/db.key
+  # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
+}
+
+
+efibackup() {
+  for i in PK KEK db dbx; do efi-readvar -v $i -o $i.esl; done
+
+  # Installing keys:
+  # db.auth,  KEK.auth and PK.auth added to bios from USB disk
+
+  # Alternative:
+  # apk update
+  # apk add sbctl
+  # sbctl create-keys
+  # sbctl sign /boot/efi/Alpine/linux-lts.efi
+  # sbctl enroll-keys -m
+}
+
+# On debian, find the explicitly installed packages
+find_installed_deb() {
+  dpkg --get-selections | grep -v deinstall | cut -f1
+}
+
+
+# Check all files and meeta checksums. Reports go to /var/lib/btrfs.
+# Docs recommend monthly, from cron. Will use 80% of bw.
+scrub() {
+  btrfs scrub start -B /x
+  btrfs filesystem defrag -v -r -f -t 32M /x
+  duperemove -dhr /x
+  btrfs balance start -m /x
+}
+
 mesh_init() {
   local dev=wlan0
   iw dev ${dev} interface add mesh0 type mesh
@@ -26,63 +153,6 @@ fixtty() {
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty1
 }
 
-init_sidecar() {
-  logi "Starting InitOS as a sidecar"
-  # TODO: start a ssh on 15022 or similar, to not interfere with 
-  # host (if any)
-  # 
-  # TODO: maybe start tini, if the host is just running a command.
-  sleep infinity
-}
-
-# Sidecar is run at startup from rc.local, after swap_root, once.
-# 
-# chroot /initos/rootfs can be used after.
-# Not needed if the 'real' rootfs is running in a container or VM.
-# Systemd is killing all processes - so this is started from systemd (or native OS).
-sidecar() {
-  # Using chroot to run a different image, not to isolate.
-  mount -o bind /x /initos/rootfs/x
-  mount -o bind / /initos/rootfs/sysroot
-  
-  # The arch script takes care of sys, etc.
-  /initos/rootfs/usr/bin/arch-chroot \
-    /initos/rootfs /sbin/initos init_sidecar &
-}
-
-startui() {
-   # TODO: may execute some startup from /x
-  if [ -f /etc/init.d/seatd ]; then
-    addgroup build seat
-    /etc/init.d/seatd start
-    /etc/init.d/polkit start
-  fi
-
-  /etc/init.d/agetty.tty2 start
-
-
-  export XDG_RUNTIME_DIR=/run/user/$(id -u build)
-  mkdir -p $XDG_RUNTIME_DIR
-  chown build $XDG_RUNTIME_DIR
-  export HOME=/home/build
-
-
-  # TODO: loop showing the interface in secure mode, maybe with
-  # a small shell to read a set of commands.
-
-  # DEBUG ONLY
-  su - build -c 'labwc -s foot' &
-
-  #sh
-    # Takes care of zombies
-  exec tini -s sleep -- infinity 
-}
-
-lspkg() {
-  dpkg --get-selections | grep -v deinstall > /tmp/packages1.txt
-  apt-mark showmanual > /tmp/packagesm.txt 
-  dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n
-}
 
 
 

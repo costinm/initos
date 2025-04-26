@@ -1,23 +1,44 @@
 #!/bin/sh
 
+set -x
 
 # Default target for recovery in docker
 install() {
+  echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
+  apk -U --no-progress update
+
   add_builder
   alpine_add_common
-  alpine_add_base
   alpine_add_recovery
-
-  # Podman + cloud hypervisor
   alpine_add_virt
- 
+
+  [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
+  mkdir -p /boot/efi
+  mkdir -p /lib/modules
+  mkdir -p /lib/firmware
+  mkdir -p /mnt/usb
+
+  alpine_add_base
+  
+  # Podman + cloud hypervisor
+
+  # Getting sway to work in a container is a pain - can't figure 
+  # out the input devices in podman... Also wayland control of the
+  # display belongs under the 'hardware', containers should not
+  # have access to sway control socket for example.
+  add_wui
+
+  apk del busybox-mdev-openrc || true
+
   (cd /etc/init.d && ln -s agetty agetty.tty1)
   (cd /etc/init.d && ln -s agetty agetty.tty2)
-  
+  set -e
+
   #rc-update add agetty.tty1 boot
   rc-update add agetty.tty2 default
-  rc-update add agetty.ttyS0 boot
-  rc-update add agetty.hvc0 boot
+  #rc-update add agetty.ttyS0 boot
+  #rc-update add agetty.hvc0 boot
 
   rc-update add devfs sysinit
   rc-update add dmesg sysinit
@@ -87,7 +108,6 @@ add_builder() {
   
   # Udev used in initrd
   
-  apk del busybox-mdev-openrc mdev-conf || true
 
   echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
 
@@ -96,77 +116,67 @@ add_builder() {
 
 # Useful packages for a host. 
 alpine_add_common() {
-  echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
-  apk -U --no-progress update
 
   #apk list -I
 
   #apk add alpine-base # Installs openrc
-  apk add ifupdown-ng libcap2  openrc \
-    alpine-conf  alpine-release  busybox-openrc \
-    busybox-suid bash \
-      crane bash-completions mc
+  apk add  \
+    openrc tini \
+     busybox-openrc \
+    alpine-conf  alpine-release \
+     eudev eudev-hwids udev-init-scripts \
+      udev-init-scripts-openrc \
+    \
+    busybox-suid bash  mc tmux git \
+    busybox-binsh \
+    findutils findmnt \
+    htop haveged \
+    sudo strace util-linux procps \
+    arch-install-scripts \
+    \
+    openssh openssh-keygen openssh-sftp-server  sshfs \
+    curl rsync \
+    ca-certificates-bundle \
+    ifupdown-ng libcap2 iproute2 iw ifupdown-ng ifupdown-ng-wifi \
+    wpa_supplicant wpa_supplicant-openrc \
+    bridge \
+    socat tcpdump iputils  \
+     \
+    lsblk  hdparm \
+     btrfs-progs duperemove parted dosfstools lsscsi \
+    lvm2 \
+    irqbalance \
+    lm-sensors \
+    mdadm \
+    smartmontools dmidecode \
+      pciutils \
+      sedutils  nvme-cli \
+    \
+     tpm2-tools tpm2-tss-tcti-device \
+      tpm2-tss-tcti-cmd tpm2-tss  
   
-
   # Not sure: this seems to take over some interfaces  
   # dhcpcd
   
   #setup-devd udev
 
-  # Will add busybox-mdev as baseline
-  apk add   busybox-suid busybox-binsh
-    
-  apk add ca-certificates-bundle
-    
+  # busybox will add busybox-mdev as baseline
+  
+      
   # Alternative: dropbear dropbear-openrc
-  apk add openssh openssh-keygen openssh-sftp-server
-
-  apk add curl rsync
-
+  
     # Using it for few things - minisign can probably be used instead.
     # 765k bin + 5M lib
     # apk add openssl
     # apk add ssl_client
-    
-    
-  # from karios - not sure we need it
-  apk add  findutils findmnt \
-    htop haveged \
-    iproute2 \
-    sudo strace util-linux bridge \
-    socat tcpdump iputils procps hdparm
-  
-  # init with a single process. Can reap even if not running as PID1.
-  apk add tini
+      
+  # tini: init with a single process. Can reap even if not running as PID1.
 
   # arch-chroot works great with other OSes
-  apk add arch-install-scripts
 
   # Recovery or host utils
-  apk add eudev eudev-hwids udev-init-scripts \
-      udev-init-scripts-openrc
-  apk del busybox-mdev-openrc mdev-conf || true
-
-  
-  apk add lsblk \
-     btrfs-progs duperemove parted dosfstools
 
   # sgdisk gptfdisk
-
-  apk add iw ifupdown-ng ifupdown-ng-wifi \
-     wpa_supplicant wpa_supplicant-openrc
-
-  apk add tpm2-tools tpm2-tss-tcti-device \
-      tpm2-tss-tcti-cmd tpm2-tss
-
-  apk add   lsscsi \
-    lvm2 \
-    irqbalance \
-    lm-sensors \
-    mdadm \
-    smartmontools 
-
-  apk add dmidecode
 
   # fsverity CLI
   #apk add fsverity-utils
@@ -197,15 +207,9 @@ alpine_add_recovery() {
   # Don't rebuild automatically.
   echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
 
-  apk add efi-mkuki
-  apk add efi-mkkeys
-  apk add sbsigntool
-  
-  apk add squashfs-tools
+  apk add efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
+     binutils uuidgen cryptsetup efibootmgr zstd
 
-  apk add binutils uuidgen
-
-  apk add cryptsetup
 
   # clevis adds bash, jose, cacklib.
   # has nice network-based unlock
@@ -215,24 +219,17 @@ alpine_add_recovery() {
   #apk add minisign
 
   # To modify keys, control efi
-  apk add efibootmgr mokutil
+  # mokutil
 
   # To decompress firmware in zstd format (debian doesn't load it)
-  apk add zstd
-
-
-  # Not used
-  #apk add secureboot-hook
 }
 
 # Base users, groups, packages.
 alpine_add_base() {
-  [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
-
-  mkdir -p /boot/efi
-  mkdir -p /lib/modules
-  mkdir -p /lib/firmware
-  mkdir -p /mnt/usb
+  if [ -e /home/build ]; then
+    return
+  fi
+  
 
   addgroup -g 1000 build
   addgroup -g 1001 admin
@@ -249,7 +246,7 @@ alpine_add_base() {
   addgroup admin kvm
 
   addgroup build users # otherwise swayunlock fails, /etc/shaddow permissions
-  addgroup build video
+
   addgroup build audio
   addgroup build tty
   addgroup build input
@@ -270,22 +267,26 @@ alpine_add_base() {
 # Packages for virtualization on the initos verity image.
 # 
 alpine_add_virt() {
-  df -h
 
   # For OCI interaction - podman can also pull, for building use dev image.
-  apk add crane runc
+  apk add crane runc \
+  podman podman-openrc podman-docker fuse-overlayfs \
+  buildah lxc lxc-openrc lxc-templates lxc-templates-oci lxc-download lxc-bridge \
+  cloud-hypervisor virtiofsd
+
     # podman instead of docker: no daemon. Adds ~70M
 
   # Deps: crun container, gpg, etc
   # /var/lib/containers must be a tmpfs or btrfs (not overlayfs)
   # requires fuse-overlayfs
-  apk add podman podman-openrc podman-docker fuse-overlayfs 
-  apk add buildah
+  
+  # Buildah is temp until I fix the scripts to use buildah for export
+  # lxc - I have one container that uses it, not migrated yet
   # podman-tui
 
   # About 7M extra - better to let the script download the static version
-  #apk add cloud-hypervisor virtiofsd
-  virt_install
+  # This installs the glibc ch-remote... 
+  # virt_install
 
   # similar to ujail and others - no server.
   # nsjail can listen on a port and start container on connection
@@ -293,35 +294,10 @@ alpine_add_virt() {
   # can act as an init (restart on exit)
   # logs of deps (abseil, protobuf)
   #apk add nsjail
-  df -h
 }
 
 
-virt_install() {
-  local d=/opt/virt
-  mkdir -p $d
-  local latest=v44.0
-  curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/ch-remote \
-    -o ${d}/ch-remote
-  chmod +x ${d}/ch-remote
-  # Tested 
-  curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$latest/cloud-hypervisor-static \
-     -o ${d}/cloud-hypervisor
-  chmod +x ${d}/cloud-hypervisor
-
-  # Alpine lacks wget -L
-  curl -L https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish \
-     -o /tmp/virtiofsd.zip
-  unzip /tmp/virtiofsd.zip -d /tmp
-  mv /tmp/target/x86_64-unknown-linux-musl/release/virtiofsd ${d}/virtiofsd
-  rm -rf /tmp/target /tmp/virtiofsd.zip
-
-  # Sidecar should be built after the initrd files are generated.
-  # The lib/modules are in the debian file.
-  cp /data/virt/* /opt/virt/
-}
-
-# Optional - using alpine kernel instead of debian kernel.
+# Optional - using alpine kernel instead of debian kernel. This goes to the rootfs, not sidecar.
 # Doesn't work well with debian rootfs (module loading issues, different gcc)
 # so can't load Nvidia module. Since one of the main goals is to run on servers
 # with nvidia cards - not used.
@@ -345,6 +321,56 @@ virt_install() {
 #   #du -sh /lib/firmware
 #   df -h
 # }
+
+# Wayland UI. Using alpine setup-desktop, which adds 
+# - dbus, elogind, firefox, foot.
+# The sqfs moves from ~310M to 580M
+# The build time also increases from 7 to 9 min 
+add_wui() {
+  #  apk add mesa-dri-gallium
+
+  # Built in option in Alpine.
+  setup-desktop sway 
+
+  apk add labwc \
+  rofi-wayland rofi-pass rofi-top polkit seatd dbus \
+   mc bash bash-completion \
+   kitty kitty-kitten foot \
+    font-jetbrains-mono font-croscore \
+    firefox
+  
+  # Conflicts with rofi - host will not expose X11/kasm anyway,
+  # that should be only in VMs/pods.
+
+  # labwc (pi) can be used instead of sway, OpenBox-based with ALT-TAB
+
+  # make sure video, input, seat groups are added to the UI user
+  # Seatd is required dep of sway and labwc
+ 
+  addgroup build seat
+
+
+  # Terminal and browser is all I need, rest is remote or in opt
+   # required
+   # esr is the less updated long term
+
+}
+
+
+# Native X UI
+xui_alpine() {
+  apk add i3wm dbus-x11
+  apk add tint2 rofi alttab i3status
+  apk add xorg-server
+  apk add xinit
+
+#  apk add xset
+#  apk add xrandr
+#  apk add xmodmap
+#  apk add xinput
+#  apk add xhost
+#  apk add xkill
+}
 
 
 "$@"

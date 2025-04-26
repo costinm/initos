@@ -35,7 +35,9 @@ all() {
   # Get the latest kernel. 'kernel' container
   # When kernel changes, rebuild everything.
   kernel
+  
   buildah rm initos-sidecar | true
+
   sidecar
 
   # The remaining steps are are using the images built above.
@@ -54,7 +56,7 @@ gen() {
 
   # Build the SQFS with the kernel.
   updateDeb
-  updateAlpine
+  updateSidecar
 
   ./sign.sh
 }
@@ -105,7 +107,7 @@ updateDeb() {
   #"$@"
 }
 
-updateAlpine() {
+updateSidecar() {
   rm -rf ${WORK}/efi/sidecar*
   _run_cmd initos-sidecar setup-initos sqfs /data/efi/initos sidecar
   #"$@"

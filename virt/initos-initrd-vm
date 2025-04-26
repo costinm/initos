@@ -12,10 +12,27 @@ initramfs_init_vm() {
   #/bin/sh
   set -x
   mkdir -p /x /z
-
-  # Shared disk with the host. May include modules, rootfs.  
-  mount -t virtiofs /dev/root /z
   
+  # Shared disk with the host. May include modules, rootfs,
+  # startup script.
+  mount -t virtiofs /dev/root /z
+
+  # Initrd customization, may include a shell for debug  
+  if [ -e /z/initos/initrd ]; then
+    . /z/initos/initrd
+  fi
+
+  if [ -n "$KOPT_initos_ip" ] ; then
+    # Setup networking based on kernel options.
+    # IPAM or static config - no DHCP.
+    ifconfig lo up
+    ifconfig eth0 up
+    ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
+    route add default gw $KOPT_initos_gw
+    hostname $KOPT_initos_host
+  fi
+
+
   if [ -e /z/rootfs ]; then 
       # Rootfs on the host, via virtiofs.
       # kitty and other apps don't work on virtiofs
@@ -23,24 +40,45 @@ initramfs_init_vm() {
       if [ -e /dev/vda ]; then
         mount -t btrfs -o nobarrier /dev/vda /x
       fi
-  else
-    if [ -e /dev/vda2 ]; then
-        # TODO: remove this, expect rootfs
-        mount -t btrfs -o nobarrier /dev/vda2 /sysroot
-    elif [ -e /dev/vda ]; then
+  else # /dev/vda is the rootfs
+    if [ -e /dev/vda ]; then
         mount -t btrfs -o nobarrier /dev/vda /sysroot
+    else 
+        echo "No rootfs found"
+        blkid
+        mount
+        ls /z
+        poweroff -f
     fi
+
     # Separate /x - useful if rootfs image is created/updated by a script.
     if [ -e /dev/vdb ]; then
       mount -t btrfs -o nobarrier /dev/vdb /x
     fi
   fi
 
-  
-  ifconfig lo up
-  ifconfig eth0 up
-  ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
-  route add default gw $KOPT_initos_gw
+
+  if [ -f /x/swap ]; then
+    swapon /sysroot/swap
+  fi
+ 
+  # Modules from the shared disk (bind mounts) or separate RO volume.
+  # the rootfs can be a bare container.
+  local kv=$(uname -r)
+  mkdir -p /lib/modules/$kv
+  if [ -d /z/lib/modules/$kv ]; then
+    mount -o bind /z/lib/modules/$kv /lib/modules/$kv
+  fi
+
+  # TODO: load any extra modules (if needed). container-based rootfs may not know how to.
+  modprobe bridge 
+  modprobe nft_socket
+  # Makes pmem accessibe
+  modprobe pmem
+
+  mount LABEL=X /x || true
+  mkdir -p /x/@cache
+  mount LABEL=CACHE /x/@cache || true
 
   # initcmd is used to debug/test the pre-switch root portion.
   # It can be a shell or a command to display info and exit (to check startup time to this point)
@@ -49,23 +87,34 @@ initramfs_init_vm() {
     ${KOPT_initos_initcmd}
     poweroff -d 0 -f
   fi
+
   if [ ! -e /sysroot/etc ]; then
-      echo "No rootfs found"
+      echo "No rootfs /etc found"
+      blkid
+      mount
+      ls /z
       poweroff -f
   fi
-  # cp /sbin/initos* /sysroot/sbin
-  # rm -f /sysroot/.dockerenv
 
   # This is the VM startup script - if not present, copy it over.
-  if [ ! -f /sysroot/initos/bin/initos-init-vm ]; then
-    mkdir -p /sysroot/initos/bin
-    cp /opt/virt/initos-init-vm /sysroot/initos/bin
+  if [ -f /z/initos/start ]; then
+    move_mounted_to_sysroot
+    # Has access to KOPT_cmd and other env variables.
+    exec switch_root /sysroot /z/initos/start
   fi
-
-
+ if [ -f /sysroot/lib/systemd/systemd ]; then
+    move_mounted_to_sysroot
+    #exec switch_root /sysroot /usr/bin/systemd --system 
+    exec switch_root /sysroot /usr/bin/systemd --system --log-level=err  --system \
+       --default-standard-output=tty --default-standard-error=tty
+   # --unit=rescule.target
+ elif [ -f /sysroot/sbin/init ]; then
+    move_mounted_to_sysroot
+    exec switch_root /sysroot /sbin/init
+ else
   move_mounted_to_sysroot
-  # Has access to KOPT_cmd and other env variables.
-  exec switch_root /sysroot /initos/bin/initos-init-vm
+  exec switch_root /sysroot /bin/sh
+ fi 
 }
 
 ## First step - expand busybox and mount the basic filesystems.

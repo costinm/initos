@@ -94,7 +94,7 @@ function tools() {
   $APTINSTALL wget curl ca-certificates gpg \
      net-tools vim mc tmux \
    git less bash-completion \
-   openssh-server 
+   openssh-server  rsync
 
   # SSH: used by code
 }

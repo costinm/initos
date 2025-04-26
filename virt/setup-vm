@@ -5,6 +5,8 @@
 # - starts with an OCI image or already expanded rootfs
 # - generate startup scripts
 
+IMGDIR=/x/vol/images
+SIZE=${SIZE:-10G}
 
 fix() {
     setcap cap_net_admin+ep /opt/virt/cloud-hypervisor
@@ -27,7 +29,8 @@ mkdisk() {
   local img=$1
 
   mkdir -p ${IMGDIR}
-  truncate -s ${vm_disk} ${IMGDIR}/${VM}.img
+  
+  truncate -s ${SIZE} ${IMGDIR}/${POD}.img
   # Same as - but simpler/faster than
   # qemu-img create -f raw ${WORK}/disk.img 10G
 
@@ -36,11 +39,29 @@ mkdisk() {
 
   mkdir -p ${WORK}/rootfs
 
-  mkfs.btrfs ${IMGDIR}/${VM}.img --rootdir ${WORK}/rootfs
+  buildah run --mount=type=bind,from=$img,src=/,dst=/rootfs \
+     -v ${IMGDIR}:${IMGDIR} initos-sidecar \
+    mkfs.btrfs ${IMGDIR}/${POD}.img --rootdir /rootfs
   #parted $dev mklabel gpt
 
   # --shrink will keep the image at the required size - can be used for a base image.
 }
+
+# TODO: make a read-only disk with 
+
+mkdiskX() {
+  local label=$1
+  local dir=$2
+  SIZE=${SIZE:-10G}
+
+  local temp_dir=$(mktemp -d)
+  trap "rm -rf $temp_dir" EXIT
+  mkdir -p $temp_dir/$dir
+  
+  truncate -s ${SIZE} ${IMGDIR}/${POD}-data.img
+  mkfs.btrfs ${IMGDIR}/${POD}-data.img -L X -R $temp_dir
+}
+
 
 # Download the binaries required for running VMs.
 # 
@@ -98,7 +119,7 @@ initrd() {
   ln -s ${BASE}/lib/modules/${VER} /lib/modules || true
   cp ${BASE}/boot/vmlinuz-${VER} ${DEST}/vmlinuz
 
-  mkinitfs -k  -i ${SRC}/initos-initrd-vm \
+  /sbin/mkinitfs -k  -i ${SRC}/initos-initrd-vm \
      -F "base btrfs virtio initosvm" \
      -o ${DEST}/initramfs ${VER}
 }
