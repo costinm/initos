@@ -47,6 +47,22 @@ mkdisk() {
   # --shrink will keep the image at the required size - can be used for a base image.
 }
 
+# TODO: make a read-only disk with 
+
+mkdiskX() {
+  local label=$1
+  local dir=$2
+  SIZE=${SIZE:-10G}
+
+  local temp_dir=$(mktemp -d)
+  trap "rm -rf $temp_dir" EXIT
+  mkdir -p $temp_dir/$dir
+  
+  truncate -s ${SIZE} ${IMGDIR}/${POD}-data.img
+  mkfs.btrfs ${IMGDIR}/${POD}-data.img -L X -R $temp_dir
+}
+
+
 # Download the binaries required for running VMs.
 # 
 # Currently using cloud-hypervisor and virtiofsd.

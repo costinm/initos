@@ -27,7 +27,6 @@ startX() {
  sleep 1
  echo "X STARTED"
  kitty &
- i3  &
  echo DONE
  sleep infinity
 }

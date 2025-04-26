@@ -9,6 +9,24 @@ initos_init() {
   # Additional drivers with the real firmware and modules mounted. 
   load_drivers
 
+  # Security note: if they key is in the TPM and an attacker removes the
+  # tpm_handle, it falls back to manual unlock. Attacker can swap the disk 
+  # and unlock - then read the key from the TPM. That's not good...
+  # 
+  # Even if the EFI had a signed tpm_handle or had a separate EFI for 
+  # manual unlock - it would still be possible to swap the disk and use the 
+  # manual unlock. 
+  # 
+  # One way is to have the unattended unlock use separate signing
+  # keys. That is fine - since the server machines can use a different release
+  # cycle than regular laptops.
+  # 
+  # The other is to have an 'escrow', encrypted with a recovery key and signed
+  # by the root CA. User will need to decrypt - the value is the LUKS key - 
+  # and we can verify the signature. WIP 
+
+  # TODO: update the scripts to disable manual, and split the builder.
+
   if [ -f /boot/efi/initos/tpm_handle ]; then 
     unlock_tpm
 
@@ -18,7 +36,11 @@ initos_init() {
       echo
       echo -n "Enter the disk (LUKS) password (attempt $i of 3): "
       read -s KEY
-
+  
+      # TODO: use KEY to decrypt the real KEY, verify.
+      # We may as well use the alpine overlay, load additional configs
+      # like ssh key and support the case where the LUKS is not setup
+      # ( i.e. installer )
       open_disks "$KEY"
       
       if [ -e /dev/mapper/luks-1 ]; then
@@ -49,26 +71,25 @@ initos_init() {
       lfatal "Failed to mount btrfs"
   fi
 
+  # Will either give control to the rootfs (Systemd or init) or 
+  # start the sidecar to manage the hardware and return.
   start_os
-  echo "InitOS started. Press 't' to start agetty on tty1"
-  read -t 50 -n 1 key
-  if [ "$key" = "t" ]; then
-    ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
-    /etc/init.d/agetty.tty1 start
-  elif [ "$key" = "c" ]; then
-    # This is for testing - need to find a password 
-    echo "WIP: UI for laptop"
-    /etc/init.d/seatd start
-    export XDG_RUNTIME_DIR=/run/user/$(id -u build)
-    mkdir -p $XDG_RUNTIME_DIR
-    chown build $XDG_RUNTIME_DIR
-    if [ "$MANUAL_UNLOCK" = "1" ]; then
-      echo "Manual unlock mode - starting shell"
-      su - build /sbin/initos ui
-    else 
-      login -f build 
-    fi
-  fi
+
+  /etc/init.d/seatd start
+  export XDG_RUNTIME_DIR=/run/user/$(id -u build)
+  mkdir -p $XDG_RUNTIME_DIR
+  chown build $XDG_RUNTIME_DIR
+
+  # tty2 is not very reliable on some old chromeos laptops (keyboard)
+  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
+
+  # This is called if initos ssh/udev/etc are started, main 
+  # OS will be in a container or VM.
+  echo "InitOS started. Press a key to start 'login'"
+  # Give some time to read the ip address for ssh, agetty cleans the 
+  # screen.
+  read -t 30 -n 1 key
+  /etc/init.d/agetty.tty1 start
 
   exec tini -s sleep -- infinity 
 }
@@ -85,7 +106,32 @@ initos_init() {
 load_drivers() {
   sysctl -w kernel.printk="0 4 1 7" > /dev/null 2>&1
 
-    # this is normally done by sysinit - we want tpm2 to be loaded
+  modprobe vfio_iommu_type1  allow_unsafe_interrupts
+  modprobe vfio_pci
+
+  # Bind nvidia to vfio-pci - this will break Nvidia.
+  # TODO: use a file or read a key to control. Screen will freeze.
+
+  #  lspci -n -s 0x:0x.0 to find the vendor ID
+
+  
+  if [ -f /boot/efi/vfio ]; then 
+    set -x 
+    read -t 2 -n 1 key
+    if [ ! "$key" = "t" ]; then 
+      cat /boot/efi/vfio | while read V1 V2 ; do 
+        echo $V1 $V2 > /sys/bus/pci/drivers/vfio-pci/new_id 
+      done
+    fi 
+  # Alternatively, options vfio-pci ids=1002:687f,1002:aaf8
+  # in /etc/modprobe.d - but I think this is more reliable.
+  #echo 10de 1f82 > /sys/bus/pci/drivers/vfio-pci/new_id &
+  #echo 10de 10fa > /sys/bus/pci/drivers/vfio-pci/new_id &
+  # Second device: # echo 0000:02:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
+
+  fi
+
+  # this is normally done by sysinit - we want tpm2 to be loaded
   # Needs to happen after full firmware and modules are in place
   hwdrivers > /tmp/hwdrivers.log 2>&1
 
@@ -207,7 +253,7 @@ open_disks() {
   
   local cnt=1
   echo "$parts" | while read -r part; do 
-    echo -n "$KEY" | cryptsetup open $part luks-${cnt} -
+    echo -n "$KEY" | cryptsetup open --persistent --allow-discards --perf-no_read_workqueue --perf-no_write_workqueue $part luks-${cnt} -
     if [ $? -eq 0 ]; then
       logi "Opened $part"
       cnt=$((cnt + 1))
@@ -325,7 +371,8 @@ mount_sysroot() {
   if [ -d ${x}/@home ] ; then
     mount -o bind ${x}/@home /home
   fi
-  if [ -d ${x}/@cache ]; then
+  # Not backing up cache
+  if [ -d /x/@cache ]; then
     mount -o bind ${x}/@cache /var/cache
 
     mkdir -p /x/@cache/vartmp /x/@cache/containers /var/tmp # For buildah overlay, most be on same disk

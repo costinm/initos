@@ -168,6 +168,9 @@ start() {
   CMD_OPTS="$CMD_OPTS initos.host=${POD}"
   CMD_OPTS="$CMD_OPTS net.ifnames=0 initos.ip=${vm_ip} initos.gw=${vm_gw}"
   
+  if [ -f ${WORK}/kernel ] ; then 
+    OPTS="$OPTS --kernel ${VIRT}/vmlinuz"
+  fi
   OPTS="$OPTS --kernel ${VIRT}/vmlinuz"
   OPTS="$OPTS --initramfs ${VIRT}/initramfs "
 
@@ -188,6 +191,9 @@ start() {
   if [ -f ${IMGDIR}/${VM}-data.img ]; then
     DISKS="$DISKS path=${IMGDIR}/${VM}-data.img" 
   fi
+  if [ -f ${IMGDIR}/${VM}-cache.img ]; then
+    DISKS="$DISKS path=${IMGDIR}/${VM}-cache.img" 
+  fi
   OPTS="$OPTS $DISKS"
     
   #  --vsock \
@@ -198,8 +204,11 @@ start() {
  
   #set -x
 
-  mkdir -p ${WORK}/share/lib/modules
-  mount -o bind /initos/rootfs/lib/modules ${WORK}/share/lib/modules
+  # Loading Nvidia drivers from share modules doesn't work.
+  # 
+  # 
+  #mkdir -p ${WORK}/share/lib/modules
+  #mount -o bind /initos/rootfs/lib/modules ${WORK}/share/lib/modules
 
   if [ "${DEBUG}" = "init" ]; then
     # Debian kernel doesn't seem to work with hvc0, serial is fine

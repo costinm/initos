@@ -12,14 +12,7 @@ initramfs_init_vm() {
   #/bin/sh
   set -x
   mkdir -p /x /z
-
-  # Setup networking based on kernel options.
-  # IPAM or static config - no DHCP.
-  ifconfig lo up
-  ifconfig eth0 up
-  ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
-  route add default gw $KOPT_initos_gw
-
+  
   # Shared disk with the host. May include modules, rootfs,
   # startup script.
   mount -t virtiofs /dev/root /z
@@ -29,7 +22,16 @@ initramfs_init_vm() {
     . /z/initos/initrd
   fi
 
-  hostname $KOPT_initos_host
+  if [ -n "$KOPT_initos_ip" ] ; then
+    # Setup networking based on kernel options.
+    # IPAM or static config - no DHCP.
+    ifconfig lo up
+    ifconfig eth0 up
+    ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
+    route add default gw $KOPT_initos_gw
+    hostname $KOPT_initos_host
+  fi
+
 
   if [ -e /z/rootfs ]; then 
       # Rootfs on the host, via virtiofs.
@@ -39,10 +41,7 @@ initramfs_init_vm() {
         mount -t btrfs -o nobarrier /dev/vda /x
       fi
   else # /dev/vda is the rootfs
-    if [ -e /dev/vda2 ]; then
-        # TODO: remove this, expect rootfs
-        mount -t btrfs -o nobarrier /dev/vda2 /sysroot
-    elif [ -e /dev/vda ]; then
+    if [ -e /dev/vda ]; then
         mount -t btrfs -o nobarrier /dev/vda /sysroot
     else 
         echo "No rootfs found"
@@ -58,6 +57,7 @@ initramfs_init_vm() {
     fi
   fi
 
+
   if [ -f /x/swap ]; then
     swapon /sysroot/swap
   fi
@@ -69,6 +69,16 @@ initramfs_init_vm() {
   if [ -d /z/lib/modules/$kv ]; then
     mount -o bind /z/lib/modules/$kv /lib/modules/$kv
   fi
+
+  # TODO: load any extra modules (if needed). container-based rootfs may not know how to.
+  modprobe bridge 
+  modprobe nft_socket
+  # Makes pmem accessibe
+  modprobe pmem
+
+  mount LABEL=X /x || true
+  mkdir -p /x/@cache
+  mount LABEL=CACHE /x/@cache || true
 
   # initcmd is used to debug/test the pre-switch root portion.
   # It can be a shell or a command to display info and exit (to check startup time to this point)

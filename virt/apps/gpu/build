@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Location of the home template ( configs, etc )
+USER_HOME=${USER_HOME:-${HOME}/ws/home}
+POD=gpuvm
+
+build() {
+    buildah --name ${POD} from debian:bookworm
+
+    buildah copy ${POD} sbin/ /sbin
+    buildah run -v $(pwd):/data ${POD}  /sbin/setup-deb all
+
+    buildah copy ${POD} ../../../rootfs/etc/ /etc
+}
+
+push() {
+    buildah commit ${POD} git.h.webinf.info/costin/dev/gpu:latest
+    buildah push git.h.webinf.info/costin/dev/gpu:latest
+}
+
+pull() {
+  buildah from --name ${POD} git.h.webinf.info/costin/dev/gpu:latest
+}
+
+img() {
+    buildah run -v $(pwd):/data ${POD}  /sbin/setup-deb img
+
+}
+
+"$@"

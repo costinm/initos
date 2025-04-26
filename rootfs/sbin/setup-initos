@@ -138,7 +138,8 @@ debian_rootfs_base() {
 
 add_deb_core() {
   $APTINSTALL ca-certificates curl gpg  \
-     linux-headers-$(cat /boot/version) 
+     linux-headers-$(cat /boot/version) \
+     linux-headers-$(cat /boot/cloud-version) 
 
 
   $APTINSTALL  tpm2-tools  \
@@ -149,8 +150,9 @@ add_deb_core() {
      wireless-tools bridge-utils net-tools tcpdump iptables iproute2  \
     nftables iperf3 openssh-server  iw \
     \
-    cryptsetup efibootmgr squashfs-tools 
+    cryptsetup efibootmgr squashfs-tools pciutils
 
+  #systemctl enable ssh.service
 }
 
 # Adds Kernel, firmware, Nvidia driver.
@@ -171,13 +173,14 @@ add_deb_kernel_nvidia() {
 
   curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
   dpkg -i /tmp/cuda.deb
-  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
-  
-  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ] ; then
+     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+      tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+     apt update
+  fi
     
-  apt update
   
   # The debian kernel (old) can be instlled with:
   #$APTINSTALL nvidia-driver 
@@ -186,6 +189,9 @@ add_deb_kernel_nvidia() {
   $APTINSTALL cuda-drivers
   $APTINSTALL nvidia-container-toolkit  
  
+  
+  /usr/lib/dkms/dkms_autoinstaller start $(cat /boot/version )
+  dkms status
 }
 
 # Save the kernel and modules on /data, to be used by the 'sign' image and
@@ -240,7 +246,7 @@ add_deb_kernel() {
 
   find . | cpio -o -H newc >/boot/intel-ucode.img
 
-  ver=$(ls /lib/modules)
+  ver=$(ls /lib/modules |grep -v cloud)
   echo -n ${ver} > /boot/version
 
   # Also install the cloud kernel - upgrade them at the same cadence, and
@@ -248,20 +254,11 @@ add_deb_kernel() {
   # Images grows from 795 -> 909 M, Initos image from 568-> 634
   $APTINSTALL \
      linux-image-cloud-amd64
+  ver=$(ls /lib/modules |grep cloud)
+  echo -n ${ver} > /boot/cloud-version
 
   # Can't stop the creation - but not used. Just need the kernel and modules.
   rm -rf /boot/initrd.img* /tpm/* /tmp/* || true
-}
-
-add_virt_kernel() {
-  apt update
-  export INITRD=No
-  %APTINSTALL  \
-     linux-image-cloud-amd64
-  ver=$(ls /lib/modules)
-  echo -n ${ver} > /boot/versionv
-  # Can't stop the creation - but not used. Just need the kernel and modules.
-  rm -rf /boot/initrd.img*  || true
 }
 
 
