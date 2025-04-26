@@ -337,7 +337,10 @@ add_wui() {
    mc bash bash-completion \
    kitty kitty-kitten foot \
     font-jetbrains-mono font-croscore \
-    firefox
+    chromium nix
+
+  # Firefox: doesn't work well with kasmvnc
+
   
   # Conflicts with rofi - host will not expose X11/kasm anyway,
   # that should be only in VMs/pods.

@@ -87,7 +87,9 @@ debian_rootfs_base() {
   
   add_deb_core
 
-  add_deb_kernel_nvidia
+  # No longer installing the nvidia driver - should be in a 
+  # VM, pcie delegation works pretty well and better to isolate it.
+  ### add_deb_kernel_nvidia
 }
 
 add_deb_core() {
@@ -138,13 +140,9 @@ add_deb_kernel_nvidia() {
   #$APTINSTALL nvidia-driver 
 
   # This has systemd as a dependency...
-  $APTINSTALL cuda-drivers      linux-headers-$(cat /boot/version) 
-          
-     #linux-headers-$(cat /boot/cloud-version) 
-
+  $APTINSTALL cuda-drivers linux-headers-$(cat /boot/version) 
   $APTINSTALL nvidia-container-toolkit  
  
-  
   /usr/lib/dkms/dkms_autoinstaller start $(cat /boot/version )
   dkms status
 }
@@ -186,13 +184,14 @@ add_deb_kernel() {
   ver=$(ls /lib/modules |grep -v cloud)
   echo -n ${ver} > /boot/version
 
+  # No longer doing this - separate builder/image for VMs. 
   # Also install the cloud kernel - upgrade them at the same cadence, and
   # will be used to run the real root as a VMs for more security.
   # Images grows from 795 -> 909 M, Initos image from 568-> 634
-  $APTINSTALL \
-     linux-image-cloud-amd64
-  ver=$(ls /lib/modules |grep cloud)
-  echo -n ${ver} > /boot/cloud-version
+  # $APTINSTALL \
+  #    linux-image-cloud-amd64
+  # ver=$(ls /lib/modules |grep cloud)
+  # echo -n ${ver} > /boot/cloud-version
 
   # Can't stop the creation - but not used. Just need the kernel and modules.
   rm -rf /boot/initrd.img* /tpm/* /tmp/* || true

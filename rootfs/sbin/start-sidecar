@@ -4,8 +4,12 @@
 # Primary use is systemd which kills all processes when switching.
 # Should be used in rc.local or in a systemd unit.
 
+TAG=${TAG:-latest}
+REPO=${REPO:-ghcr.io/costinm/initos}
+
 # chroot /initos/sidecar can be used after.
 
+# Default - run it as a chroot (arch-chroot handles that well)
 sidecar() {
   # Using chroot to run a different image, not to isolate.
   mount -o bind /x /initos/sidecar/x
@@ -19,5 +23,25 @@ sidecar() {
   # priv container. 
 }
 
+priv() {
+  docker pull ${REPO}/initos-sidecar:${TAG}
+  docker run --name initos-sidecar \
+    --rm -it \
+    --network host \
+    --cap-add=ALL \
+    --privileged \
+    --security-opt seccomp=unconfined \
+    --device /dev/fuse \
+    --device /dev/kvm \
+    --device /dev/dri \
+    --device /dev/tty0 \
+    -v /x:/x \
+    -v /:/rootfs \
+    ${REPO}/initos-sidecar:${TAG} tini sleep infinity 
+
+    #-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    #-v /run/user/1000/podman/podman.sock:/run/user/1000/podman/podman.sock
+
+}
 
 "$@"
