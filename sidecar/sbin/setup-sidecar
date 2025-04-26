@@ -33,10 +33,10 @@ install() {
 
   (cd /etc/init.d && ln -s agetty agetty.tty1)
   (cd /etc/init.d && ln -s agetty agetty.tty2)
-  set -e
+  #set -e
 
   #rc-update add agetty.tty1 boot
-  rc-update add agetty.tty2 default
+  #rc-update add agetty.tty2 default
   #rc-update add agetty.ttyS0 boot
   #rc-update add agetty.hvc0 boot
 

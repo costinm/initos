@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Script to start the InitOS sidecar from the host.
+# Primary use is systemd which kills all processes when switching.
+# Should be used in rc.local or in a systemd unit.
+
+# chroot /initos/sidecar can be used after.
+
+sidecar() {
+  # Using chroot to run a different image, not to isolate.
+  mount -o bind /x /initos/sidecar/x
+  mount -o bind / /initos/sidecar/sysroot
+  
+  # The arch script takes care of sys, etc.
+  /initos/sidecar/usr/bin/arch-chroot \
+    /initos/sidecar /sbin/initos init_sidecar &
+
+  # alternative: docker/podman/direct crun to keep it in a 
+  # priv container. 
+}
+
+
+"$@"

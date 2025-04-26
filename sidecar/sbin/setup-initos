@@ -1,0 +1,169 @@
+#!/bin/sh
+
+# Build script for initos. The build typically runs 
+# inside a container with optional volumes for cache.
+#
+# The 'sign' function is the entrypoint for the container, will
+# generate a signed efi partition including the sqfs signed image
+# and patching.
+# 
+# The results:
+# - creating a 'base-recovery' image, that can be run in Docker in a trusted machine to generate signed
+# artifacts including bootstrap ssh authorized keys and user-specific roots of trust.
+#
+# - creation of a directory containing all artifacts needed for install by copying to an existing
+# USB EFI partition.
+#
+
+set -x
+set -e
+
+# Destination dir for the efi partition artifacts.
+# May include additional files to bake into images.
+# Signing the images also requires a volume holding the signing keys
+# and configs.
+WORK=${WORK:-/data}
+
+mkdir -p ${WORK}/efi/EFI/BOOT /opt/virt
+
+
+# Build the initramfs for the real kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the lighter musl binaries.
+build_initrd() {
+  local VER=${1:-$(cat /boot/version)}
+  local img=${2:-/boot/initos-initrd.img}
+
+  [ ! -f /lib/modules/${VER}/modules.dep ] && echo "Missing modules" && return
+
+    # Uses mkinitfs.conf added from file in the docker image.
+    # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
+
+    # -k - keep the file
+    # -t - temp dir where all is stored
+    # -i - what init file to use - replace default with our script.
+    #rm -rf ${WORK}/initrd
+    # -k -t ${WORK}/initrd
+
+    # Not loaded: btrfs, tpm2
+
+    # Technically cryptsetup, tpm could be loaded from recovery
+    # image, with a double pivot.
+    cp /etc/passwd /usr/share/mkinitfs/passwd
+    cp /etc/group /usr/share/mkinitfs/group
+
+    #echo "features=\"ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
+    
+    # clevis ? 
+    #rm -rf ${WORK}/initfs.host
+    # -t ${WORK}/initfs.host
+    mkinitfs -i /sbin/initos-initrd \
+      -F "ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev" \
+      -o ${img} $VER
+
+    # /init will be the inito-initrd
+
+    # Add -k to keep and inspect, or extract it
+    # Currently 90M, 54M in modules.
+}
+
+
+# Creat a sqfs under $1 with the name $2, containing all files in this 
+# container. 
+#
+# Another way is to export (pull and export or using crane) and create 
+# the sqfs externally.
+sqfs() {
+  local DIR=${1:-/data/efi/initos}
+  local name=${2:-initos}
+
+  # -one-file-system also works on the host - but not so well in a container.
+
+  # buildah unshare -m A=debui -- \
+  #  sh -c 'tar -cf - -C ${A} .' | \
+  #   sqfstar ${WORK}/vimg/virt.sqfs -e .dockerenv
+
+  #alpine_clear
+
+  # Excluding boot from the sqfs (kernel remains on the image and is used to build
+  # the EFI, but no need to add a copy)
+  # However the cloud kernel is needed for VM
+
+  mkdir -p ${DIR}
+  rm -f ${DIR}/${name}.*
+
+  cd /
+
+  # Doesn't include /boot files (kernel is separate)
+  # Includes both normal and cloud modules
+  mksquashfs . ${DIR}/${name}.sqfs \
+     -regex \
+     -e "x/.*" \
+     -e "etc/uefi-keys" \
+     -e ".dockerenv" \
+     -e "data/.*" \
+     -e "proc/.*" \
+     -e "sys/.*" \
+     -e "run/.*" \
+     -e "tmp/.*" \
+     -e "var/cache/apt/.*" \
+     -e "etc/apk/cache.*"
+    
+  # Not excluding boot, lib - work and ws are no longer mounted (old versions)
+
+  echo "Created ${DIR}/${name}.sqfs"
+}
+
+alpine_clear() {
+  rm /var/lib/dbus/machine-id || true
+  rm /etc/hostname || true
+  rm /etc/resolv.conf || true
+  echo "" > /etc/machine-id || true
+}
+
+
+# vinit updates the initram-Fs for the virt kernel
+# Expectes /boot, /lib/modules, /lib/firmware to have the right
+# mounts and /boot/version-virt to hold the desired kernel version.
+# 
+# This runs in an alpine container (for now) - the init will be based
+# on the ligher musl binaries.
+vinit() {
+  local DEST=${1:-/data/virt}
+
+  VER=$(ls /lib/modules | grep cloud | tail)
+
+  mkdir -p ${DEST}
+
+  cp /boot/vmlinuz-${VER} ${DEST}/vmlinuz
+  # btrfs is pretty slow for a VM - the rootfs may have all the modules
+  # and load it as needed.
+  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
+  # or on virtio.
+  mkinitfs -k  -i /opt/virt/initos-initrd-vm \
+     -F "base btrfs virtio initosvm" \
+     -o ${DEST}/initramfs ${VER}
+}
+
+
+setup_initrd() {
+  build_initrd 
+  vinit
+}
+
+# Single step (using crate to pull the 2 rootfs), or using docker export
+buildFromExport() {
+  # Check if the files exist (can be created with docker export)
+  #crane export  git.h.webinf.info/costin/initos-sidecar:latest /data/sidecar
+  crane export  ${REPO}/initos-sidecar:${TAG} | tar -C /data/sidecar -xf - 
+  crane export  ${REPO}/initos-rootfs:${TAG} | tar -C /data/rootfs -xf -
+  rm -rf /data/efi/initos/sidecar*
+  (cd /data/sidecar ;  mksquashfs . /data/efi/initos/sidecar.sqfs  ) 
+  rm -rf /data/efi/initos/initos*
+  (cd /data/rootfs ;  mksquashfs . /data/efi/initos/initos.sqfs ) 
+}
+
+"$@"
