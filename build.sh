@@ -49,7 +49,7 @@ all() {
 
 # Gen is called after the 2 containers are build or pulled/started
 gen() {
-  _run_cmd kernel /sbin/setup-initos save_boot
+  _run_cmd kernel /sbin/setup-deb save_boot
   # Generate the initrd files (on /data), virtual initrd is copied 
   # over to the sidecar container 
   initrd
@@ -66,7 +66,7 @@ gen() {
 # Can be extended with more debian packages.
 # This also generates /data/efi/initos/initos.sqfs and /data/lib, boot for later stages.
 kernel() {
-  _build_cmd debian:bookworm-slim kernel /sbin/setup-initos debian_rootfs_base
+  _build_cmd debian:bookworm-slim kernel /sbin/setup-deb debian_rootfs_base
 
 }
 
@@ -103,7 +103,7 @@ sidecar() {
 # Can run commands with 'buildah run kernel' - this updates the sqfs.
 updateDeb() {
   rm -rf ${WORK}/efi/initos*
-  _run_cmd kernel setup-initos sqfs /data/efi/initos
+  _run_cmd kernel setup-deb sqfs /data/efi/initos
   #"$@"
 }
 
@@ -145,6 +145,7 @@ _run_cmd() {
   VOLS="$VOLS -v ${WORK}:/data"
 
   buildah copy ${POD} rootfs/sbin /sbin
+  buildah copy ${POD} sidecar/sbin /sbin
 
   buildah run ${VOLS} ${POD} -- "$@"
   buildah copy ${POD} rootfs/etc /etc

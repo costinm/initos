@@ -3,24 +3,6 @@
 # Various small scripts to automate post-boot use in the host sidecar. 
 # 
 
-# Sidecar is run at startup from rc.local, after swap_root, once.
-# 
-# chroot /initos/sidecar can be used after.
-# Not needed if the 'real' rootfs is running in a container or VM.
-# Systemd is killing all processes - so this is started from systemd (or native OS).
-sidecar() {
-  # Using chroot to run a different image, not to isolate.
-  mount -o bind /x /initos/sidecar/x
-  mount -o bind / /initos/sidecar/sysroot
-  
-  # The arch script takes care of sys, etc.
-  /initos/sidecar/usr/bin/arch-chroot \
-    /initos/sidecar /sbin/initos init_sidecar &
-
-  # alternative: docker/podman/direct crun to keep it in a 
-  # priv container. 
-}
-
 # init_sidecar is called in a chroot or privileged container, from
 # a systemd-rootfs. 
 init_sidecar() {

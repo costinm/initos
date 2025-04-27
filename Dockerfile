@@ -20,7 +20,7 @@ COPY ./rootfs/sbin /sbin
 
 RUN --mount=target=/var/lib/cache,id=apt,type=cache \
   --mount=target=/data,from=data,rw \
-   setup-initos debian_rootfs_base
+   setup-deb debian_rootfs_base
 
 
 ######## TODO: Arch

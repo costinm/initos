@@ -1,19 +1,7 @@
 #!/bin/sh
 
-# Build script for initos. The build typically runs 
-# inside a container with optional volumes for cache.
-#
-# The 'sign' function is the entrypoint for the container, will
-# generate a signed efi partition including the sqfs signed image
-# and patching.
-# 
-# The results:
-# - creating a 'base-recovery' image, that can be run in Docker in a trusted machine to generate signed
-# artifacts including bootstrap ssh authorized keys and user-specific roots of trust.
-#
-# - creation of a directory containing all artifacts needed for install by copying to an existing
-# USB EFI partition.
-#
+# Build script for a debian rootfs.
+# Kernel, Nvidia modules and basic utils.
 
 set -x
 set -e
@@ -24,50 +12,22 @@ set -e
 # and configs.
 WORK=${WORK:-/data}
 
-mkdir -p ${WORK}/efi/EFI/BOOT /opt/virt
-
-
-# Build the initramfs for the real kernel
-# Expectes /boot, /lib/modules, /lib/firmware to have the right
-# mounts and /boot/version to hold the desired kernel version.
-# 
-# This runs in an alpine container (for now) - the init will be based
-# on the lighter musl binaries.
-build_initrd() {
-  local VER=${1:-$(cat /boot/version)}
-  local img=${2:-/boot/initos-initrd.img}
-
-  [ ! -f /lib/modules/${VER}/modules.dep ] && echo "Missing modules" && return
-
-    # Uses mkinitfs.conf added from file in the docker image.
-    # Other options: virtio, squashfs, 9p, raid, cdrom, lvm, ext4, kms (video)
-
-    # -k - keep the file
-    # -t - temp dir where all is stored
-    # -i - what init file to use - replace default with our script.
-    #rm -rf ${WORK}/initrd
-    # -k -t ${WORK}/initrd
-
-    # Not loaded: btrfs, tpm2
-
-    # Technically cryptsetup, tpm could be loaded from recovery
-    # image, with a double pivot.
-    cp /etc/passwd /usr/share/mkinitfs/passwd
-    cp /etc/group /usr/share/mkinitfs/group
-
-    #echo "features=\"ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
-    
-    # clevis ? 
-    #rm -rf ${WORK}/initfs.host
-    # -t ${WORK}/initfs.host
-    mkinitfs -i /sbin/initos-initrd \
-      -F "ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev" \
-      -o ${img} $VER
-
-    # /init will be the inito-initrd
-
-    # Add -k to keep and inspect, or extract it
-    # Currently 90M, 54M in modules.
+# Save the kernel and modules on /data, to be used by the 'sign' image and
+# to build the initrd.
+# Dockerfile is bind-mounting from the kernel stage - with buildah it is faster
+# to copy (at least on btrfs, COW) - it can't mount from a container and creating
+# an image involves tar, so no longer COW.
+#
+# The other choice is to have a large 'sign' image that bundles the kernel
+# and modules and is updated with every kernel release. 
+# Since one way or another we need /data and /config for signing, we may 
+# as well use a separate step of creating the boot/ and lib/modules which
+# don't change except on new kernel releases.
+save_boot() {
+  mkdir -p /data/lib /data/boot
+  cp -a /boot/* /data/boot
+  cp -a /lib/modules /data/lib
+  cp -a /lib/firmware /data/lib
 }
 
 
@@ -117,12 +77,6 @@ sqfs() {
   echo "Created ${DIR}/${name}.sqfs"
 }
 
-alpine_clear() {
-  rm /var/lib/dbus/machine-id || true
-  rm /etc/hostname || true
-  rm /etc/resolv.conf || true
-  echo "" > /etc/machine-id || true
-}
 
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
@@ -194,24 +148,6 @@ add_deb_kernel_nvidia() {
   dkms status
 }
 
-# Save the kernel and modules on /data, to be used by the 'sign' image and
-# to build the initrd.
-# Dockerfile is bind-mounting from the kernel stage - with buildah it is faster
-# to copy (at least on btrfs, COW) - it can't mount from a container and creating
-# an image involves tar, so no longer COW.
-#
-# The other choice is to have a large 'sign' image that bundles the kernel
-# and modules and is updated with every kernel release. 
-# Since one way or another we need /data and /config for signing, we may 
-# as well use a separate step of creating the boot/ and lib/modules which
-# don't change except on new kernel releases.
-save_boot() {
-  mkdir -p /data/lib /data/boot
-  cp -a /boot/* /data/boot
-  cp -a /lib/modules /data/lib
-  cp -a /lib/firmware /data/lib
-}
-
 # Adds Kernel, firmware
 # Builds the initrd images for intel/amd uCode.
 add_deb_kernel() {
@@ -261,51 +197,5 @@ add_deb_kernel() {
   rm -rf /boot/initrd.img* /tpm/* /tmp/* || true
 }
 
-
-# vinit updates the initram-Fs for the virt kernel
-# Expectes /boot, /lib/modules, /lib/firmware to have the right
-# mounts and /boot/version-virt to hold the desired kernel version.
-# 
-# This runs in an alpine container (for now) - the init will be based
-# on the ligher musl binaries.
-vinit() {
-  local DEST=${1:-/data/virt}
-
-  VER=$(ls /lib/modules | grep cloud | tail)
-
-  mkdir -p ${DEST}
-
-  cp /boot/vmlinuz-${VER} ${DEST}/vmlinuz
-  # btrfs is pretty slow for a VM - the rootfs may have all the modules
-  # and load it as needed.
-  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
-  # or on virtio.
-  mkinitfs -k  -i /opt/virt/initos-initrd-vm \
-     -F "base btrfs virtio initosvm" \
-     -o ${DEST}/initramfs ${VER}
-}
-
-
-setup_initrd() {
-  build_initrd 
-  vinit
-}
-
-# Single step (using crate to pull the 2 rootfs), or using docker export
-buildFromExport() {
-  # Check if the files exist (can be created with docker export)
-  #crane export  git.h.webinf.info/costin/initos-sidecar:latest /data/sidecar
-  crane export  ${REPO}/initos-sidecar:${TAG} | tar -C /data/sidecar -xf - 
-  crane export  ${REPO}/initos-rootfs:${TAG} | tar -C /data/rootfs -xf -
-  rm -rf /data/efi/initos/sidecar*
-  (cd /data/sidecar ;  mksquashfs . /data/efi/initos/sidecar.sqfs  ) 
-  rm -rf /data/efi/initos/initos*
-  (cd /data/rootfs ;  mksquashfs . /data/efi/initos/initos.sqfs ) 
-}
-
-# debootstrap_kernel() {
-#   mkdir /tmp/deb
-#   debootstrap --variant=minbase --print-debs sid  /tmp/deb
-# }
 
 "$@"
