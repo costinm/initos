@@ -6,35 +6,47 @@
 # Using cloud-hypervisor initially - for more diversity, qemu should also work, crosvm would be ideal 
 # if it had downloadable binaries.
 #
-# Using virtiofs to access shared files with the host filesystem. A local disk is usually required as cache and to
-# keep Java and other apps happy.
+# Using virtiofs to access shared files with the host filesystem. A local disk is usually required as 
+# cache and to keep Java and other apps happy.
 # 
-# The rootfs can be a host dir (similar to containers) or the immutable recovery image.
+
+# POD is required - defaults to the current working directory.
 
 # Directory layout outside the container:
 #    WORK ( defaults to /x/vol/$NAME )
-#    SRCDIR - /ws/$NAME - source directory
+#    SRCDIR - $HOME/ws/initos/virt/apps - source directory, configs
 # 
-# Directory layout inside the container:
-#   /ws/$APP - the source directory (read only)
-#   /work/$APP - the work directory, with /work/$APP/dist for the files to be distributed
-#   /run/secrets/$APP - secrets volume
-#
-# Various cache directories set to files in /work/$APP/cache, etc
+# Layout inside container/VM:
+# 
+# /z - virtiofs shared dir, any mounts from the host
+# /x - main btrfs volume, can be used for data, etc.
+# /x/@cache - optional separate volume for cache, swap etc. Not backed up.
+# /home/USER - link to /x/home/USER
+# 
+# Inside the home:
+# - .cache link to /x/@cache/home/USER/.cache
+# 
 
-
-#set -x
 set -e
 
+# Can set different base directories 
 if [ -f ${HOME}/.config/vrun/env ]; then 
   source ${HOME}/.config/vrun/env
 fi
 
-export SRCDIR=${SRCDIR:-$(pwd)}
+export SRCDIR=${SRCDIR:-${HOME}/ws/initos/virt/apps}
+
+if [ -z ${POD} ]; then 
+  echo "POD must be set to the target container or VM name"
+  echo "Options:"
+  echo "  - FG=1 vrun start - run in foreground"
+  echo "  - start/stop/vmkill - start and stop a VM"
+  exit 1
+fi
 
 # Defaults to the name of the working directory.
 # This is the application name (may have multiple pod).
-POD=${POD:-$(basename $PWD)}
+#POD=${POD:-$(basename $PWD)}
 
 VM=${VM:-${POD}}
 NAME=${NAME:-$POD}
@@ -45,7 +57,6 @@ APP=${APP:-${POD}}
 # Images are still in /x/vol/images 
 #if [ -z ${VM} ]; then
 #   vmsuffix="${0#*vrun-}"
-
 #   if [ -z "$vmsuffix" ]; then
 #  VM=$(basename $PWD)
   # else
@@ -53,10 +64,6 @@ APP=${APP:-${POD}}
   # fi
 #fi
 
-if [ -z ${POD} ]; then 
-  echo "POD must be set to the target container or VM name"
-  exit 1
-fi
 
 # If set, will be added as a prefix to the command
 #TIME="time "
@@ -69,12 +76,19 @@ VOLS=${VOLS:-/x/vol}
 VIRT=${VIRT:-/x/opt/virt}
 IMGDIR=${IMGDIR:-/x/vol/images}
 
-
 WORK=${WORK:-${VOLS}/${POD}}
+
+# Config and binaries for startup.
+mkdir -p ${WORK}/share/initos
 
 # IMAGE and other parameters loaded from this file
 if [ -f ${WORK}/env ]; then 
   . ${WORK}/env
+  cp ${WORK}/env ${WORK}/share/initos/initos.env
+fi
+
+if [ -f ${SRCDIR}/${POD}/vm-init ]; then 
+  cp ${SRCDIR}/${POD}/vm-init ${WORK}/share/initos/
 fi
 
 ### Hypvervisor
@@ -194,6 +208,12 @@ start() {
   if [ -f ${IMGDIR}/${VM}-cache.img ]; then
     DISKS="$DISKS path=${IMGDIR}/${VM}-cache.img" 
   fi
+  if [ -f ${IMGDIR}/vkernel.img ]; then
+    DISKS="$DISKS path=${IMGDIR}/vkernel.img,readonly=on" 
+  fi
+  if [ -f ${IMGDIR}/sidecar.img ]; then
+    DISKS="$DISKS path=${IMGDIR}/sidecar.img,readonly=on" 
+  fi
   OPTS="$OPTS $DISKS"
     
   #  --vsock \
@@ -278,6 +298,10 @@ vm_console() {
 
 console() {
   socat UNIX-CONNECT:${WORK}/serial.socket  -
+}
+
+ctrl() {
+  vm_ctrl "$@"
 }
 
 # Expose ch-remote control

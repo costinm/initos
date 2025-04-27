@@ -17,21 +17,10 @@ initramfs_init_vm() {
   # startup script.
   mount -t virtiofs /dev/root /z
 
-  # Initrd customization, may include a shell for debug  
-  if [ -e /z/initos/initrd ]; then
-    . /z/initos/initrd
+  # Settings for the VM.
+  if [ -e /z/initos/initos.env ]; then
+    . /z/initos/env  
   fi
-
-  if [ -n "$KOPT_initos_ip" ] ; then
-    # Setup networking based on kernel options.
-    # IPAM or static config - no DHCP.
-    ifconfig lo up
-    ifconfig eth0 up
-    ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
-    route add default gw $KOPT_initos_gw
-    hostname $KOPT_initos_host
-  fi
-
 
   if [ -e /z/rootfs ]; then 
       # Rootfs on the host, via virtiofs.
@@ -62,12 +51,22 @@ initramfs_init_vm() {
     swapon /sysroot/swap
   fi
  
+  mkdir -p /x/initos/vkernel
+
   # Modules from the shared disk (bind mounts) or separate RO volume.
   # the rootfs can be a bare container.
   local kv=$(uname -r)
   mkdir -p /lib/modules/$kv
-  if [ -d /z/lib/modules/$kv ]; then
-    mount -o bind /z/lib/modules/$kv /lib/modules/$kv
+  if mount LABEL=VKERNEL /x/initos/vkernel; then
+    mount -o bind /x/initos/vkernel/lib/modules/$kv /lib/modules/$kv
+  elif [ -e "/sysroot/lib/modules/$kv" ]; then
+    mount -o bind /sysroot/lib/modules/$kv /lib/modules/$kv
+  elif [ -d /z/lib/modules/$kv ]; then
+    cp -a /z/lib/modules/$kv /sysroot/lib/modules/$kv
+    mount -o bind /sysroot/lib/modules/$kv /lib/modules/$kv
+    #mount -o bind /z/lib/modules/$kv /lib/modules/$kv
+  else 
+    mount -o bind /sysroot/lib/modules/$kv /lib/modules/$kv
   fi
 
   # TODO: load any extra modules (if needed). container-based rootfs may not know how to.
@@ -79,6 +78,12 @@ initramfs_init_vm() {
   mount LABEL=X /x || true
   mkdir -p /x/@cache
   mount LABEL=CACHE /x/@cache || true
+  set -x 
+
+  mkdir -p /x/@cache/home/build
+  chown build /x/@cache/home/build
+
+  net_cfg 
 
   # initcmd is used to debug/test the pre-switch root portion.
   # It can be a shell or a command to display info and exit (to check startup time to this point)
@@ -96,11 +101,22 @@ initramfs_init_vm() {
       poweroff -f
   fi
 
+  if [ -e /z/initos/etc ]; then
+    cp -a /z/initos/etc/* /sysroot/etc/
+  fi
+  if [ -e /z/initos/root ]; then
+    cp -a /z/initos/root /sysroot/
+  fi
+
+  if [ -x /z/initos/initrd ]; then
+    /z/initos/initrd post 
+  fi
+
   # This is the VM startup script - if not present, copy it over.
   if [ -f /z/initos/start ]; then
     move_mounted_to_sysroot
     # Has access to KOPT_cmd and other env variables.
-    exec switch_root /sysroot /z/initos/start
+    exec switch_root /sysroot /z/initos/start init
   fi
  if [ -f /sysroot/lib/systemd/systemd ]; then
     move_mounted_to_sysroot
@@ -115,6 +131,33 @@ initramfs_init_vm() {
   move_mounted_to_sysroot
   exec switch_root /sysroot /bin/sh
  fi 
+}
+
+net_cfg() {
+  ip link set dev lo up
+  #ifconfig lo up
+  # Setup networking based on kernel options.
+  # IPAM or static config - no DHCP.
+
+  if [ -n "$br_addr" ] ; then
+  
+    ip link add name br-lan type bridge
+    ip link set dev br-lan up
+
+    ip link set dev eth0 master br-lan
+    ip link set dev eth0 up
+
+    ip addr add ${br_addr}/17 dev br-lan
+  elif [ -n "$KOPT_initos_ip" ] ; then
+  
+    ip link set dev eth0 up
+
+    ip addr add ${KOPT_initos_ip}/17 dev eth0
+    #ifconfig eth0 $KOPT_initos_ip netmask 255.255.128.0
+  fi
+
+  route add default gw $KOPT_initos_gw
+  hostname $KOPT_initos_host
 }
 
 ## First step - expand busybox and mount the basic filesystems.

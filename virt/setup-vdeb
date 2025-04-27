@@ -51,41 +51,6 @@ add_deb_core() {
     pciutils
 }
 
-# Adds Kernel, firmware, Nvidia driver.
-# Builds the initrd images for intel/amd uCode.
-# This adds X
-# 
-# Since nvidia also has libraries and docker/podman support - will use 
-# this debian image as the 'sidecar OS', so including more packages.
-add_deb_kernel_nvidia() {
-
-
-  # Will use systemd or script - may start it as 'main' as well, without 
-  # an actual sidecar.
-
-
-  # Not the current kernel on the builder machine
- 
-
-  curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
-  dpkg -i /tmp/cuda.deb
-  if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ] ; then
-     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-      tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-     apt update
-  fi
-
-  # This has systemd as a dependency...
-  $APTINSTALL cuda-drivers \
-     linux-headers-$(cat /boot/cloud-version) 
-
-  $APTINSTALL nvidia-container-toolkit  
-   
-  /usr/lib/dkms/dkms_autoinstaller start $(cat /boot/cloud-version )
-  dkms status
-}
 
 # Adds Kernel, firmware
 # Builds the initrd images for intel/amd uCode.

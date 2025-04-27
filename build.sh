@@ -31,12 +31,12 @@ set -e
 # About 8 min
 all() {
   rm -rf ${WORK}/*
-  buildah rm kernel | true
+  buildah rm kernel || true
   # Get the latest kernel. 'kernel' container
   # When kernel changes, rebuild everything.
   kernel
   
-  buildah rm initos-sidecar | true
+  buildah rm initos-sidecar || true
 
   sidecar
 
@@ -120,7 +120,7 @@ _build_cmd() {
   local POD=$2
   shift; shift
 
-  if ! buildah containers --format {{.ContainerName}} | grep ${POD} > /dev/null; then
+  if ! buildah containers --format '/{{.ContainerName}}/' | grep "/${POD}/" > /dev/null; then
  # if [ $? -ne 0 ]; then
      buildah pull ${BASE}
      buildah --name ${POD} from ${BASE}

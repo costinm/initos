@@ -82,6 +82,14 @@ export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
 
 
+deb_rootfs() {
+  $APTINSTALL tpm2-tools fdisk \
+    gdisk \
+    wpasupplicant  wireless-tools iw efibootmgr squashfs-tools \
+    cryptsetup pciutils
+}
+
+
 debian_rootfs_base() {
   add_deb_kernel
   
@@ -95,18 +103,15 @@ debian_rootfs_base() {
 add_deb_core() {
   $APTINSTALL ca-certificates curl gpg  
 
-
-  $APTINSTALL  tpm2-tools  \
-     tini  bsdutils dosfstools fdisk \
-    gdisk hdparm file findutils fuse3 btrfs-progs lsof \
+  $APTINSTALL   \
+     tini  bsdutils dosfstools  \
+     hdparm file findutils fuse3 btrfs-progs lsof \
     \
-    rsync wpasupplicant ifupdown ifupdown-extra \
-     wireless-tools bridge-utils net-tools tcpdump iptables iproute2  \
-    nftables iperf3 openssh-server  iw \
+    rsync ifupdown ifupdown-extra \
+     bridge-utils net-tools tcpdump iptables iproute2  \
+    nftables iperf3 openssh-server  \
     \
-    cryptsetup efibootmgr squashfs-tools pciutils
-
-  #systemctl enable ssh.service
+   pciutils squashfs-tools 
 }
 
 # Adds Kernel, firmware, Nvidia driver.
@@ -196,6 +201,5 @@ add_deb_kernel() {
   # Can't stop the creation - but not used. Just need the kernel and modules.
   rm -rf /boot/initrd.img* /tpm/* /tmp/* || true
 }
-
 
 "$@"

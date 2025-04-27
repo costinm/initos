@@ -127,6 +127,9 @@ alpine_add_common() {
      eudev eudev-hwids udev-init-scripts \
       udev-init-scripts-openrc \
     \
+     tpm2-tools tpm2-tss-tcti-device \
+      tpm2-tss-tcti-cmd tpm2-tss \
+    \
     busybox-suid bash  mc tmux git \
     busybox-binsh \
     findutils findmnt \
@@ -142,7 +145,7 @@ alpine_add_common() {
     bridge \
     socat tcpdump iputils  \
      \
-    lsblk  hdparm \
+    lsblk  hdparm fio qemu-img \
      btrfs-progs duperemove parted dosfstools lsscsi \
     lvm2 \
     irqbalance \
@@ -150,11 +153,10 @@ alpine_add_common() {
     mdadm \
     smartmontools dmidecode \
       pciutils \
-      sedutils  nvme-cli \
-    \
-     tpm2-tools tpm2-tss-tcti-device \
-      tpm2-tss-tcti-cmd tpm2-tss  
+        nvme-cli \
   
+  #sedutils
+
   # Not sure: this seems to take over some interfaces  
   # dhcpcd
   

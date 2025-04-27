@@ -63,6 +63,11 @@ mkdiskX() {
   mkfs.btrfs ${IMGDIR}/${POD}-data.img -L X -R $temp_dir
 }
 
+all() {
+  buildah rm vkernel || true
+  vkernel
+  vinitrd
+}
 
 vkernel() {
   buildah --name vkernel from debian:bookworm-slim || true
@@ -79,43 +84,25 @@ vkernel() {
 
 }
 
-vkerneln() {
-  #buildah --name vkerneln from vkernel || true
-  # Or next 3 lines will do it again - this part is fast
-  buildah --name vkerneln from debian:bookworm-slim || true
-  buildah copy vkerneln setup-vdeb /sbin
-  buildah run vkerneln /sbin/setup-vdeb debian_rootfs_base
-
-  buildah run vkerneln /sbin/setup-vdeb add_deb_kernel_nvidia
-
-  mkdir -p ${WORK}/vkerneln
-
-  buildah run \
-    -v ${WORK}/vkerneln:/data \
-      vkerneln  /sbin/setup-vdeb save_boot 
-
-  #buildah commit vkerneln vkerneln 
-   
-}
 vkernelnsh() {
   buildah run -t \
     -v ${WORK}:/data \
-      vkerneln  /sbin/setup-vdeb /bin/bash
+      vkernel  /sbin/setup-vdeb /bin/bash
 }
 
 vinitrd() {
   buildah copy initos-sidecar setup-vm initos-initrd-vm /sbin 
   mkdir -p ${WORK}/virt
 
-  if [ ! -d ${WORK}/vkernen/boot ]; then
-    mkdir -p ${WORK}/vkerneln
+  if [ ! -d ${WORK}/vkernel/boot ]; then
+    mkdir -p ${WORK}/vkernel
     buildah run \
-      -v ${WORK}/vkerneln:/data \
-        vkerneln  /sbin/setup-vdeb save_boot 
+      -v ${WORK}/vkernel:/data \
+        vkernel  /sbin/setup-vdeb save_boot 
   fi
 
   buildah run  \
-    -e BASE=/data/vkerneln \
+    -e BASE=/data/vkernel \
     -e DEST=/data/virt \
     -e SRC=/sbin \
     -v ${WORK}:/data \

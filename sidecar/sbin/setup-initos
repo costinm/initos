@@ -124,34 +124,8 @@ alpine_clear() {
   echo "" > /etc/machine-id || true
 }
 
-
-# vinit updates the initram-Fs for the virt kernel
-# Expectes /boot, /lib/modules, /lib/firmware to have the right
-# mounts and /boot/version-virt to hold the desired kernel version.
-# 
-# This runs in an alpine container (for now) - the init will be based
-# on the ligher musl binaries.
-vinit() {
-  local DEST=${1:-/data/virt}
-
-  VER=$(ls /lib/modules | grep cloud | tail)
-
-  mkdir -p ${DEST}
-
-  cp /boot/vmlinuz-${VER} ${DEST}/vmlinuz
-  # btrfs is pretty slow for a VM - the rootfs may have all the modules
-  # and load it as needed.
-  # squashfs may not be needed if modules/firmware are on the ext4 rootfs
-  # or on virtio.
-  mkinitfs -k  -i /opt/virt/initos-initrd-vm \
-     -F "base btrfs virtio initosvm" \
-     -o ${DEST}/initramfs ${VER}
-}
-
-
 setup_initrd() {
   build_initrd 
-  vinit
 }
 
 # Single step (using crate to pull the 2 rootfs), or using docker export

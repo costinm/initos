@@ -3,6 +3,13 @@
 # Location of the home template ( configs, etc )
 USER_HOME=${USER_HOME:-${HOME}/ws/home}
 POD=gpuvm
+WORK=${WORK:-/x/vol/${POD}}
+IMGDIR=${IMGDIR:-/x/vol/images}
+
+all() {
+  buildah rm ${POD} || true
+  build
+}
 
 build() {
     buildah --name ${POD} from debian:bookworm
@@ -10,8 +17,10 @@ build() {
     buildah copy ${POD} sbin/ /sbin
     buildah run -v $(pwd):/data ${POD}  /sbin/setup-deb all
 
-    buildah copy ${POD} ../../../rootfs/etc/ /etc
+    buildah copy ${POD} etc/ /etc
+    buildah commit ${POD} ${POD}
 }
+
 
 push() {
     buildah commit ${POD} git.h.webinf.info/costin/dev/gpu:latest
@@ -22,9 +31,20 @@ pull() {
   buildah from --name ${POD} git.h.webinf.info/costin/dev/gpu:latest
 }
 
+# The container image is not very useful - maybe as a cache. 
+# We need to generate a .btrfs image to use with the VM, doesn't 
+# work in container or using virtiofs.
 img() {
-    buildah run -v $(pwd):/data ${POD}  /sbin/setup-deb img
+    mkdir -p ${WORK}
+    set -x
+    buildah copy ${POD} sbin/ /sbin
+    
+    rm -f ${WORK}/img
+
+    buildah  -v ${WORK}:/data -v ${IMGDIR}:/img \
+      run -t ${POD}  /sbin/setup-deb img
 
 }
+
 
 "$@"

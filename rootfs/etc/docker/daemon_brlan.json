@@ -1,0 +1,6 @@
+{
+ "bridge": "br-lan",
+ "ipv6": true,
+ "iptables": false,
+ "fixed-cidr-v6": "2001:db8:1::/64"
+}

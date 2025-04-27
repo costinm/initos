@@ -16,49 +16,72 @@ USERNAME=${USERNAME:-build}
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
 
+# This works - but more generic is to use setup-vm and convert OCI image
+# to btrfs using buildah.
+# It requires to commit - but given how slow the build is, commit is
+# not a big difference.
 img() {
+  set -x 
   truncate -s 10G /data/gpu.img
-  mkdir /tmp/img
-  mount -o bind / /tmp/img
-  mkfs.btrfs /data/gpu.img -r /tmp/img
+  mkdir -p /tmp/img
+  cd /
+  # tar cf - --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+  #   --exclude='/tmp' --exclude=/var/tmp --exclude=/var/log \
+  #   --exclude=/var/lib/docker --exclude=/data --exclude=/img / \
+  #   | (cd /tmp/img; tar xf -)
+ rsync -au --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+    --exclude='/tmp' --exclude=/var/tmp --exclude=/var/log \
+    --exclude=/var/lib/docker --exclude=/data --exclude=/img / /tmp/img/
+
+  mkfs.btrfs -L ROOTFS /data/gpu.img -r /tmp/img
 }
 
 all() {
   apt update
 
+  add_deb_kernel
   add_base_users
   tools
   add_deb_core
   add_deb_kernel_nvidia
 
+  systemctl enable ssh.service
+
   apt clean
 }
 
 
-add_deb_core() {
+# Adds Kernel, firmware
+# Builds the initrd images for intel/amd uCode.
+add_deb_kernel() {
   export INITRD=No
+  # Also install the cloud kernel - upgrade them at the same cadence, and
+  # will be used to run the real root as a VMs for more security.
+  # Images grows from 795 -> 909 M, Initos image from 568-> 634
   $APTINSTALL \
      linux-image-cloud-amd64
   ver=$(ls /lib/modules |grep cloud)
   echo -n ${ver} > /boot/cloud-version
 
-  $APTINSTALL ca-certificates curl gpg  \
-     linux-headers-$(cat /boot/cloud-version) 
+  # Can't stop the creation - but not used. Just need the kernel and modules.
+  rm -rf /boot/initrd.img* /tpm/* /tmp/* || true
+}
 
 
-  $APTINSTALL  tpm2-tools  \
-     tini  bsdutils dosfstools fdisk \
-    gdisk hdparm file findutils fuse3 btrfs-progs lsof \
+add_deb_core() {
+  $APTINSTALL ca-certificates curl gpg 
+
+  $APTINSTALL  \
+     tini  bsdutils dosfstools \
+      hdparm file findutils fuse3 btrfs-progs lsof \
     \
-    rsync wpasupplicant ifupdown ifupdown-extra \
-     wireless-tools bridge-utils net-tools tcpdump iptables iproute2  \
-    nftables iperf3 openssh-server  iw \
-    \
-    cryptsetup efibootmgr squashfs-tools pciutils
+     rsync ifupdown ifupdown-extra \
+      bridge-utils net-tools tcpdump iptables iproute2  \
+    nftables iperf3 openssh-server \
+     pciutils
 
   $APTINSTALL docker.io lxc 
 
-  systemctl enable ssh.service
 }
 
 # Adds Kernel, firmware, Nvidia driver.
@@ -68,10 +91,15 @@ add_deb_core() {
 # Since nvidia also has libraries and docker/podman support - will use 
 # this debian image as the 'sidecar OS', so including more packages.
 add_deb_kernel_nvidia() {
+
+
   # Will use systemd or script - may start it as 'main' as well, without 
   # an actual sidecar.
+
+
   # Not the current kernel on the builder machine
  
+
   curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
   dpkg -i /tmp/cuda.deb
   if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ] ; then
@@ -81,12 +109,14 @@ add_deb_kernel_nvidia() {
       tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
      apt update
   fi
-    
+
   # This has systemd as a dependency...
-  $APTINSTALL cuda-drivers
+  $APTINSTALL cuda-drivers \
+     linux-headers-$(cat /boot/cloud-version) 
+
   $APTINSTALL nvidia-container-toolkit  
- 
-  /usr/lib/dkms/dkms_autoinstaller start $(cat /boot/cloud-version )
+   
+  /usr/lib/dkms/dkms_autoinstaller start $(cat /boot/cloud-version | tail )
   dkms status
 }
 
