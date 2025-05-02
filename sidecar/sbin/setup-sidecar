@@ -10,6 +10,7 @@ install() {
   add_builder
   alpine_add_common
   alpine_add_recovery
+  # Podman, buildah, cloud hypervisor
   alpine_add_virt
 
   [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
@@ -21,14 +22,6 @@ install() {
 
   alpine_add_base
   
-  # Podman + cloud hypervisor
-
-  # Getting sway to work in a container is a pain - can't figure 
-  # out the input devices in podman... Also wayland control of the
-  # display belongs under the 'hardware', containers should not
-  # have access to sway control socket for example.
-  add_wui
-
   apk del busybox-mdev-openrc || true
 
   (cd /etc/init.d && ln -s agetty agetty.tty1)
@@ -271,11 +264,13 @@ alpine_add_base() {
 alpine_add_virt() {
 
   # For OCI interaction - podman can also pull, for building use dev image.
-  apk add crane runc \
+  apk add runc \
   podman podman-openrc podman-docker fuse-overlayfs \
-  buildah lxc lxc-openrc lxc-templates lxc-templates-oci lxc-download lxc-bridge \
+  buildah  \
   cloud-hypervisor virtiofsd
 
+  # lxc lxc-openrc lxc-templates lxc-templates-oci lxc-download lxc-bridge
+  
     # podman instead of docker: no daemon. Adds ~70M
 
   # Deps: crun container, gpg, etc
@@ -323,59 +318,6 @@ alpine_add_virt() {
 #   #du -sh /lib/firmware
 #   df -h
 # }
-
-# Wayland UI. Using alpine setup-desktop, which adds 
-# - dbus, elogind, firefox, foot.
-# The sqfs moves from ~310M to 580M
-# The build time also increases from 7 to 9 min 
-add_wui() {
-  #  apk add mesa-dri-gallium
-
-  # Built in option in Alpine.
-  setup-desktop sway 
-
-  apk add labwc \
-  rofi-wayland rofi-pass rofi-top polkit seatd dbus \
-   mc bash bash-completion \
-   kitty kitty-kitten foot \
-    font-jetbrains-mono font-croscore \
-    chromium nix
-
-  # Firefox: doesn't work well with kasmvnc
-
-  
-  # Conflicts with rofi - host will not expose X11/kasm anyway,
-  # that should be only in VMs/pods.
-
-  # labwc (pi) can be used instead of sway, OpenBox-based with ALT-TAB
-
-  # make sure video, input, seat groups are added to the UI user
-  # Seatd is required dep of sway and labwc
- 
-  addgroup build seat
-
-
-  # Terminal and browser is all I need, rest is remote or in opt
-   # required
-   # esr is the less updated long term
-
-}
-
-
-# Native X UI
-xui_alpine() {
-  apk add i3wm dbus-x11
-  apk add tint2 rofi alttab i3status
-  apk add xorg-server
-  apk add xinit
-
-#  apk add xset
-#  apk add xrandr
-#  apk add xmodmap
-#  apk add xinput
-#  apk add xhost
-#  apk add xkill
-}
 
 
 "$@"
