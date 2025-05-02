@@ -81,7 +81,6 @@ kernel() {
 initrd() {
   buildah copy initos-sidecar rootfs/sbin /sbin
   buildah copy initos-sidecar sidecar/sbin /sbin
-  buildah copy initos-sidecar virt /opt/virt
 
   buildah run -v ${WORK}:/data \
     -v ${WORK}/boot:/boot \
