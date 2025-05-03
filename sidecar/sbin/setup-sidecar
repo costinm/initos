@@ -7,9 +7,12 @@ install() {
   echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
   apk -U --no-progress update
 
+  # Packages needed for building an initrd and signing an EFI.
   add_builder
+
+  # Common utilities for a host sidecar.
   alpine_add_common
-  alpine_add_recovery
+    
   alpine_add_virt
 
   [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
@@ -102,17 +105,28 @@ add_builder() {
    efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
    cryptsetup mkinitfs zstd \
   openssl openssh openssh-keygen \
-     eudev eudev-hwids udev-init-scripts \
+     binutils uuidgen eudev eudev-hwids udev-init-scripts \
       udev-init-scripts-openrc \
-      dosfstools 
+      dosfstools efibootmgr
   
   # Udev used in initrd
   
 
   echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
 
-  # To create IMGs:   dosfstools parted 
+  # clevis adds bash, jose, cacklib.
+  # has nice network-based unlock
+  # apk add clevis
+
+  # 400k - smallest util to sign/verify.
+  #apk add minisign
+
+  # To modify keys, control efi
+  # mokutil
+
+  # To decompress firmware in zstd format (debian doesn't load it)
 }
+
 
 # Useful packages for a host. 
 alpine_add_common() {
@@ -135,7 +149,7 @@ alpine_add_common() {
     findutils findmnt \
     htop haveged \
     sudo strace util-linux procps \
-    arch-install-scripts \
+    arch-install-scripts bash-completion \
     \
     openssh openssh-keygen openssh-sftp-server  sshfs \
     curl rsync \
@@ -199,32 +213,6 @@ alpine_add_common() {
   # apk add lvm2
 }
 
-# Packages for building EFI UKI and image
-alpine_add_recovery() {
-
-  #### Building the images and UKI
-
-  # To build the UKI
-  apk add mkinitfs
-  # Don't rebuild automatically.
-  echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
-
-  apk add efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
-     binutils uuidgen cryptsetup efibootmgr zstd
-
-
-  # clevis adds bash, jose, cacklib.
-  # has nice network-based unlock
-  # apk add clevis
-
-  # 400k - smallest util to sign/verify.
-  #apk add minisign
-
-  # To modify keys, control efi
-  # mokutil
-
-  # To decompress firmware in zstd format (debian doesn't load it)
-}
 
 # Base users, groups, packages.
 alpine_add_base() {
@@ -336,7 +324,6 @@ add_wui() {
 
   apk add labwc \
   rofi-wayland rofi-pass rofi-top polkit seatd dbus \
-   mc bash bash-completion \
    kitty kitty-kitten foot \
     font-jetbrains-mono font-croscore \
     chromium nix
@@ -361,21 +348,6 @@ add_wui() {
 
 }
 
-
-# Native X UI
-xui_alpine() {
-  apk add i3wm dbus-x11
-  apk add tint2 rofi alttab i3status
-  apk add xorg-server
-  apk add xinit
-
-#  apk add xset
-#  apk add xrandr
-#  apk add xmodmap
-#  apk add xinput
-#  apk add xhost
-#  apk add xkill
-}
 
 
 "$@"

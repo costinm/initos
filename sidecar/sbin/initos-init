@@ -6,6 +6,12 @@ export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 initos_init() {  
   logi "Starting INITOS TPM2 $(uname -r)"
 
+  if [ -f /var/initos/local/initos.env ]; then
+    echo "Using signed EFI config: "
+    cat /var/initos/local/initos.env
+    . /var/initios/local/initos.env
+  fi
+
   # Additional drivers with the real firmware and modules mounted. 
   load_drivers
 
@@ -123,11 +129,15 @@ load_drivers() {
         echo $V1 $V2 > /sys/bus/pci/drivers/vfio-pci/new_id 
       done
     fi 
-  # Alternatively, options vfio-pci ids=1002:687f,1002:aaf8
+  # Alternatively, options vfio-pci ids=10de:1f82,10de:10fa
   # in /etc/modprobe.d - but I think this is more reliable.
   #echo 10de 1f82 > /sys/bus/pci/drivers/vfio-pci/new_id &
   #echo 10de 10fa > /sys/bus/pci/drivers/vfio-pci/new_id &
   # Second device: # echo 0000:02:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
+
+  # The audio driver may be takend over - intel or other, need to remove
+  # or make sure efi/vfio is set correctly.
+  # lspci -v | gre Kernel
 
   fi
 
@@ -385,7 +395,7 @@ mount_sysroot() {
   fi
   
   if [ -d ${x}/initos/etc ] ; then
-    cp -a ${x}/initos/etc /etc
+    cp -a ${x}/initos/etc/* /etc
   fi
 
   if [ -d ${x}/initos/root ] ; then

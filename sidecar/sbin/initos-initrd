@@ -73,8 +73,14 @@ boot_initos() {
   # This can include wpa supplicant file for insecure machines
   # (ideally on a separate net)
   mkdir -p /sysroot/var/initos/local/logs
+  
+  # Will be available as /var/initos/local in the init.
   cp -a /local/* /sysroot/var/initos/local
+  
+  # Override files in etc with the /local/ files (it's either generic 
+  # or specific to this machine)
   cp -a /local/* /
+  
   cp /tmp/* /sysroot/var/initos/local/logs 
 
   # Patch initos scripts to the latest version from initrd (with possible patches) 

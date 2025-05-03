@@ -135,7 +135,9 @@ fixtty() {
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty1
 }
 
-
+hdinfo() {
+  cryptsetup luksDump $1
+}
 
 
 
