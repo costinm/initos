@@ -181,6 +181,8 @@ bootNext() {
 # Run before the upgrade - mounts the 'next' EFI partition, 
 # remove old files if the SQFS has changed (small disk, rsync doesn't work
 # very well)
+# Args: hash of new image (compared to old, will remove to avoid issues)
+# optional label of partition to upgrade, defaults to /var/initos/BOOT_NEXT.
 upgrade_start() {
   local newh=${1}
   local clabel=${2}
@@ -207,7 +209,8 @@ upgrade_start() {
     echo "Mounting $label to /boot/b - same SQFS $newh"
   else
     echo "Mounting $label to /boot/b and accepting new version $newh existing $eh"
-    ###### XXX After all are upgraded rm -f /boot/b/initos/initos.*
+    rm -f /boot/b/initos/initos.*
+    rm -f /boot/b/initos/rootfs.*
   fi
 }
 

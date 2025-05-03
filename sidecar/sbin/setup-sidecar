@@ -12,7 +12,8 @@ install() {
 
   # Common utilities for a host sidecar.
   alpine_add_common
-    
+  alpine_add_recovery
+  # Podman, buildah, cloud hypervisor
   alpine_add_virt
 
   [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
@@ -24,14 +25,6 @@ install() {
 
   alpine_add_base
   
-  # Podman + cloud hypervisor
-
-  # Getting sway to work in a container is a pain - can't figure 
-  # out the input devices in podman... Also wayland control of the
-  # display belongs under the 'hardware', containers should not
-  # have access to sway control socket for example.
-  add_wui
-
   apk del busybox-mdev-openrc || true
 
   (cd /etc/init.d && ln -s agetty agetty.tty1)
@@ -259,11 +252,13 @@ alpine_add_base() {
 alpine_add_virt() {
 
   # For OCI interaction - podman can also pull, for building use dev image.
-  apk add crane runc \
+  apk add runc \
   podman podman-openrc podman-docker fuse-overlayfs \
-  buildah lxc lxc-openrc lxc-templates lxc-templates-oci lxc-download lxc-bridge \
+  buildah  \
   cloud-hypervisor virtiofsd
 
+  # lxc lxc-openrc lxc-templates lxc-templates-oci lxc-download lxc-bridge
+  
     # podman instead of docker: no daemon. Adds ~70M
 
   # Deps: crun container, gpg, etc
@@ -312,6 +307,7 @@ alpine_add_virt() {
 #   df -h
 # }
 
+<<<<<<< HEAD
 # Wayland UI. Using alpine setup-desktop, which adds 
 # - dbus, elogind, firefox, foot.
 # The sqfs moves from ~310M to 580M
@@ -349,5 +345,7 @@ add_wui() {
 }
 
 
+=======
+>>>>>>> 4e080df4c173bf4e5d5b1937bbf307d43ab4960b
 
 "$@"
