@@ -70,11 +70,11 @@ push() {
   # TODO: this should go to the sidecar, should use the script
   # to mount the alternate partition
   ssh $host /sbin/setup-initos-host upgrade_start ${newh}
+
+  ssh $host rm -f /boot/b/initosA.EFI
   
   # Ignore the timestamp, inplace because the EFI is small (default creates a copy)
   rsync -ruvz -I --inplace ${WORK}/efi/  $host:/boot/b
-
-  ssh $host cat /boot/b/initos/initos.hash
   
   ssh $host /sbin/setup-initos-host upgrade_end "$@"
 

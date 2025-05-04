@@ -76,9 +76,11 @@ boot_initos() {
   
   # Will be available as /var/initos/local in the init.
   cp -a /local/* /sysroot/var/initos/local
+  ls -lR /local
   
   # Override files in etc with the /local/ files (it's either generic 
   # or specific to this machine)
+  # TODO: split 'local' for initrd, sidecar and rootfs
   cp -a /local/* /
   
   cp /tmp/* /sysroot/var/initos/local/logs 

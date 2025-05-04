@@ -47,7 +47,7 @@ sign_init() {
   echo "Generating new root keys for signing and mesh"
   cat /etc/uefi-keys/authorized_keys
 
-  cp -a /etc/uefi-keys /config
+  cp -a /etc/uefi-keys /var/run/secrets
 }
 
 # Copy the efi keys to the EFI partition
@@ -92,11 +92,10 @@ efi() {
   set -e
 
   # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
-  if [ ! -f /config/uefi-keys/db.crt ]; then
-    ls -R /config
+  if [ ! -f /var/run/secrets/uefi-keys/db.crt ]; then
     sign_init
   else
-    cp -a /config/uefi-keys /etc
+    cp -a /var/run/secrets/uefi-keys /etc
   fi
 
   mkdir -p ${DEST}/initos ${DEST}/keys /local ${DEST}/EFI/BOOT
@@ -139,8 +138,10 @@ efi() {
   # Per host local configs - go to /sysroot/var/initios/local/* in initrd (as backup) but 
   # also get copied over /
   # The /x/ dir 
-  cp -a /config/hosts/${host}/local/* /local/ || true
-  
+  cp -a /config/hosts/${host}/* /local/ || true
+  echo "Host specific files: ${host}"
+  ls -R /local 
+
   INIT_PATCH=/tmp/initrd-patch.cpio.gz
   (find /sbin/initos* /sbin/setup-initos* /local \
    | sort  | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${INIT_PATCH}
@@ -173,7 +174,7 @@ efi() {
         ${UCODE} /boot/initos-initrd.img ${INIT_PATCH}
  
 
-  echo "$cmd loglevel=2 quiet rdinit=/sbin/initos-initrd" > /boot/cmdline
+  echo "$cmd loglevel=1 quiet rdinit=/sbin/initos-initrd" > /boot/cmdline
   efi-mkuki \
       -c /boot/cmdline \
       -o /tmp/tmp.EFI \

@@ -4,7 +4,6 @@
 
 
 SRCDIR=$(dirname "$(readlink -f "$0")")
-#export SRCDIR=${SRCDIR:-$(pwd)}
 . ${SRCDIR}/env
 
 SECRET=${HOME}/.ssh/initos
@@ -12,11 +11,8 @@ if [ -f ${SECRET}/env ]; then
   . ${SECRET}/env
 fi
 
-# The container with the tools and images to sign.
-POD=${POD:-initos}
-
 # Output generated here
-WORK=${HOME}/.cache/${POD}
+WORK=${DATA:-${HOME}/.cache/initos}
 
 IMAGE_SIGNER=${REPO}/initos-sidecar:latest
 
@@ -59,12 +55,14 @@ efi() {
   buildah copy initos-sidecar sidecar /
 
   # Create signed UKI (and unsigned one)
-  VOLS="$VOLS -v ${SECRET}:/config" 
+  VOLS="$VOLS -v ${SECRET}:/var/run/secrets" 
+  VOLS="$VOLS -v ${HOME}/config:/config" 
   VOLS="$VOLS -v ${WORK}:/data" 
 
   if [ -d ${WORK}/boot ]; then
     VOLS="$VOLS -v ${WORK}/boot:/boot -v ${WORK}/lib/modules:/lib/modules -v ${WORK}/lib/firmware:/lib/firmware "
   fi
+  #buildah run -t $VOLS initos-sidecar -- bash
   buildah run $VOLS initos-sidecar -- setup-efi efi $*
 }
 

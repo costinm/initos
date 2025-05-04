@@ -307,45 +307,5 @@ alpine_add_virt() {
 #   df -h
 # }
 
-<<<<<<< HEAD
-# Wayland UI. Using alpine setup-desktop, which adds 
-# - dbus, elogind, firefox, foot.
-# The sqfs moves from ~310M to 580M
-# The build time also increases from 7 to 9 min 
-add_wui() {
-  #  apk add mesa-dri-gallium
-
-  # Built in option in Alpine.
-  setup-desktop sway 
-
-  apk add labwc \
-  rofi-wayland rofi-pass rofi-top polkit seatd dbus \
-   kitty kitty-kitten foot \
-    font-jetbrains-mono font-croscore \
-    chromium nix
-
-  # Firefox: doesn't work well with kasmvnc
-
-  
-  # Conflicts with rofi - host will not expose X11/kasm anyway,
-  # that should be only in VMs/pods.
-
-  # labwc (pi) can be used instead of sway, OpenBox-based with ALT-TAB
-
-  # make sure video, input, seat groups are added to the UI user
-  # Seatd is required dep of sway and labwc
- 
-  addgroup build seat
-
-
-  # Terminal and browser is all I need, rest is remote or in opt
-   # required
-   # esr is the less updated long term
-
-}
-
-
-=======
->>>>>>> 4e080df4c173bf4e5d5b1937bbf307d43ab4960b
 
 "$@"

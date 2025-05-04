@@ -9,9 +9,12 @@ initos_init() {
   if [ -f /var/initos/local/initos.env ]; then
     echo "Using signed EFI config: "
     cat /var/initos/local/initos.env
-    . /var/initios/local/initos.env
+    . /var/initos/local/initos.env
+  else 
+    echo "No initos config found, using defaults"
+    sh
   fi
-
+  
   # Additional drivers with the real firmware and modules mounted. 
   load_drivers
 
@@ -72,8 +75,6 @@ initos_init() {
   if [ $? -eq 0 ]; then
       logi "BTRFS mounted"
   else
-      # XXX debug
-      bash 
       lfatal "Failed to mount btrfs"
   fi
 
@@ -81,10 +82,10 @@ initos_init() {
   # start the sidecar to manage the hardware and return.
   start_os
 
-  /etc/init.d/seatd start
-  export XDG_RUNTIME_DIR=/run/user/$(id -u build)
-  mkdir -p $XDG_RUNTIME_DIR
-  chown build $XDG_RUNTIME_DIR
+  #/etc/init.d/seatd start
+  #export XDG_RUNTIME_DIR=/run/user/$(id -u build)
+  #mkdir -p $XDG_RUNTIME_DIR
+  #chown build $XDG_RUNTIME_DIR
 
   # tty2 is not very reliable on some old chromeos laptops (keyboard)
   ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
@@ -94,7 +95,7 @@ initos_init() {
   echo "InitOS started. Press a key to start 'login'"
   # Give some time to read the ip address for ssh, agetty cleans the 
   # screen.
-  read -t 30 -n 1 key
+  read -t 60 -n 1 key
   /etc/init.d/agetty.tty1 start
 
   exec tini -s sleep -- infinity 
@@ -359,24 +360,28 @@ mount_sysroot() {
     swapon ${x}/swap
   fi
 
-  if [ -z $INITOS_ROOT ]; then
-    if [ -d "${x}/@" ]; then
-      INITOS_ROOT="@"
-    else
-      INITOS_ROOT="NOTFOUND"
-    fi
-  fi
-
   mkdir -p /sysroot
-  if [ -d ${x}/${INITOS_ROOT} ]; then
-    logi "USING /x/$INITOS_ROOT as 'main' OS"
 
-    mount -t btrfs "${root_device}" /sysroot -o subvol=${INITOS_ROOT} \
-      -o noatime -o nodiratime
-    if [ $? -ne 0 ]; then
-      logi "Error: Failed to mount BTRFS partition ${INITOS_ROOT}, fallback to recovery"
+  if [ -n "$INITOS_ROOT" ]; then
+    # The sidecar is used for upgrades and control - host can work without it
+    if [ -d /x/"${INITOS_ROOT}" ]; then
+      echo "Using InitOS rootfs: $INITOS_ROOT - enter 'r' to fallback to recovery"
+      read -t 5 -n 1 key
+      if [ "$key" != "r" ]; then 
+        mount -t btrfs "${root_device}" /sysroot -o subvol=${INITOS_ROOT} \
+            -o noatime -o nodiratime
+        if [ $? -ne 0 ]; then
+          logi "Error: Failed to mount BTRFS partition ${INITOS_ROOT}, fallback to recovery"
+        fi
+        echo "Mounted InitOS rootfs: $INITOS_ROOT"
+        cp -a /x/initos/rootfs/etc/* /sysroot/etc/
+        cp -a /x/initos/root /sysroot/
+      fi
     fi
+  else
+    echo "INITOS_ROOT not set, using default"
   fi
+  env
 
   if [ -d ${x}/@home ] ; then
     mount -o bind ${x}/@home /home
@@ -469,7 +474,7 @@ start_os() {
   elif [ -f /sysroot/lib/systemd/systemd ]; then
     logi "Preparing to switch root $INITOS_ROOT (systemd)"
     move_mounted_to_sysroot
-    exec switch_root /sysroot /usr/bin/systemd --system 
+    exec switch_root /sysroot /lib/systemd/systemd --system 
     #  systemd --log-level=err --unit=rescue.target --system --default-standard-output=tty --default-standard-error=tty
   elif [ -f /sysroot/sbin/init ]; then
     logi "Preparing to switch root $INITOS_ROOT"
