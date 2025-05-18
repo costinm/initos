@@ -11,8 +11,7 @@ initos_init() {
     cat /var/initos/local/initos.env
     . /var/initos/local/initos.env
   else 
-    echo "No initos config found, using defaults"
-    sh
+    echo "No built-in initos config found, using defaults"
   fi
   
   # Additional drivers with the real firmware and modules mounted. 
@@ -82,20 +81,15 @@ initos_init() {
   # start the sidecar to manage the hardware and return.
   start_os
 
-  #/etc/init.d/seatd start
-  #export XDG_RUNTIME_DIR=/run/user/$(id -u build)
-  #mkdir -p $XDG_RUNTIME_DIR
-  #chown build $XDG_RUNTIME_DIR
-
-  # tty2 is not very reliable on some old chromeos laptops (keyboard)
-  ln -s /etc/init.d/agetty /etc/init.d/agetty.tty1
-
   # This is called if initos ssh/udev/etc are started, main 
   # OS will be in a container or VM.
-  echo "InitOS started. Press a key to start 'login'"
+  echo "InitOS started. Press a key to start login"
   # Give some time to read the ip address for ssh, agetty cleans the 
   # screen.
   read -t 60 -n 1 key
+  # TODO: more options - configure wireless, show IP/public keys, etc
+  # Normal case use remote login to the machine for servers, no password set
+  # except authorized_keys.
   /etc/init.d/agetty.tty1 start
 
   exec tini -s sleep -- infinity 
@@ -374,8 +368,6 @@ mount_sysroot() {
           logi "Error: Failed to mount BTRFS partition ${INITOS_ROOT}, fallback to recovery"
         fi
         echo "Mounted InitOS rootfs: $INITOS_ROOT"
-        cp -a /x/initos/rootfs/etc/* /sysroot/etc/
-        cp -a /x/initos/root /sysroot/
       fi
     fi
   else
@@ -390,7 +382,7 @@ mount_sysroot() {
   if [ -d /x/@cache ]; then
     mount -o bind ${x}/@cache /var/cache
 
-    mkdir -p /x/@cache/vartmp /x/@cache/containers /var/tmp # For buildah overlay, most be on same disk
+    mkdir -p /x/@cache/vartmp /x/@cache/containers /var/tmp /var/log # For buildah overlay, most be on same disk
     chmod 1777 /x/@cache/vartmp
     mount -o bind /x/@cache/vartmp /var/tmp
     mount -o bind /x/@cache/containers /var/lib/containers
@@ -423,6 +415,9 @@ hwdrivers() {
 }
 
 # Called after the /x partition has been mounted.
+# Based on env on the EFI-UKI it may boot one of the existing rootfs
+# on /x, or use the sidecar as main with differeent rootfs in containers or 
+# VMs.
 start_os() {
   # At this point we have an encrypted disk (or we need to load recovery)
   if [ -f /x/initos/initos.env ]; then
@@ -434,7 +429,6 @@ start_os() {
   if [ ! -d /sysroot/etc ]; then
     logi "INITOS_ROOT not set, running as primary - additional OS as VMs/pods"
     run_standalone
-    # TPM will sleep, insecure will have a shell
     return
   fi
 
@@ -455,6 +449,11 @@ start_os() {
   cp /sbin/initos* /sysroot/sbin
   mkdir -p /sysroot/var/initos # Local files and boot next
   cp -a /var/initos /sysroot/var/
+  cp -a /x/initos/rootfs/etc/* /sysroot/etc/
+  cp -a /x/initos/root /sysroot/
+
+  # For some reason this is not set properly, prevents swaylock from unlocking.
+  chmod u+s /sysroot/usr/sbin/unix_chkpwd
 
   # This works if the debian includes the kernel modules (copy above)
   # commented out for now to test the sqfs modules

@@ -470,6 +470,24 @@ get_firmware_info() {
   done
 }
 
+create_ec() {
+  # Endorsement key
+  #tpm2_createek -c primarye.ctx -G 0x01 
+  # 0x80000000
+  #  tpm2_print -t TPMS_CONTEXT primary.ctx # -> Handle: 0x80000000
+
+  tpm2_ptool init
+  
+  tpm2_ptool addtoken --pid=1 --label=ssh \
+     --sopin='admin-password' --userpin='user-password'
+  
+  tpm2_ptool addkey --algorithm=rsa2048 --label=ssh --userpin='user-password'
+  
+  ssh-keygen -D /usr/lib/pkcs11/libtpm2_pkcs11.so
+  ssh -I /usr/lib/pkcs11/libtpm2_pkcs11.so some.host.name
+
+}
+
 create_primary() {
   mkdir -p /boot/efi/initos
 

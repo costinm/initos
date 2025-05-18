@@ -100,7 +100,7 @@ add_builder() {
   openssl openssh openssh-keygen \
      binutils uuidgen eudev eudev-hwids udev-init-scripts \
       udev-init-scripts-openrc \
-      dosfstools efibootmgr
+      dosfstools efibootmgr yq jq
   
   # Udev used in initrd
   
