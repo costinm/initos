@@ -149,7 +149,7 @@ alpine_add_common() {
     ca-certificates-bundle \
     ifupdown-ng libcap2 iproute2 iw ifupdown-ng ifupdown-ng-wifi \
     wpa_supplicant wpa_supplicant-openrc \
-    bridge \
+    bridge iptables nftables \
     socat tcpdump iputils  \
      \
     lsblk  hdparm fio qemu-img \
