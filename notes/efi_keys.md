@@ -30,4 +30,17 @@ The DB key is the one that matters - it signs the actual EFI imags. It also incl
 MokUtil and the 'shim' is a separate boot loader, using a separate set of keys - while keeping PK/KEK in place. More complicated, less secure.
 
 
+# EFItools 
 
+Various programs can be used before turning signature, including scripts using the shell.
+
+```
+UpdateVars db db.auth
+UpdateVars KEK KEK.auth
+UpdateVars PK PK.auth
+
+```
+
+Updating PK should turn secure mode on.
+
+LocDown script can be compiled with the keys built-in.
