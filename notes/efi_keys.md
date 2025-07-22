@@ -28,6 +28,3 @@ You can think of this as a 3-layer TLS certificate.
 The DB key is the one that matters - it signs the actual EFI imags. It also includes hashes, but not very useful.
 
 MokUtil and the 'shim' is a separate boot loader, using a separate set of keys - while keeping PK/KEK in place. More complicated, less secure.
-
-
-

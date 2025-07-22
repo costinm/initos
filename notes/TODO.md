@@ -1,5 +1,18 @@
 # TODO and ideas
 
+[ ] Switch to only signed images, with DHCP as fallback. The authorized keys are baked in. USB (unsigned) build as option.
+Remove the magic boot options - use just standard BOOT/BOOTx64.EFI, less complexity, now init is scanning for the right image.
+
+[ ] Switch back to docker/podman instead of buildah. Not worth the effort, equivalent (still using the 'style', not the runtime)
+
+[ ] Scripts to fast recover after changing CPU/MB and to swap disks.
+
+[ ] SSH/Wireguard Private key in TPM
+
+[ ] Relax secure disk layout: look for a plain text btrfs or ext4, encrypted disk as file in the main one (ChromeOS labels).
+Also relax the location of the signed disks, allow searching
+for the ext4/btrfs root as well. Easier to upgrade existing machines, including dual-boot chromium.
+
 [x] Before releasing - remove the debug shell in secure, mode unless LUKS is unlocked by user password.
 Only unsigned usb installer should have shell on console.
 

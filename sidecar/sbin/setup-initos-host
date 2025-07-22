@@ -360,39 +360,6 @@ genpass() {
      head -c14; echo
 }
 
-init_pass() {
-  #export KEY=$(openssl rand -base64 32)
-  export KEY=$(genpass)
-
-  mkdir -p $SECRETS
-  echo -n "${KEY}" > $SECRETS/key
-  encrypt_key $KEY
-}
-
-encrypt_key() {
-  local KEY=$1 
-
-  if [ -f /boot/root.pem ]; then
-    echo -n "${KEY}" | openssl pkeutl -encrypt \
-         -pubin -inkey /boot/root.pem \
-         -pkeyopt rsa_padding_mode:oaep \
-         -pkeyopt rsa_oaep_md:sha256 \
-         -out /x/initos/DISK_RECOVERY_KEY
-
-    cp /x/initos/DISK_RECOVERY_KEY /boot/efi/initos/${HOSTNAME}.recovery 
-  fi
-}
-
-recover_key() {
-  local ENCRYPTED_PASSPHRASE_FILE=$1
-  PRIVATE_KEY=$HOME/.ssh/id_ecdsa
-
-  KEY=$(openssl pkeyutl -decrypt \
-     -inkey $PRIVATE_KEY -in $ENCRYPTED_PASSPHRASE_FILE \
-     -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256)
-}
-
-
 HANDLE=${HANDLE:-0x81000001}
 
 # On Chromebook, only -C p works. 
@@ -470,6 +437,7 @@ get_firmware_info() {
   done
 }
 
+# Not working yet - for ssh keys
 create_ec() {
   # Endorsement key
   #tpm2_createek -c primarye.ctx -G 0x01 
@@ -488,6 +456,7 @@ create_ec() {
 
 }
 
+# Create primary TPM2 key 
 create_primary() {
   mkdir -p /boot/efi/initos
 
@@ -516,6 +485,7 @@ create_primary() {
   echo $phandle > /boot/efi/initos/tpm_primary
 }
 
+# After create_primary - will create a random key and save it.
 set_pass() { 
   mkdir -p /initos/tpm
   cd /initos/tpm

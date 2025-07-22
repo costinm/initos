@@ -60,12 +60,25 @@ boot_initos() {
   # one if upgrading a machine with a very small EFI).
 
   if [ ! -d /initos/sidecar/etc ]; then
-    lfatal "partition containing boot image not found. Use alternate boot or USB disk for recovery"
+    if [ "$SECURE_MODE" = "1" ]; then
+      lfatal "Secure mode, but /initos/sidecar/etc not found. InitOS sidecar is not mounted."
+    else
+      logi "Insecure mode, no /initos/sidecar/etc found."
+      if [ -e /z/rootfs/etc ]; then
+        logi "Using /z/rootfs (unencrypted STATE) as rootfs"
+        mount -o bind /z/rootfs /sysroot
+      elif [ -e /z/etc ]; then
+        logi "Using /z (unencrypted STATE) as rootfs"
+        mount -o bind /z /sysroot
+      else
+        lfatal "Insecure mode, no /rootfs. Mount something to recover."
+      fi
+    fi
+  else
+    # The verified sidecar will be the sysroot.
+    mount -o bind /initos/sidecar /sysroot
   fi
-
-  # Chroot into the Initos main
-  mount -o bind /initos/sidecar /sysroot
-
+  
   # The files from the signed initrd can override files in the 
   # initos sqfs. It is also possible to append to or rebuild the 
   # sqfs using the docker image.
@@ -76,7 +89,6 @@ boot_initos() {
   
   # Will be available as /var/initos/local in the init.
   cp -a /local/* /sysroot/var/initos/local
-  ls -lR /local
   
   # Override files in etc with the /local/ files (it's either generic 
   # or specific to this machine)
@@ -111,8 +123,7 @@ find_and_mount_efi() {
   # to check first.
   # TODO: also check a local file - we want the signed EFI to only work in secure mode.
   check_efi
-
-  BOOT_CURRENT=$BOOT_CURRENT
+  # Will set BOOT_CURRENT and SECURE_MODE envs
 
   if [ "$BOOT_CURRENT" = "1001" ]; then
     find_boot BOOTA
@@ -131,13 +142,9 @@ find_and_mount_efi() {
       logi "Mounted verity SECURE, boot id: $BOOT_CURRENT "
     else 
       logi "Mounted verity INSECURE ($SECURE_MODE) boot id: $BOOT_CURRENT "
-      # may as well panic - in insecure use the unsigned UKI
-      # only use is machines that lack secure boot - but still want
-      # to encrypt the disk (manually). Evil maid can easily hack it
-      # and capture the password.
     fi
   else
-    lfatal "$BOOT_CURRENT - boot partition not found"
+    lfatal "$BOOT_CURRENT - boot partition not found. Expects /boot/efi to be mounted and /dev/mapper/initos verity device to be setup."
   fi
 }
 
@@ -216,7 +223,12 @@ initramfs_mods() {
   # btrfs, vfat are are normally present - but may be loaded if missing
 }
 
-# Mount the boot image - verity and unionfs
+# Mount the boot image - verity and unionfs.
+# At this point, /dev/mapper/initos and /dev/mapper/sidecar
+# should be available.
+#
+# In insecure mode, if a STATE ext4 partition is found, it can be
+# used as rootfs.
 mount_initos() {
   # Will be moved to recovery image
   mkdir -p /initos
@@ -227,20 +239,45 @@ mount_initos() {
 
   # TODO: in insecure/debug mode - mount without verity
 
-  mount_overlay initos /initos/rootfs
-  mount_overlay sidecar /initos/sidecar
-
+  if [ -e /dev/mapper/initos ]; then
+    mount_overlay initos /initos/rootfs
+  fi
+  if [ -e /dev/mapper/sidecar ]; then
+    mount_overlay sidecar /initos/sidecar
+  fi
   kernel_ver=$(uname -r)
  
   mkdir -p /lib/firmware
   mkdir -p /lib/modules/${kernel_ver}
-  mount -o bind /initos/rootfs/lib/firmware /lib/firmware
-  mount -o bind /initos/rootfs/lib/modules/${kernel_ver} \
-      /lib/modules/${kernel_ver}
+
+  if [ -e /initos/rootfs/lib/modules/${kernel_ver} ]; then
+    mount -o bind /initos/rootfs/lib/firmware /lib/firmware
+    mount -o bind /initos/rootfs/lib/modules/${kernel_ver} \
+        /lib/modules/${kernel_ver}
+  else
+    if [ "$SECURE_MODE" = "1" ]; then
+      lfatal "Secure mode, but /initos/rootfs/lib/modules/${kernel_ver} not found. InitOS rootfs is not mounted."
+    else
+      logi "Insecure mode, no modules for ${kernel_ver} found in initos rootfs."
+      if [ -e /z/rootfs/lib/modules/${kernel_ver} ]; then
+        logi "Using modules from /z/rootfs/lib/modules/${kernel_ver}"
+        mount -o bind /z/rootfs/lib/modules/${kernel_ver} /lib/modules/${kernel_ver}
+        mount -o bind /z/rootfs/lib/firmware /lib/firmware
+      elif [ -e /z/lib/modules/${kernel_ver} ]; then
+        logi "Using modules from /z/lib/modules/${kernel_ver}"
+        mount -o bind /z/lib/modules/${kernel_ver} /lib/modules/${kernel_ver}
+        mount -o bind /z/lib/firmware /lib/firmware
+      else
+        lfatal "Insecure mode, no modules for ${kernel_ver} found in /z/lib/modules/${kernel_ver}."
+      fi
+    fi
+  fi
 
   mkdir -p /initos/sidecar/var/initos
-  echo ${BOOT_CURRENT} > /initos/sidecar/var/initos/BOOT_CURRENT
-  echo ${NEXT} > /initos/sidecar/var/initos/BOOT_NEXT
+  echo -n ${BOOT_CURRENT} > /initos/sidecar/var/initos/BOOT_CURRENT
+  echo -n ${NEXT} > /initos/sidecar/var/initos/BOOT_NEXT
+  echo -n ${SECURE_MODE} > /initos/sidecar/var/initos/BOOT_SECURE
+  echo -n ${BOOT_DEVICE} > /initos/sidecar/var/initos/BOOT_DEVICE
 }
 
 # Mount an overlayfs on top of a squashfs, dm-verity or other RO device.
@@ -256,7 +293,7 @@ mount_overlay() {
   logi "Mounting overlay $dev $type to /initos/ro/$name and overlay to $dst"
   mount -t $type $dev /initos/ro/${name}
   if [ $? -ne 0 ]; then
-     lfatal "Error: Failed to sqfs ${name}"
+     lfatal "Error: Failed to mount sqfs ${name}"
      return 1
   fi
 
@@ -266,8 +303,6 @@ mount_overlay() {
   if [ $? -ne 0 ]; then
      lfatal "Error: Failed to mount overlay ${name}"
   fi
-
-
 }
 
 # All remaining mounted dirs will be moved under same dir in /sysroot,
@@ -305,14 +340,19 @@ lfatal() {
   cat /proc/devices > $save/devices
   lsmod > $save/lsmod.log
 
-  echo "Rebooting in 20 sec. Block devices:"
-
+  
   # TODO: if /boot/efi is mounted, save to the EFI partition
   blkid
   
-  sleep 20
-  sync
-  reboot -f
+  if [ "$SECURE_MODE" = "1" ]; then 
+    echo "Rebooting in 20 sec. Block devices:"
+    sleep 20
+    sync
+    reboot -f
+  else
+    echo "Recovery shell, insecure boot. Fix the issue and exit to continue."
+    /bin/sh
+  fi
 }
 
 # retry function. Not used right now, will be used for LVM open
@@ -371,10 +411,14 @@ udev_start() {
 # a initios.hash matching the signed EFI.
 find_boot() {
   local first=${1:-BOOTA}
-  local mountp=${2:-/boot/efi}
-  local vname=${3:-initos}
-  local hashf=${4:-$(cat /local/initos.hash)}
-  local hashf2=${4:-$(cat /local/sidecar.hash)}
+  # Mount point for the disk containing the /initos content.
+  local mountp=/boot/efi
+  # Main file - if /dev/mapper/initos can be mounted, will assume success.
+  local vname=initos
+  # Location on the initramfs where the hashes are stored.
+  # Will be matched against disk content under /initos/*.hash
+  local hashf=${2:-$(cat /local/initos.hash)}
+  local hashf2=${3:-$(cat /local/sidecar.hash)}
 
   # findfs doesn't work well if multiple partitions with same label are present.
   # This just waits for the expected label to show up, will try all of them
@@ -382,6 +426,25 @@ find_boot() {
 
   local temp_mount_point=/boot/efi
   
+  # try an ext4 partition, with label STATE (chromeos style).  
+  device=$(blkid | grep "LABEL=\"STATE\"" | cut -d: -f1)
+  if [ -n "$device" ]; then
+    echo "$device" | while read -r d; do 
+      try_ext_disk "$d" "$hashf" "$hashf2"
+      if [ $? -eq 0 ]; then
+        export BOOT_LABEL=$kind
+        export BOOT_DEVICE=$d
+        break
+      fi
+    done
+    if [ -e /dev/mapper/$vname ]; then
+      return 0
+    fi
+  fi
+
+  # Attempt to mount a FAT disk with label $first, giving 
+  # priotity to nvme, mmc. SD are last (usually USB).
+  # If the hashed files are found and verity works - return.
   for diskt in /dev/nvme /dev/mmc /dev/sd ;  do 
     device=$(blkid | grep "LABEL=\"$first\"" | cut -d: -f1 | grep $diskt)
     echo "$device" | while read -r d; do 
@@ -392,6 +455,7 @@ find_boot() {
       try_disk "$d" "$hashf" "$hashf2"
       if [ $? -eq 0 ]; then
         export BOOT_LABEL=$first
+        export BOOT_DEVICE=$d
         break
       fi
     done
@@ -413,6 +477,7 @@ find_boot() {
       try_disk "$d" "$hashf" "$hashf2"
       if [ $? -eq 0 ]; then
         export BOOT_LABEL=$kind
+        export BOOT_DEVICE=$d
         break
       fi
     done
@@ -420,9 +485,6 @@ find_boot() {
       return 0
     fi
   done
-
-  echo "XXXX TEMPORARY DEBUG - INITRD FAILED, check efi partitions"
-  sh
 
   return 2
 }
@@ -438,22 +500,74 @@ try_disk() {
   
   fsck.vfat -y $device >> /tmp/initos.log 2>&1
   if mount -t vfat "$device" $mountp ; then
-      if [ -f $mountp/initos/initos.hash ]; then
-        version_content=$(cat $mountp/initos/initos.hash)
-        if [ "$version_content" = "$hashf" ]; then
-          logi "Found InitOS partition $device $hashf"
-          # Cleanup - it happens if not unmounted safely.
-          rm -f $mountp/FSCK*.REC || true
+    if [ -f $mountp/initos/initos.hash ]; then
+      version_content=$(cat $mountp/initos/initos.hash)
+      if [ "$version_content" = "$hashf" ]; then
+        logi "Found InitOS partition $device $hashf"
+        # Cleanup - it happens if not unmounted safely.
+        rm -f $mountp/FSCK*.REC || true
 
-          veritysetup open $mountp/initos/sidecar.sqfs sidecar \
-            $mountp/initos/sidecar.sqfs.verity ${hashf2} 
+        veritysetup open $mountp/initos/sidecar.sqfs sidecar \
+          $mountp/initos/sidecar.sqfs.verity ${hashf2} 
+        
+        veritysetup open $mountp/initos/initos.sqfs initos \
+          $mountp/initos/initos.sqfs.verity ${hashf} 
+        if [ $? -eq 0 ]; then
+          return 0 
+        fi
+        logi "   found InitOS with correct hash, but verity failed, continue $device"
+      else 
+        logi "  found InitOS partition with different version $version_content on $device expecting $hashf"
+      fi
+    else
+      logi "  hash file not found on $device"
+    fi
+
+    # Unmount the device
+    if ! umount $mountp ; then
+      logi "  Error: Failed to unmount device."
+    fi
+  else
+      logi "  Error: Failed to mount EFI device $device"
+  fi
+  return 1
+}
+
+# Using an ext4 disk with label STATE allows running alongside chromeos flex.
+# Still needs 2 small EFI partitions for A/B, but could
+# use the single EFI partition with 2 EFI files as well.
+# 
+# It will leave /z/ mounted, and the /dev/mapper/initos may be available.
+# as well as /dev/mapper/sidecar - neither are required in insecure mode.
+# 
+#
+try_ext_disk() {
+  local device=$1
+  local hashf=$2
+  local hashf2=$3
+  local mountp=/z
+  mkdir -p /z
+
+  if mount -t ext4 "$device" $mountp ; then
+    for kind in BOOTA BOOTB ;  do
+      if [ -f $mountp/initos/${kind}/initos.hash ]; then
+        version_content=$(cat $mountp/initos/${kind}/initos.hash)
+        if [ "$version_content" = "$hashf" ]; then
+          logi "Found InitOS STATE dir $device $kind $hashf"
           
-          veritysetup open $mountp/initos/initos.sqfs initos \
-            $mountp/initos/initos.sqfs.verity ${hashf} 
+          veritysetup open $mountp/initos/${kind}/sidecar.sqfs sidecar \
+            $mountp/initos/${kind}/sidecar.sqfs.verity ${hashf2} 
+          if [ $? -neq 0 ]; then
+            logi "   found InitOS with correct hash, but verity failed for sidecar, continue $device"
+            continue 
+          fi
+          
+          veritysetup open $mountp/initos/${kind}/initos.sqfs initos \
+            $mountp/initos/${kind}/initos.sqfs.verity ${hashf} 
           if [ $? -eq 0 ]; then
             return 0 
           fi
-          logi "   found InitOS with correct hash, but verity failed, continue $device"
+          logi "   found InitOS with correct hash, but verity failed for initos, continue $device"
         else 
           logi "  found InitOS partition with different version $version_content on $device expecting $hashf"
         fi
@@ -461,14 +575,12 @@ try_disk() {
         logi "  hash file not found on $device"
       fi
 
-      # Unmount the device
-      if ! umount $mountp ; then
-        logi "  Error: Failed to unmount device."
-      fi
-    else
+      # Not unmounting - if STATE exists, it remains as /z
+    done
+  else
       logi "  Error: Failed to mount EFI device $device"
-    fi
-    return 1
+  fi
+  return 1
 }
 
 # We need to find the boot partition, to load the matching signed image.

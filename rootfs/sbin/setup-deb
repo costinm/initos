@@ -1,15 +1,12 @@
 #!/bin/sh
 
 # Build script for a debian rootfs.
+#
 # Kernel, Nvidia modules and basic utils.
 
 set -x
 set -e
 
-# Destination dir for the efi partition artifacts.
-# May include additional files to bake into images.
-# Signing the images also requires a volume holding the signing keys
-# and configs.
 WORK=${WORK:-/data}
 
 # Save the kernel and modules on /data, to be used by the 'sign' image and
@@ -30,8 +27,7 @@ save_boot() {
   cp -a /lib/firmware /data/lib
 }
 
-
-# Creat a sqfs under $1 with the name $2, containing all files in this 
+# Create a sqfs under $1 with the name $2, containing all files in this 
 # container. 
 #
 # Another way is to export (pull and export or using crane) and create 

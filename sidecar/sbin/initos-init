@@ -4,14 +4,14 @@ export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Main entry point - called by the init script
 initos_init() {  
-  logi "Starting INITOS TPM2 $(uname -r)"
+  export SECURE_MODE=$(cat /initos/sidecar/var/initos/BOOT_SECURE)
+
+  logi "Starting INITOS TPM2 $(uname -r) SECURE=${SECURE_MODE}"
 
   if [ -f /var/initos/local/initos.env ]; then
     echo "Using signed EFI config: "
     cat /var/initos/local/initos.env
     . /var/initos/local/initos.env
-  else 
-    echo "No built-in initos config found, using defaults"
   fi
   
   # Additional drivers with the real firmware and modules mounted. 
@@ -39,6 +39,9 @@ initos_init() {
     unlock_tpm
 
     open_disks "$KEY"
+    # If tpm_handle is set: assume unattended mode (in secure mode).
+    # do not ask for password. 
+    # TODO: encode this on the signed image instead.
   else
     for i in 1 2 3; do
       echo
@@ -204,12 +207,17 @@ logi() {
 lfatal() {
   echo "FAILED: "$@""
   edump
-
-  echo "Rebooting in 20 sec"
-  blkid
   
-  sleep 20
-  reboot -f
+  if [ "$SECURE_MODE" = "1" ]; then
+    echo "Rebooting in 20 sec"
+    blkid
+  
+    sleep 20
+    reboot -f
+  else
+    echo "Insecure mode - recovery"
+    bash
+  fi
 }
 
 # dump info to the EFI partition (which exists if we managed to get the
@@ -343,9 +351,12 @@ mount_btrfs_raw() {
 }
 
 
-# Persistent disk mounted on /x
-# Mount /sysroot from the BTRFS subvolume, mount additional volumes.
-mount_sysroot() {
+# Called after (ideally encrypted) persistent disk is mounted on /x
+# Will bind mount and prepare the core mounts.
+# 
+# If INITOS_ROOT is set and exists, create a /sysroot and prepare to 
+# switch roots.
+mount_encrypted() {
   # This is the first LUKS device open
   root_device=/dev/mapper/luks-1
   x=/x
@@ -354,10 +365,10 @@ mount_sysroot() {
     swapon ${x}/swap
   fi
 
-  mkdir -p /sysroot
-
+  # Rootfs in a subvolume on the encrypted btrfs.
   if [ -n "$INITOS_ROOT" ]; then
-    # The sidecar is used for upgrades and control - host can work without it
+    mkdir -p /sysroot
+
     if [ -d /x/"${INITOS_ROOT}" ]; then
       echo "Using InitOS rootfs: $INITOS_ROOT - enter 'r' to fallback to recovery"
       read -t 5 -n 1 key
@@ -370,14 +381,12 @@ mount_sysroot() {
         echo "Mounted InitOS rootfs: $INITOS_ROOT"
       fi
     fi
-  else
-    echo "INITOS_ROOT not set, using default"
   fi
-  env
-
+  
   if [ -d ${x}/@home ] ; then
     mount -o bind ${x}/@home /home
   fi
+
   # Not backing up cache
   if [ -d /x/@cache ]; then
     mount -o bind ${x}/@cache /var/cache
@@ -387,6 +396,7 @@ mount_sysroot() {
     mount -o bind /x/@cache/vartmp /var/tmp
     mount -o bind /x/@cache/containers /var/lib/containers
   fi
+  
   if [ -d ${x}/@log ]; then
     mount -o bind ${x}/@log /var/log
   fi
@@ -424,10 +434,10 @@ start_os() {
     . /x/initos/initos.env
   fi
   
-  mount_sysroot
+  mount_encrypted
 
   if [ ! -d /sysroot/etc ]; then
-    logi "INITOS_ROOT not set, running as primary - additional OS as VMs/pods"
+    logi "INITOS_ROOT not set, running sidecar as main OS - additional OS as VMs/pods"
     run_standalone
     return
   fi
@@ -449,6 +459,7 @@ start_os() {
   cp /sbin/initos* /sysroot/sbin
   mkdir -p /sysroot/var/initos # Local files and boot next
   cp -a /var/initos /sysroot/var/
+
   cp -a /x/initos/rootfs/etc/* /sysroot/etc/
   cp -a /x/initos/root /sysroot/
 

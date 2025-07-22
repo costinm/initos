@@ -93,6 +93,11 @@ initrd() {
 # Build the initos alpine rootfs.
 sidecar() {
   _build_cmd alpine:edge initos-sidecar  setup-sidecar install
+
+  # Add UI and dev tools to the sidecar - useful, may switch to an option
+  # later
+  _build_cmd alpine:edge initos-sidecar  setup-sidecar add_extra
+
   # Add the sidecar-specific files
   buildah copy initos-sidecar sidecar/etc /etc
 

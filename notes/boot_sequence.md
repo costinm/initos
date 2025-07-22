@@ -1,28 +1,74 @@
-# Boot sequence
+# OS Initialization 
 
-After install and provisioning the signing keys:
+The InitOS project is focused on safe initialization of a physical machine. It consists on one EFI file, containing a 'UKI' - linux
+kernel, initrd and CLI args.
 
-1. EFI loades the initos signed Kernel+initramfs UKI file according to the 'next boot' or default.
-2. The image signature is verified by firmware.
-3. The initramfs mounts the partition containing the signed Initos image
-4. Using the signature included in the signed kernel, use verify to 
-enable verification on the image, mount it RO + an overlayfs
-5. Copy the /local dir containing signed configs (CA root, etc)
-6. Pass control to the Initos image.
+There are 2 variants - a simple one intended as replacement for 
+grub + dracut (and other equivalents), and one for secure boot.
 
-The InitOS image is an alpine image with a custom init script responsible for machine initialization:
+The main difference is that the boot components should be built in a secure, isolated environment - and not on each machine. 
+
+It also tries to keep things as small and simple (readable) as possible, with all logic around boot in a single shell script.
+
+## Simple boot (insecure)
+
+The simple boot is similar to grub - secure boot is not used and
+the root disk is not encrypted. That means someone with access to
+the hardware can replace the boot or change the disk. It is  
+fine for test machines - and even for personal cheap servers, that's
+how majority of linux distributions using grub actually work.
+
+The init script detects insecure boot from the EFI variables, and 
+mounts an EXT4 disk with label 'STATE' as /z (this is used to allow 
+coexistence with ChromiumOS - this is the main disk).
+
+On the disk, either /z/rootfs/etc or /z/etc must exist - they are 
+given control after initialization. The rootfs is expected to have the kernel and matching modules installed - but not grub or dracut.
+
+Since physical access to the machine would allow root anyways - a shell on the console is possible.
+
+The script will also attempt to use some of the 'secure boot' 
+elements: if /z/initos/BOOTA/initos.hash is present and matches the EFI - it is mounted and used. Same for the sidecar.hash. 
+
+The 'initos.sqfs' is an image containing the kernel modules and firmware. It should be installed at the same time with the EFI -
+and not require the rootfs to include the same.
+
+The sidecar.sqfs contains an Alpine-based sidecar that can build
+the EFI and perform secure boot, along with many utilities. It is
+mounted as /initos/sidecar - and can be used with chroot or as a container.
+
+## Secure boot sequence
+
+This requires a central machine to build and sign the EFI.
+
+The keys are copied and most be installed in the BIOS, and secure boot enabled - this is manual on each machine.
+
+The central machine also adds the 'mesh' root public keys and
+any configs - it can build a single image or one image per machine
+or group of machines, with machine-specific configs.
+
+1. EFI loads the UKI image (kernel + initramfs + cmdline). This should be signed and contain root public keys and mesh-specific core configs. 
+
+2. If boot was secure, look for initos rootfs (containing modules/firmware) and sidecar (alpine). Both are verity-mounted, using hashes built into the UKI image. Pass control to sidecar. Any error is fatal, reboot.
+
+We copy the /local dir from UKI and the current startup scripts, it  contains signed configs (CA root, etc) and give control to  initios-init script in the rootfs.
+
+## Sidecar behavior
+
+The InitOS image is an alpine image with a custom init script responsible for further machine initialization:
+
 - load kernel modules, start udev, initialize hardware
+
 - unlock the TPM2 and get the LUKS key, or ask the user for the key
+
 - use the key to mount the LUKS partition
 
-Based on the (signed in the UKI or encrypted in LUKS) configuration, 
-it may:
-- switch root to one of the 'rootfs' subvolumes on the encrypted disk 
-- start one or more pods and VMs using rootfs and images on the disk
-- if the rootfs is not using systemd, both.
+Based on the (signed in the UKI or encrypted in LUKS) configurations, it may:
 
-InitOS will continue to run as a sidecar - mainly the SSHD and 
-udev handling.
+- switch root to one of the 'rootfs' subvolumes on the encrypted disk. If the rootfs is not using systemd, InitOS will continue to run as a sidecar - mainly the SSHD and udev handling.
+
+- continue running, start one or more pods and VMs using rootfs and images on the disk
+
 
 ## Disk layout 
 
@@ -62,7 +108,6 @@ Optional: LVM partition for the use with VMs.
   - initos/KEYS will be used to setup secure boot
   - initos/install/ scripts will be run automatically to unatended installs.
 - optional LUKS disk containing a btrfs filesystem - can be copied over to the host disk.
-
 
 
 # Rootfs (full)
