@@ -82,8 +82,9 @@ push() {
   # using swapNext
 }
 
+
 if [ -z ${1+x} ] ; then
-  push
+  echo "push.sh \$host"
 else
   push "$@"
 fi

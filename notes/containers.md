@@ -53,4 +53,21 @@ Another approach is chaining:
 The helpers can start ssh or other debug tools, handle 
 mesh, mount disks.
 
+# Podman
 
+I use podman for 2 main reasons:
+- it works very well as regular user, with no daemon
+- it support `--rootfs` option so it can take a custom-created rootfs.
+
+When running it without systemd - the config needs to be adjusted.
+
+As user, files are in `~/.local/share/containers/storage`:
+- vfs-containers/${ID}/userdata/[buildah,config].json - the runc config. 
+  After the container stops - the file is left around. 
+  `jq .root.path` to find the rootfs. 
+
+- images under vfs-images/${ID}/ - json files with metadata/schema.
+  `jq .layers[].digest` for the layers.
+
+When building - or running - the container layers remain around and
+may be reused.

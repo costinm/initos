@@ -2,22 +2,31 @@
 
 set -x
 
-# Default target for recovery in docker
-install() {
+min() {
   echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories
   apk -U --no-progress update
+
+  alpine_add_common
+
+  alpine_add_host_sidecar
+
+  finish
+}
+
+# Default target for recovery in docker
+install() {
+  min
 
   # Packages needed for building an initrd and signing an EFI.
   add_builder
 
-  # Common utilities for a host sidecar.
-  alpine_add_common
-
-  alpine_add_recovery
-
   # Podman, buildah, cloud hypervisor
   alpine_add_virt
 
+}
+
+# Setup init files and common options
+finish() {
   [ -f /etc/resolv.conf ] ||  echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
   mkdir -p /boot/efi
@@ -30,6 +39,8 @@ install() {
   apk del busybox-mdev-openrc || true
 
   (cd /etc/init.d && ln -s agetty agetty.tty2)
+  (cd /etc/init.d && ln -s agetty agetty.tty1)
+  (cd /etc/init.d && ln -s agetty agetty.ttyS0)
   #rc-update add agetty.tty2 default
   #rc-update add agetty.ttyS0 boot
   #rc-update add agetty.hvc0 boot
@@ -91,29 +102,36 @@ install() {
 # 
 # To check: gzip -dc ../initos-initrd.img | cpio -idmv
 add_builder() {
-  apk add ca-certificates-bundle curl \
-   efi-mkuki efi-mkkeys sbsigntool squashfs-tools \
-   cryptsetup mkinitfs zstd \
-   openssl openssh openssh-keygen \
-     binutils uuidgen eudev eudev-hwids udev-init-scripts \
-      udev-init-scripts-openrc \
-      dosfstools efibootmgr yq jq
+  apk add  \
+    efi-mkkeys sbsigntool \
+    mkinitfs binutils  \
+    zstd \
+     uuidgen 
+      
   
+  # No longer used: efi-mkuki (forked, upstream no longer works - systemd )
+  # gummiboot - forked 
+
   # Udev used in initrd
   
-
   echo 'disable_trigger=yes' >> /etc/mkinitfs/mkinitfs.conf
 
 }
 
+alpine_add_host_sidecar() {
+  apk add  cryptsetup  squashfs-tools \
+   openssl openssh openssh-keygen dosfstools efibootmgr  jq \
 
-# Useful packages for a host. 
+}
+
+# Useful packages for a host or container running alpine.
 alpine_add_common() {
 
   #apk list -I
 
   #apk add alpine-base # Installs openrc
   apk add  \
+    ca-certificates-bundle \
     openrc tini \
      busybox-openrc \
     alpine-conf  alpine-release \
@@ -140,14 +158,22 @@ alpine_add_common() {
      \
     lsblk  hdparm fio qemu-img \
      btrfs-progs e2fsprogs duperemove parted dosfstools lsscsi \
-    lvm2 \
+    lvm2 squashfs-tools \
     irqbalance \
     lm-sensors \
     mdadm \
     smartmontools dmidecode \
       pciutils \
+      uuidgen  \
+      dosfstools efibootmgr jq \
         nvme-cli \
+        pm-utils \
+        \
+        minisign nsjail age
   
+  # gnu-efi ovmf 
+
+
   #sedutils
 
   # Not sure: this seems to take over some interfaces  
@@ -242,7 +268,6 @@ alpine_add_virt() {
   # For OCI interaction - podman can also pull, for building use dev image.
   apk add runc \
     podman podman-openrc podman-docker fuse-overlayfs \
-    buildah  \
     cloud-hypervisor virtiofsd
 
   # lxc lxc-openrc lxc-templates lxc-templates-oci lxc-download lxc-bridge
@@ -268,16 +293,20 @@ alpine_add_virt() {
   #apk add nsjail
 }
 
+add_dev() {
+  apk add \
+     mc bash bash-completion \
+     uv go k3s cni-plugins restic rclone nix \
+       buildah yq pev 
+}
+
 add_extra() {
   # clevis adds bash, jose, cacklib.
   # has nice network-based unlock
-  apk add clevis minisign nsjail age 
+  #apk add clevis  
 
   add_wui
 
-  apk add \
-     mc bash bash-completion \
-     uv go k3s restic rclone nix
 
   # minisign: 400k - smallest util to sign/verify.
   #apk add minisign
@@ -317,8 +346,8 @@ add_wui() {
     rofi-wayland rofi-pass rofi-top polkit seatd dbus \
     kitty kitty-kitten foot \
     font-jetbrains-mono font-croscore \
-    chromium \
-    code-oss 
+    chromium 
+  #  code-oss - remote doesn't work. glibc
 
 
   # Firefox: doesn't work well with kasmvnc

@@ -1,0 +1,95 @@
+#!/bin/sh
+
+# Script to initialize wireguard and nftables.
+
+# Based on https://www.wireguard.com/netns/
+#
+# Unlike the original script, which tries to set a VPN (internet traffic over WG),
+# this script wants to route 'mesh' traffic over WG.
+# 
+# Using 10.x.y.y addresses, where y is the node number - wg will get only this
+# traffic. If something is using SSH or https - all good, it's encrypted.
+
+
+set -ex
+
+[[ $UID != 0 ]] && exec sudo -E "$(readlink -f "$0")" "$@"
+
+upwg() {
+    ip netns add physical
+
+    # The wg0 interface is created in the physical namespace, so will route there.
+    # We move it to netns - but it remembers.
+    ip -n physical link add wgvpn0 type wireguard
+    ip -n physical link set wgvpn0 netns 1
+
+    wg setconf wgvpn0 /etc/wireguard/wgvpn0.conf
+
+    ip addr add 192.168.4.33/32 dev wgvpn0
+
+    ip link set wgvpn0 up
+    #ip route add default dev wgvpn0
+
+
+    wg set wg0 fwmark 1234
+
+    # Table 2468 has default route via wg0.
+    # Everyone except wg0 uses 2468
+    ip route add default dev wg0 table 2468
+    ip rule add not fwmark 1234 table 2468
+
+    # Table main has no default route, so it will use the default route
+    # of the physical namespace (eth0).
+    ip rule add table main suppress_prefixlength 0
+}
+
+upwl() {
+    ip link set wlan0 down
+    iw phy phy0 set netns name physical
+    ip netns exec physical dhcpcd -b wlan0
+    ip netns exec physical wpa_supplicant -B -c/etc/wpa_supplicant/wpa_supplicant-wlan0.conf -iwlan0
+}
+
+upeth() {
+    ip link set eth0 down
+    ip link set eth0 netns physical
+    ip netns exec physical dhcpcd -b eth0
+}
+
+downeth() {
+    ip -n physical link set eth0 down
+    ip -n physical link set eth0 netns 1
+    dhcpcd -b eth0
+}
+
+downwl() {
+    ip -n physical link set wlan0 down
+
+    ip netns exec physical iw phy phy0 set netns 1
+    dhcpcd -b wlan0
+    wpa_supplicant -B -c/etc/wpa_supplicant/wpa_supplicant-wlan0.conf -iwlan0
+}
+
+status() {
+    ip -n physical link show
+    ip link
+} 
+
+down() {
+    killall wpa_supplicant dhcpcd || true
+
+    ip link del wgvpn0
+    ip netns del physical
+
+}
+
+# Run a process in the physical namespace, with full internet access
+# We may also run a proxy in the physical namespace
+execi() {
+    exec ip netns exec physical sudo -E -u \#${SUDO_UID:-$(id -u)} -g \#${SUDO_GID:-$(id -g)} -- "$@"
+}
+
+command="$1"
+shift
+$command "$@"
+

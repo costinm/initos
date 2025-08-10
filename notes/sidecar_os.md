@@ -1,21 +1,36 @@
 # Sidecar OS
 
-We start with a signed EFI - including kernel, cmdline and essential modules 
-with a set of scripts using busybox/alpine, just enough to load a signed image.
 
-The signed image contains the 'sidecar OS' - which handles unlocking the disks (TMP/2 or user input), upgrades, networking and launching the 'main' OS.
+## Generating the signed EFI 
 
-The main OS doesn't handle kernel or initialization - can be anything that can run in a container, and may be run 'raw' or in a container or VM - and 
-multiple 'main' OSes can be started as well.
+We start with a signed EFI - including kernel, cmdline and essential modules with a set of scripts using busybox/alpine, just enough to load the verity image. The image hash is included in the initrd inside the signed EFI, along with the hash of the 'modloop' containing the modules
+and firmware.
 
-Question is: what OS to run as sidecar. 
+The verity image contains the 'sidecar OS' - which handles unlocking the disks (TMP/2 or user input), upgrades, networking and either switching to the 'main' OS or running the 'main' OS along with other VMs and containers.
 
-Alpine is great - small size, simple startup. But it lacks Nvidia support, 
-so will need a separate debian for that. 
+The main OS - just like any VM or container - doesn't handle kernel modules, disk initialization or networking - even if we give control to
+a systemd-based OS, the sidecar will still run as a priviledged container 
+or chroot along with the main OS.
 
-A small debian - without systemd (which may be used for the 'main' OS) - also works, and it reduces the complexity a bit (no need to use Alpine except as a builder and base for the initrd, and for small containers)
+A small debian or Nix - without systemd - works very well.
 
-For an Nividia-based server: Debian seems the best choice.
+## Which kernel ?
 
-For an old laptop used as a (more secure) UI: Alpine seems good enough.
-Original idea was to use the debian kernel with Alpine rootfs as a container - but if we don't have to deal with NVidia, can just use alpine kernel.
+Currently using debian kernel/firmware/modules - with the mkinitrd and busybox from Alpine which runs as sidecar and initrd.
+
+Nix and Arch linux kernels should work too.
+
+Alpine and OpenWRT kernel don't work very well with Debian and don't support Nvidia so far.
+
+## Sidecar content
+
+The script to generate sidecar currently creates a 'fat' sidecar - including the 'builder' (mkinitrd, efi tools), init utils (tmp, luks, filesystem), networking. 
+
+I am also adding wayland and X11, python and node, as well as Nix- in many cases the sidecar can be used fully standalone without a 'main' OS.
+
+The script can be easily changed to only include the minimum - but for now 
+I'm trying to push the limits and see how much I can do with Alpine+Nix combo, using Musl packages from alpine when available and Nix for the rest,  and the 'debian' main OS relegated to VMs.
+
+## Sidecar and VMs
+
+The startup script for VMs can (and should) mount the sidecar and the /nix store (read only or overlay). Normally the initrd script for VMs can take care of network setup and mounts.

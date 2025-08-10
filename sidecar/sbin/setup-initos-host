@@ -485,13 +485,18 @@ create_primary() {
   echo $phandle > /boot/efi/initos/tpm_primary
 }
 
+set_pass() {
+  KEY=${KEY:-$(setup-initos-host genpass)}
+  export KEY
+  save_pass $KEY
+}
+
 # After create_primary - will create a random key and save it.
-set_pass() { 
+save_pass() { 
+  KEY=${1:-$(setup-initos-host genpass)}
+ 
   mkdir -p /initos/tpm
   cd /initos/tpm
-#  tpm2_getcap handles-persistent | grep -q 0x81800001
-  # if [ $? -ne 0 ]; then
-  # fi
   
   # Can be called multiple times, same result
   # Shows the same output every time, probably fine to repeat.
@@ -508,9 +513,8 @@ set_pass() {
 
   PRIMARY=$(cat /boot/efi/initos/tpm_primary)
 
-  KEY=${KEY:-$(setup-initos-host genpass)}
-  export KEY
   # primary.tr or 0x81000000 - the eviccontrol handle
+  # If policy is not specified - default to no policy, so no PCR is used.
   echo ${KEY} | tpm2_create -u key.pub -r key.priv -C ${PRIMARY} -L policy.digest -i -
 
   cp key.pub /boot/efi/initos/tpm_key.pub

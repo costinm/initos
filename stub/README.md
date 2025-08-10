@@ -1,1 +1,0 @@
-Forked from version 48 of 10-year old gummibut - only the stub, not the boot loader.

@@ -4,7 +4,9 @@ export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Main entry point - called by the init script
 initos_init() {  
+  # Created by initrd, based on EFI - "1" if secure boot.
   export SECURE_MODE=$(cat /initos/sidecar/var/initos/BOOT_SECURE)
+  local z=/initos/z
 
   logi "Starting INITOS TPM2 $(uname -r) SECURE=${SECURE_MODE}"
 
@@ -35,50 +37,83 @@ initos_init() {
 
   # TODO: update the scripts to disable manual, and split the builder.
 
-  if [ -f /boot/efi/initos/tpm_handle ]; then 
-    unlock_tpm
-
-    open_disks "$KEY"
-    # If tpm_handle is set: assume unattended mode (in secure mode).
-    # do not ask for password. 
-    # TODO: encode this on the signed image instead.
-  else
-    for i in 1 2 3; do
-      echo
-      echo -n "Enter the disk (LUKS) password (attempt $i of 3): "
-      read -s KEY
-  
-      # TODO: use KEY to decrypt the real KEY, verify.
-      # We may as well use the alpine overlay, load additional configs
-      # like ssh key and support the case where the LUKS is not setup
-      # ( i.e. installer )
-      open_disks "$KEY"
-      
-      if [ -e /dev/mapper/luks-1 ]; then
-        export MANUAL_UNLOCK=1
-        break
-      fi
-
-      echo
-      echo "Failed to unlock the disk. Please try again."
-    done
-  fi 
-
-  KEY=""
-  
-  # LUKS mounted on /x, secure mode.
-
-  # At this point we may have a tpm and may be able to mount
-  # encrypted disk.
-  # If insecure - the TPM should NOT have the key
-  # Without TPM2 - will ask for a password - if it can open the
-  # disk - ok, otherwise panic
-  mount_btrfs_raw /dev/mapper/luks-1 /x
-  if [ $? -eq 0 ]; then
-      logi "BTRFS mounted"
-  else
-      lfatal "Failed to mount btrfs"
+  # From the EFI initrd - the EFI is customized to include this.
+  if [ -f /var/initos/local/autosetup.sh ]; then
+    # May call open_disks, mount_btrfs_raw 
+    bash -x /var/initos/local/autosetup.sh init
   fi
+
+  if [ "$SECURE_MODE" = "1" ]; then
+    if [ -f /boot/efi/initos/tpm_handle ]; then 
+      unlock_tpm $(cat /boot/efi/initos/tpm_handle)
+
+      open_disks "$KEY"
+      # If tpm_handle is set: assume unattended mode (in secure mode).
+      # do not ask for password. 
+      # TODO: encode this on the signed image instead.
+    elif [ -f ${z}/initos/tpm_handle ]; then 
+      unlock_tpm $(cat ${z}/initos/tpm_handle)
+
+      open_disks "$KEY"
+    else
+      for i in 1 2 3; do
+        echo
+        echo -n "Enter the disk (LUKS) password (attempt $i of 3): "
+        read -s KEY
+    
+        # TODO: use KEY to decrypt the real KEY, verify.
+        # We may as well use the alpine overlay, load additional configs
+        # like ssh key and support the case where the LUKS is not setup
+        # ( i.e. installer )
+        open_disks "$KEY"
+        
+        if [ -e /dev/mapper/luks-1 ]; then
+          export MANUAL_UNLOCK=1
+          break
+        fi
+
+        echo
+        echo "Failed to unlock the disk. Please try again."
+      done
+    fi 
+
+    KEY=""
+    # LUKS mounted on /x, secure mode.
+
+    # At this point we may have a tpm and may be able to mount
+    # encrypted disk.
+    # If insecure - the TPM should NOT have the key
+    # Without TPM2 - will ask for a password - if it can open the
+    # disk - ok, otherwise panic
+    mount_btrfs_raw /dev/mapper/luks-1 /x
+    if [ $? -eq 0 ]; then
+        logi "BTRFS mounted"
+    else
+        lfatal "Failed to mount btrfs"
+    fi
+
+  else
+    echo "Insecure boot - before switch root, enter 'a' for admin shell at start, d at each step"
+    read -t 4 -n 1 key
+    if [ "$key" = "d" ]; then
+      sh 
+    fi 
+
+    if [ -f ${z}/initos/install/autosetup.sh ]; then
+      # May call open_disks, mount_btrfs_raw 
+      bash -x ${z}/initos/install/autosetup.sh init
+    fi
+
+    btrfs device scan --all-devices
+
+    echo "No luks-1 device found, using LABEL=INITOSROOT"
+    # TODO: use LABEL=INITOSROOT instead of mapper name
+    mount -t btrfs LABEL=INITOSROOT /x
+
+  fi
+
+
+ 
 
   # Will either give control to the rootfs (Systemd or init) or 
   # start the sidecar to manage the hardware and return.
@@ -93,7 +128,14 @@ initos_init() {
   # TODO: more options - configure wireless, show IP/public keys, etc
   # Normal case use remote login to the machine for servers, no password set
   # except authorized_keys.
-  /etc/init.d/agetty.tty1 start
+
+  if [ "${SECURE_MODE}" = "1" ] ; then
+    if [ -e /dev/tty2 -a -e /etc/init.d/agetty.tty2 ]; then
+      /etc/init.d/agetty.tty2 start
+    fi
+  else
+    sh
+  fi
 
   exec tini -s sleep -- infinity 
 }
@@ -286,35 +328,19 @@ unlock_tpm() {
   # 4 = boot manager code
   # 5 = boot manager data, include GPT partitions
   # 6 = resume events
-  # 7 = secure boot status, certificates -> This is what 
   #  we want, gpt layout is not relevant, firmware can be
   #  upgraded.
 
   # The setup script makes sure this handle is set - we may try multiple handles or
   # list nv persistent and try all.
 
-  handle=0x81000001
-
-  if [ -f /boot/efi/initos/tpm_handle ]; then
-    handle=$(cat /boot/efi/initos/tpm_handle)
-  fi
+  handle=${1:-0x81000001}
 
   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
   
   if [ -z $PASSPHRASE ]; then 
     logi "Handle $handle PCR7 failed, try PCR8" 
     PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:8 2>/dev/null)
-  fi 
-  
-  # if [ -z $PASSPHRASE ]; then 
-  #   logi "Handle $handle failed PCR8 try 8100..2 PCR7" 
-  #   handle=0x81000002
-  #   PASSPHRASE=$(tpm2_unseal -c ${handle} -p pcr:sha256:7 2>/dev/null)
-  # fi 
-  if [ -z $PASSPHRASE ]; then 
-    logi "Handle $handle:8 failed, try 81800001" 
-    handle=0x81800001
-    PASSPHRASE=$(tpm2_unseal -c 0x81800001 -p pcr:sha256:7 2>/dev/null)
   fi 
   
   if [ -z $PASSPHRASE ]; then
@@ -391,14 +417,32 @@ mount_encrypted() {
   if [ -d /x/@cache ]; then
     mount -o bind ${x}/@cache /var/cache
 
-    mkdir -p /x/@cache/vartmp /x/@cache/containers /var/tmp /var/log # For buildah overlay, most be on same disk
+    rm -rf /x/@cache/tmp
+    mkdir -p /x/@cache/vartmp \
+            /x/@cache/tmp \
+            /x/@cache/containers \
+            /x/@cache/rancher /var/lib/rancher \
+            /var/tmp \
+            /var/log # For buildah overlay, must be on same disk
+    
+    mount -o bind /x/@cache/rancher /var/lib/rancher
+
     chmod 1777 /x/@cache/vartmp
     mount -o bind /x/@cache/vartmp /var/tmp
+    # Want /tmp to be on disk, not in memory.
+    mount -o bind /x/@cache/tmp /tmp
     mount -o bind /x/@cache/containers /var/lib/containers
   fi
   
   if [ -d ${x}/@log ]; then
     mount -o bind ${x}/@log /var/log
+  fi
+
+  mkdir -p /nix /z/nix
+  if [ -d ${x}/nix ]; then
+    mount -o bind ${x}/nix /nix
+  else 
+    mount -o bind /z/nix /nix
   fi
   
   if [ -d ${x}/initos/etc ] ; then
@@ -567,11 +611,7 @@ run_standalone() {
 }
 
 if [ "$$" = "1" ]; then
-  if [ "$INSECURE" = "1" ]; then
-    ins_initos_init
-  else
-    initos_init
-  fi
+  initos_init
 else
   "$@"
 fi

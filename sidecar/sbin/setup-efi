@@ -1,8 +1,15 @@
 #!/bin/sh
 
-# Setup for the files going into the EFI partition.
+# Setup for the UKI (signed kernel + initrd + signed configs/hashes).
+# Input: 
+# - /data/efi/initos - the directory with the initos.sqfs and sidecar.sqfs images
+# - The /config directory is expected to contain uefi-keys (will be created if missing) 
+# - /config/hosts - host specific configs - 'default' configs will be added.
+# 
+# Output:
+# - /data/efi/keys - the keys used to sign the images (to be added to host)
+# - /data/efi/EFI/BOOT/BOOTx64.EFI - the signed UKI image
 #
-# The /config directory is expected to contain uefi-keys (will be created if missing) 
 #
 # It will start by generating Verity signatures for the .sqfs images in
 # /data/efi/initios (generated as part of the rootfs)
@@ -23,6 +30,167 @@ set -e
 # and configs.
 
 mkdir -p /data/efi/initos /data/efi/EFI/BOOT /data/efi/keys
+
+# Sign will create the UKI signed, insecure and usb images.
+# It will also regenerate and sign the SQFS file, and add patches
+# to the UKI that will be used to configure the hosts, including 
+# a 'mesh root cert', authorized keys, common configs.
+#
+# The patches can also be added to the SQFS file before signing.
+# They go to /opt/initos/local
+# 
+# It is intended to run from a container with /etc/uefi-keys mounted
+# to a disk on an encrypted partition or 'secrets', and /data
+# mounted with the destination disk, where efi image will be 
+# created. It can also be used from recovery.
+efi() {
+  local host=${1:-default}
+    
+  # Mounted dir
+  DEST=/data/efi
+  set -e
+
+  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
+  if [ ! -f /var/run/secrets/uefi-keys/db.crt ]; then
+    sign_init
+  else
+    cp -a /var/run/secrets/uefi-keys /etc
+  fi
+
+  mkdir -p ${DEST}/initos ${DEST}/keys /local ${DEST}/EFI/BOOT
+
+  efi_keys
+
+  # If hash is missing, use verity to sign it now
+  # If making changes to the img (on the mounted disk), remove hash.recovery to force
+  # regeneration.
+
+  for base in modloop sidecar rootfs; do
+    if [ ! -f ${DEST}/initos/${base}.sqfs ]; then
+      continue
+    fi
+  
+    if [ ! -f ${DEST}/initos/${base}.hash ]; then
+      # TODO: check if older 
+      veritysetup format \
+        --root-hash-file=${DEST}/initos/${base}.hash \
+        ${DEST}/initos/${base}.sqfs \
+        ${DEST}/initos/${base}.sqfs.verity
+      # | xxd -r -p 
+      cat ${DEST}/initos/${base}.hash | openssl dgst \
+        -sha256 -sign /etc/uefi-keys/root.key \
+        -out ${DEST}/initos/${base}.sig
+    fi
+  done
+
+  # /local dir will be baked into the initrd and propagated. Include critical security files.
+  # Also add fresh scripts from the image.
+  cp ${DEST}/initos/*.hash /local/ 
+  cp /etc/uefi-keys/authorized_keys /local/
+  cp /etc/uefi-keys/root.pem /local/
+  
+  if [ -d /config/local ]; then
+    cp -a /config/local/* /local/
+  fi
+
+  # Per host local configs - go to /sysroot/var/initios/local/* in initrd (as backup) but 
+  # also get copied over /
+  # The /x/ dir 
+  cp -a /config/hosts/${host}/* /local/ || true
+  echo "Host specific files: ${host}"
+  ls -R /local 
+
+  INIT_PATCH=/tmp/initrd-patch.cpio.gz
+  (find /sbin/initos* /sbin/setup-initos* /local \
+   | sort  | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${INIT_PATCH}
+
+  # Console on ttyS0: for headless servers
+  local cmd="rdinit=/sbin/initos-initrd net.ifnames=0 panic=5 "
+  # console=tty1
+  
+  kernel_version=$(cat /boot/version) # Created on download
+  KERNEL=/boot/vmlinuz-${kernel_version}
+  #UCODE="/boot/intel-ucode.img /boot/amd-ucode.img"
+  UCODE=""
+  # Deb kernel is compiled with ucode included
+  # With the ucode - 2024-02-15
+
+  # console log level 2 (critical)
+  # default messages (no loglevel): 4 (warning)
+  # min console log level
+  # default console log level 7
+  # cmdline: loglevel=
+  #sysctl -w kernel.printk="2 4 1 7"
+
+  # TODO: add a file an create another config.cpio - command line can be set by efibootmgr.
+  # Technically if the command line can be changed an attacker can also set rdinit=/bin/sh - the bootloader must 
+  # be locked down and EFI restricted just like TPM
+  # Main setting - iomem - allows flashing bios, etc.
+
+  #if [ "$UNSIGNED" != "" ]; then
+    echo "$cmd  console=tty1 console=ttyS0,115200 iomem=relaxed  loglevel=6 foo=bar debug_init - example" > /boot/cmdline.usb
+    efi-mkuki \
+        -S /boot/linux.efi.stub \
+        -c /boot/cmdline.usb \
+        -o ${DEST}/InitOS-debug.EFI \
+          ${KERNEL} \
+          ${UCODE} /boot/initos-initrd.img ${INIT_PATCH}
+  #fi
+
+  echo "$cmd console=tty1 loglevel=1 quiet" > /boot/cmdline
+  efi-mkuki \
+        -S /boot/linux.efi.stub \
+      -c /boot/cmdline \
+      -o ${DEST}/InitOS-unsigned.EFI \
+        ${KERNEL} \
+        ${UCODE} /boot/initos-initrd.img ${INIT_PATCH}
+
+  sbsign --cert /etc/uefi-keys/db.crt \
+      --key /etc/uefi-keys/db.key \
+      --output ${DEST}/InitOS-signed.EFI \
+      ${DEST}/InitOS-unsigned.EFI
+  
+  cp ${DEST}/InitOS-signed.EFI ${DEST}/EFI/BOOT/BOOTx64.EFI 
+  # Old name
+  cp ${DEST}/InitOS-signed.EFI ${DEST}/initosA.EFI 
+
+  ls -l ${DEST}/
+
+  chmod -R 755 ${DEST}
+  rm -rf /etc/uefi-keys
+}
+
+unsigned() {
+  # Mounted dir
+  DEST=/data/efi
+  set -e
+
+  local cmd="rdinit=/sbin/initos-initrd net.ifnames=0 panic=5 "
+  
+  kernel_version=$(cat /boot/version) # Created on download
+  KERNEL=/boot/vmlinuz-${kernel_version}
+
+  if [ -e /src/sidecar ]; then
+    cp -a /src/sidecar/sbin/* /sbin
+  fi
+
+  INIT_PATCH=/tmp/initrd-patch.cpio.gz
+  (find /sbin/initos* /sbin/setup-initos* /local \
+   | sort  | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${INIT_PATCH}
+
+  # The init script will use 'the last console' if multiple are listed, not very useful.
+  # instead allow customization of the tty
+  TTY=${TTY:-tty1}
+  echo "$cmd  console=${TTY} iomem=relaxed  loglevel=6 foo=bar debug_init - example" > /boot/cmdline.usb
+  efi-mkuki \
+        -S /boot/linux.efi.stub \
+        -c /boot/cmdline.usb \
+        -o ${DEST}/InitOS-debug.EFI \
+          ${KERNEL} \
+          /boot/initos-initrd.img \
+          ${INIT_PATCH}
+
+}
 
 # Generate the key pairs for signing the kernel and the disk image.
 # This is done before install - as a separate step/process - the rest can be automated easily,
@@ -72,132 +240,6 @@ efi_keys() {
 
 }
 
-# Sign will create the UKI signed, insecure and usb images.
-# It will also regenerate and sign the SQFS file, and add patches
-# to the UKI that will be used to configure the hosts, including 
-# a 'mesh root cert', authorized keys, common configs.
-#
-# The patches can also be added to the SQFS file before signing.
-# They go to /opt/initos/local
-# 
-# It is intended to run from a container with /etc/uefi-keys mounted
-# to a disk on an encrypted partition or 'secrets', and /data
-# mounted with the destination disk, where efi image will be 
-# created. It can also be used from recovery.
-efi() {
-  local host=${1:-default}
-    
-  # Mounted dir
-  DEST=/data/efi
-  set -e
-
-  # Alpine expects keys on /etc/uefi-keys/{db.crt,db.key}
-  if [ ! -f /var/run/secrets/uefi-keys/db.crt ]; then
-    sign_init
-  else
-    cp -a /var/run/secrets/uefi-keys /etc
-  fi
-
-  mkdir -p ${DEST}/initos ${DEST}/keys /local ${DEST}/EFI/BOOT
-
-  efi_keys
-
-  # If hash is missing, use verity to sign it now
-  # If making changes to the img (on the mounted disk), remove hash.recovery to force
-  # regeneration.
-  if [ ! -f ${DEST}/initos/initos.hash ]; then
-    # TODO: check if older 
-    veritysetup format \
-      --root-hash-file=${DEST}/initos/initos.hash \
-      ${DEST}/initos/initos.sqfs \
-      ${DEST}/initos/initos.sqfs.verity
-  fi
-
-  if [ ! -f ${DEST}/initos/sidecar.hash ]; then
-    ls -l ${DEST}/initos
-    veritysetup format \
-      --root-hash-file=${DEST}/initos/sidecar.hash \
-      ${DEST}/initos/sidecar.sqfs \
-      ${DEST}/initos/sidecar.sqfs.verity
-  fi
-
-  cat  ${DEST}/initos/initos.hash
-
-
-  # /local dir will be baked into the initrd and propagated. Include critical security files.
-  # Also add fresh scripts from the image.
-  cp ${DEST}/initos/*.hash /local/ 
-
-  cp /etc/uefi-keys/authorized_keys /local/
-  cp /etc/uefi-keys/root.pem /local/
-  
-  if [ -d /config/local ]; then
-    cp -a /config/local/* /local/
-  fi
-
-  # Per host local configs - go to /sysroot/var/initios/local/* in initrd (as backup) but 
-  # also get copied over /
-  # The /x/ dir 
-  cp -a /config/hosts/${host}/* /local/ || true
-  echo "Host specific files: ${host}"
-  ls -R /local 
-
-  INIT_PATCH=/tmp/initrd-patch.cpio.gz
-  (find /sbin/initos* /sbin/setup-initos* /local \
-   | sort  | cpio --quiet --renumber-inodes -o -H newc | gzip) > ${INIT_PATCH}
-
-  # Console on ttyS0: for headless servers
-  local cmd="console=ttyS0 console=tty1 net.ifnames=0 panic=5 libata.allow_tpm=1"
- 
-  kernel_version=$(cat /boot/version) # Created on download
-  KERNEL=/boot/vmlinuz-${kernel_version}
-  #UCODE="/boot/intel-ucode.img /boot/amd-ucode.img"
-  UCODE=""
-  # Deb kernel is compiled with ucode included
-  # With the ucode - 2024-02-15
-
-  # console log level 2 (critical)
-  # default messages (no loglevel): 4 (warning)
-  # min console log level
-  # default console log level 7
-  # cmdline: loglevel=
-  #sysctl -w kernel.printk="2 4 1 7"
-
-  # TODO: add a file an create another config.cpio - command line can be set by efibootmgr.
-  # Technically if the command line can be changed an attacker can also set rdinit=/bin/sh - the bootloader must 
-  # be locked down and EFI restricted just like TPM
-  echo "$cmd initos=USB  rdinit=/sbin/initos-initrd-ins loglevel=6 debug_init iomem=relaxed " > /boot/cmdline.usb
-  efi-mkuki \
-      -c /boot/cmdline.usb \
-      -o ${DEST}/EFI/BOOT/BOOTx64.EFI \
-        ${KERNEL} \
-        ${UCODE} /boot/initos-initrd.img ${INIT_PATCH}
- 
-
-  echo "$cmd loglevel=1 quiet rdinit=/sbin/initos-initrd" > /boot/cmdline
-  efi-mkuki \
-      -c /boot/cmdline \
-      -o /tmp/tmp.EFI \
-        ${KERNEL} \
-        ${UCODE} /boot/initos-initrd.img ${INIT_PATCH}
-
-  sbsign --cert /etc/uefi-keys/db.crt \
-      --key /etc/uefi-keys/db.key \
-      --output ${DEST}/initosA.EFI \
-      /tmp/tmp.EFI
-
-  ls -l ${DEST}/
-
-  rm /tmp/tmp.EFI
-  chmod -R 755 ${DEST}
-  rm -rf /etc/uefi-keys
-}
-
-
-#    sigfile=${hashfile}.sig
-#    cat $hashfile | xxd -r -p | openssl dgst \
-#      -sha256 -sign /etc/uefi-keys/root.key \
-#      -out root_hash.sig
 
 if [ -z ${1+x} ] ; then
   efi

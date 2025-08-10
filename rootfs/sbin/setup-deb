@@ -23,56 +23,13 @@ WORK=${WORK:-/data}
 save_boot() {
   mkdir -p /data/lib /data/boot
   cp -a /boot/* /data/boot
+  cp -a /lib/modules /data/boot
+  cp -a /lib/firmware /data/boot
+
+  # Old, will be removed
   cp -a /lib/modules /data/lib
   cp -a /lib/firmware /data/lib
 }
-
-# Create a sqfs under $1 with the name $2, containing all files in this 
-# container. 
-#
-# Another way is to export (pull and export or using crane) and create 
-# the sqfs externally.
-sqfs() {
-  local DIR=${1:-/data/efi/initos}
-  local name=${2:-initos}
-
-  # -one-file-system also works on the host - but not so well in a container.
-
-  # buildah unshare -m A=debui -- \
-  #  sh -c 'tar -cf - -C ${A} .' | \
-  #   sqfstar ${WORK}/vimg/virt.sqfs -e .dockerenv
-
-  #alpine_clear
-
-  # Excluding boot from the sqfs (kernel remains on the image and is used to build
-  # the EFI, but no need to add a copy)
-  # However the cloud kernel is needed for VM
-
-  mkdir -p ${DIR}
-  rm -f ${DIR}/${name}.*
-
-  cd /
-
-  # Doesn't include /boot files (kernel is separate)
-  # Includes both normal and cloud modules
-  mksquashfs . ${DIR}/${name}.sqfs \
-     -regex \
-     -e "x/.*" \
-     -e "etc/uefi-keys" \
-     -e ".dockerenv" \
-     -e "data/.*" \
-     -e "proc/.*" \
-     -e "sys/.*" \
-     -e "run/.*" \
-     -e "tmp/.*" \
-     -e "var/cache/apt/.*" \
-     -e "etc/apk/cache.*"
-    
-  # Not excluding boot, lib - work and ws are no longer mounted (old versions)
-
-  echo "Created ${DIR}/${name}.sqfs"
-}
-
 
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL="apt install --assume-yes --no-install-recommends "
@@ -90,6 +47,12 @@ debian_rootfs_base() {
   add_deb_kernel
   
   add_deb_core
+  save_boot
+}
+
+modloop() {
+  add_deb_kernel
+  save_boot
 }
 
 add_deb_core() {
@@ -142,15 +105,6 @@ add_deb_kernel() {
 
   ver=$(ls /lib/modules |grep -v cloud)
   echo -n ${ver} > /boot/version
-
-  # No longer doing this - separate builder/image for VMs. 
-  # Also install the cloud kernel - upgrade them at the same cadence, and
-  # will be used to run the real root as a VMs for more security.
-  # Images grows from 795 -> 909 M, Initos image from 568-> 634
-  # $APTINSTALL \
-  #    linux-image-cloud-amd64
-  # ver=$(ls /lib/modules |grep cloud)
-  # echo -n ${ver} > /boot/cloud-version
 
   # Can't stop the creation - but not used. Just need the kernel and modules.
   rm -rf /boot/initrd.img* /tpm/* /tmp/* || true

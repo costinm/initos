@@ -55,13 +55,13 @@ build_initrd() {
     cp /etc/passwd /usr/share/mkinitfs/passwd
     cp /etc/group /usr/share/mkinitfs/group
 
+    # Alternative:
     #echo "features=\"ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev\"" > /etc/mkinitfs/mkinitfs.conf
     
-    # clevis ? 
     #rm -rf ${WORK}/initfs.host
     # -t ${WORK}/initfs.host
     mkinitfs -i /sbin/initos-initrd \
-      -F "ata base keymap mmc nvme scsi usb cryptsetup squashfs initos eudev" \
+      -F "ata base keymap mmc nvme scsi usb cryptsetup squashfs ext4 initos eudev" \
       -o ${img} $VER
 
     # /init will be the inito-initrd
@@ -78,7 +78,7 @@ build_initrd() {
 # the sqfs externally.
 sqfs() {
   local DIR=${1:-/data/efi/initos}
-  local name=${2:-initos}
+  local name=${2:-sidecar}
 
   # -one-file-system also works on the host - but not so well in a container.
 
@@ -90,16 +90,15 @@ sqfs() {
 
   # Excluding boot from the sqfs (kernel remains on the image and is used to build
   # the EFI, but no need to add a copy)
-  # However the cloud kernel is needed for VM
+  # However ./the cloud kernel is needed for VM
 
   mkdir -p ${DIR}
   rm -f ${DIR}/${name}.*
 
   cd /
 
-  # Doesn't include /boot files (kernel is separate)
-  # Includes both normal and cloud modules
   mksquashfs . ${DIR}/${name}.sqfs \
+     -noappend \
      -regex \
      -e "x/.*" \
      -e "etc/uefi-keys" \
@@ -112,9 +111,15 @@ sqfs() {
      -e "var/cache/apt/.*" \
      -e "etc/apk/cache.*"
     
-  # Not excluding boot, lib - work and ws are no longer mounted (old versions)
-
   echo "Created ${DIR}/${name}.sqfs"
+}
+
+mod_sqfs() {
+  local DIR=${1:-/data/efi/initos}
+
+  rm -f ${DIR}/modloop.*
+  cd /data/boot
+  mksquashfs . ${DIR}/modloop.sqfs 
 }
 
 alpine_clear() {
