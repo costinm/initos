@@ -90,6 +90,18 @@ FROM alpine-dev as alpine-ui
 RUN setup-sidecar add_wui
 
 
+
+
+#################
+FROM sidecar-base as sidecar
+
+COPY --from=modloop /boot /boot
+COPY --from=modloop /lib/modules /lib/modules
+COPY --from=modloop /lib/firmware /lib/firmware
+
+RUN /sbin/setup-initos build_initrd
+COPY --from=ghcr.io/costinm/uki-stub/uki-stub:latest /boot/linux.efi.stub /boot/
+
 #################
 FROM sidecar as tmp-gen
 
@@ -104,16 +116,3 @@ RUN /sbin/setup-efi unsigned
 # Use: podman build --target efi . --output DEST_DIR
 FROM scratch as efi
 COPY --from=tmp-gen /data/efi ./
-
-
-#################
-FROM sidecar-base as sidecar
-
-COPY --from=modloop /boot /boot
-COPY --from=modloop /lib/modules /lib/modules
-COPY --from=modloop /lib/firmware /lib/firmware
-
-RUN /sbin/setup-initos build_initrd
-COPY --from=ghcr.io/costinm/uki-stub/uki-stub:latest /boot/linux.efi.stub /boot/
-
-#################
