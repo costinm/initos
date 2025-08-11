@@ -114,6 +114,6 @@ COPY --from=modloop /lib/modules /lib/modules
 COPY --from=modloop /lib/firmware /lib/firmware
 
 RUN /sbin/setup-initos build_initrd
-COPY prebuilt/linux.efi.stub /boot/
+COPY --from=ghcr.io/costinm/uki-stub/uki-stub:latest /boot/linux.efi.stub /boot/
 
 #################
