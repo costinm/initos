@@ -12,8 +12,6 @@ ARG BASE=alpine:edge
 # Will add UI, etc on top.
 ARG DEBBASE=debian:bookworm-slim
 
-# The shared data dir. Mounted in each step.
-FROM scratch as data
 
 ######## Debian: kernel extracted as modloop
 FROM ${DEBBASE} as modloop
@@ -24,7 +22,6 @@ COPY ./rootfs/sbin /sbin
 # but we are not using the rest so no point to upload the container.
 RUN \
   --mount=target=/var/lib/cache,id=apt,type=cache \
-  --mount=target=/data,from=data \
      setup-deb modloop && ls -l /data/boot
 
 
