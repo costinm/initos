@@ -1,4 +1,0 @@
-/usr/lib/udev/*
-/bin/udevadm
-/etc/udev/*
-/sbin/udev*

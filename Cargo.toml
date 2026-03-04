@@ -1,0 +1,18 @@
+[package]
+name = "initos"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal rdinit binary for initrd with fs-verity verification"
+
+[dependencies]
+libc = "0.2"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hex = "0.4"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+rand = "0.8"
+tempfile = "3"
+
+[profile.release]
+panic = "abort"

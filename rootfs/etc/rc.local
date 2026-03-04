@@ -1,9 +1,0 @@
-#!/bin/sh
-
-touch /tmp/rc.local
-# Running in a debian systemd .
-# TODO: convert this to a unit
-
-echo "starting initos as sidecar"
-/initos/sidecar/sbin/initos sidecar
-
