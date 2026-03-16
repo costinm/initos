@@ -1,7 +1,7 @@
 //! Filesystem mount operations for the initrd boot process.
 //!
 //! Provides functions to mount pseudo-filesystems (proc, sys, devtmpfs),
-//! find partitions by label, mount ext4 filesystems, set up loop devices,
+//! find partitions by label, mount ext4/erofs filesystems, set up loop devices,
 //! and perform switch_root.
 
 use std::ffi::CString;
@@ -46,50 +46,32 @@ pub fn mount_pseudo_fs(fstype: &str, target: &str) -> io::Result<()> {
 ///
 /// Scans `/sys/class/block/` entries for one whose
 /// `/sys/class/block/<dev>/device/../<dev>/partition` and label match.
-/// Falls back to checking `/dev/disk/by-label/<label>`.
+///
+/// If the label starts with "USB", retries up to 10 times (1s sleep)
+/// to allow slow USB devices to enumerate.
 pub fn find_partition_by_label(label: &str) -> io::Result<PathBuf> {
     if label.starts_with("/dev/") {
         return Ok(PathBuf::from(label));
     }
 
-    // First try /dev/disk/by-label/ symlink (created by udev/mdev)
-    let by_label = PathBuf::from(format!("/dev/disk/by-label/{}", label));
-    if by_label.exists() {
-        return fs::canonicalize(&by_label);
-    }
+    let max_attempts = if label.starts_with("USB") { 10 } else { 1 };
 
-    // Fallback: scan sysfs block devices
-    let block_dir = Path::new("/sys/class/block");
-    if block_dir.exists() {
-        for entry in fs::read_dir(block_dir)? {
-            let entry = entry?;
-            let dev_name = entry.file_name();
-            let dev_name_str = dev_name.to_string_lossy();
+    for attempt in 1..=max_attempts {
+        if let Some(dev) = scan_sysfs_for_label(label) {
+            return Ok(dev);
+        }
 
-            // Skip non-partition entries (no "partition" file)
-            let partition_file = entry.path().join("partition");
-            if !partition_file.exists() {
-                continue;
-            }
-
-            // Try to read the label via blkid-style approach:
-            // Check if /sys/class/block/<dev>/device exists
-            // and try reading the superblock label from the ext4 header.
-            // For simplicity, we use the uevent file to find PARTNAME.
-            let uevent_path = entry.path().join("uevent");
-            if let Ok(uevent) = fs::read_to_string(&uevent_path) {
-                eprintln!("initos: block device {} uevent:\n{}", dev_name_str, uevent);
-                for line in uevent.lines() {
-                    if let Some(val) = line.strip_prefix("PARTNAME=") {
-                        if val == label {
-                            return Ok(PathBuf::from(format!("/dev/{}", dev_name_str)));
-                        }
-                    }
-                }
-            }
+        if attempt < max_attempts {
+            eprintln!(
+                "initos: partition '{}' not found, retrying ({}/{})",
+                label, attempt, max_attempts
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
 
+    // Final failure — dump diagnostics
+    let block_dir = Path::new("/sys/class/block");
     eprintln!(
         "initos: Could not find partition with label '{}'. Dumping block devices:",
         label
@@ -123,12 +105,46 @@ pub fn find_partition_by_label(label: &str) -> io::Result<PathBuf> {
     ))
 }
 
-/// Mount a filesystem (ext4 or btrfs).
+/// Scan sysfs block devices for a partition matching the given label.
+/// Returns `Some(PathBuf)` with the `/dev/<name>` path on match, `None` otherwise.
+fn scan_sysfs_for_label(label: &str) -> Option<PathBuf> {
+    let block_dir = Path::new("/sys/class/block");
+    if !block_dir.exists() {
+        return None;
+    }
+
+    let entries = fs::read_dir(block_dir).ok()?;
+    for entry in entries.flatten() {
+        let dev_name = entry.file_name();
+        let dev_name_str = dev_name.to_string_lossy().to_string();
+
+        // Skip non-partition entries (no "partition" file)
+        if !entry.path().join("partition").exists() {
+            continue;
+        }
+
+        let uevent_path = entry.path().join("uevent");
+        if let Ok(uevent) = fs::read_to_string(&uevent_path) {
+            eprintln!("initos: block device {} uevent:\n{}", dev_name_str, uevent);
+            for line in uevent.lines() {
+                if let Some(val) = line.strip_prefix("PARTNAME=") {
+                    if val == label {
+                        return Some(PathBuf::from(format!("/dev/{}", dev_name_str)));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Mount a filesystem.
 ///
 /// # Arguments
 /// * `device` - Block device path (e.g., "/dev/sda1")
 /// * `target` - Mount point path
-/// * `fs_type` - Filesystem type ("ext4" or "btrfs")
+/// * `fs_type` - Filesystem type (e.g., "ext4", "erofs")
 pub fn mount_filesystem(
     device: &str,
     target: &str,
@@ -175,7 +191,7 @@ pub fn mount_ext4(device: &str, target: &str) -> io::Result<()> {
     mount_filesystem(device, target, "ext4", true)
 }
 
-/// Set up a loop device for the given image file and mount it as ext4.
+/// Set up a loop device for the given image file and mount it as erofs.
 ///
 /// Uses /dev/loop-control to allocate a free loop device, then configures
 /// it with the given image path.
@@ -230,8 +246,8 @@ pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
     }
     unsafe { libc::close(loop_fd) };
 
-    eprintln!("initos: mount_loop - mounting ext4 on {}", loop_dev);
-    mount_filesystem(&loop_dev, target, "ext4", true)
+    eprintln!("initos: mount_loop - mounting erofs on {}", loop_dev);
+    mount_filesystem(&loop_dev, target, "erofs", true)
 }
 
 /// Switch root to the new filesystem and exec init.

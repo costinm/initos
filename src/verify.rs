@@ -1,8 +1,8 @@
 //! Ed25519 signature verification for fs-verity digests.
 //!
 //! Provides functions to verify that a file's fs-verity digest was signed
-//! by a trusted key. The public key is provided as a hex-encoded string
-//! (typically via an environment variable set by the kernel command line).
+//! by a trusted key. The public key is provided as a base64-encoded string
+//! (compatible with wireguard/libsodium format).
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::fs;
@@ -14,7 +14,7 @@ use std::path::Path;
 /// # Arguments
 /// * `digest` - The raw digest bytes (e.g., from `measure_verity`)
 /// * `signature_bytes` - The 64-byte Ed25519 signature
-/// * `pub_key_hex` - Hex-encoded 32-byte Ed25519 public key
+/// * `pub_key_b64` - Base64-encoded 32-byte Ed25519 public key
 ///
 /// # Returns
 /// * `Ok(true)` if the signature is valid
@@ -23,15 +23,18 @@ use std::path::Path;
 pub fn verify_signature(
     digest: &[u8],
     signature_bytes: &[u8],
-    pub_key_hex: &str,
+    pub_key_b64: &str,
 ) -> io::Result<bool> {
-    // Decode hex public key
-    let pub_key_bytes = hex::decode(pub_key_hex).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("bad hex pub_key: {}", e),
-        )
-    })?;
+    use base64::Engine;
+    // Decode base64 public key
+    let pub_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(pub_key_b64)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad base64 pub_key: {}", e),
+            )
+        })?;
 
     if pub_key_bytes.len() != 32 {
         return Err(io::Error::new(
@@ -83,13 +86,13 @@ pub fn verify_signature(
 ///
 /// # Arguments
 /// * `img_path` - Path to the image file with fs-verity enabled
-/// * `pub_key_hex` - Hex-encoded 32-byte Ed25519 public key
+/// * `pub_key_b64` - Base64-encoded 32-byte Ed25519 public key
 ///
 /// # Returns
 /// * `Ok(true)` if verification succeeds
 /// * `Ok(false)` if the signature doesn't match
 /// * `Err` on I/O or format errors
-pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_hex: &str) -> io::Result<bool> {
+pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Result<bool> {
     let img = img_path.as_ref();
     eprintln!("initos: verity check - opening image: {:?}", img);
 
@@ -143,7 +146,7 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_hex: &str) -> io::Resul
         )
     })?;
 
-    verify_signature(&digest, &signature_bytes, pub_key_hex)
+    verify_signature(&digest, &signature_bytes, pub_key_b64)
 }
 
 /// Verify a pre-computed digest against a signature file.
@@ -154,14 +157,14 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_hex: &str) -> io::Resul
 /// # Arguments
 /// * `digest` - The digest bytes
 /// * `sig_path` - Path to the signature file
-/// * `pub_key_hex` - Hex-encoded 32-byte Ed25519 public key
+/// * `pub_key_b64` - Base64-encoded 32-byte Ed25519 public key
 pub fn verify_digest_with_sig_file<P: AsRef<Path>>(
     digest: &[u8],
     sig_path: P,
-    pub_key_hex: &str,
+    pub_key_b64: &str,
 ) -> io::Result<bool> {
     let signature_bytes = fs::read(sig_path.as_ref())?;
-    verify_signature(digest, &signature_bytes, pub_key_hex)
+    verify_signature(digest, &signature_bytes, pub_key_b64)
 }
 
 #[cfg(test)]
@@ -171,36 +174,38 @@ mod tests {
     /// Helper to generate a keypair and sign data for testing.
     /// Only available in test builds (dev-dependencies include rand_core).
     fn test_sign(data: &[u8]) -> (String, Vec<u8>) {
+        use base64::Engine;
         use ed25519_dalek::{Signer, SigningKey};
         use rand::rngs::OsRng;
 
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
-        let pub_key_hex = hex::encode(verifying_key.as_bytes());
+        let pub_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
 
         let signature = signing_key.sign(data);
-        (pub_key_hex, signature.to_bytes().to_vec())
+        (pub_key_b64, signature.to_bytes().to_vec())
     }
 
     #[test]
     fn test_verify_signature_valid() {
         let digest = b"test-digest-32-bytes-long-xxxxx";
-        let (pub_key_hex, sig_bytes) = test_sign(digest);
+        let (pub_key_b64, sig_bytes) = test_sign(digest);
 
-        let result = verify_signature(digest, &sig_bytes, &pub_key_hex).unwrap();
+        let result = verify_signature(digest, &sig_bytes, &pub_key_b64).unwrap();
         assert!(result, "valid signature should verify");
     }
 
     #[test]
     fn test_verify_signature_invalid_sig() {
         let digest = b"test-digest-32-bytes-long-xxxxx";
-        let (_pub_key_hex, mut sig_bytes) = test_sign(digest);
-        let (pub_key_hex, _) = test_sign(b"different-data");
+        let (_pub_key_b64, mut sig_bytes) = test_sign(digest);
+        let (pub_key_b64, _) = test_sign(b"different-data");
 
         // Tamper with the signature
         sig_bytes[0] ^= 0xFF;
 
-        let result = verify_signature(digest, &sig_bytes, &pub_key_hex).unwrap();
+        let result = verify_signature(digest, &sig_bytes, &pub_key_b64).unwrap();
         assert!(!result, "tampered signature should fail");
     }
 
@@ -216,21 +221,23 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_signature_bad_key_hex() {
-        let result = verify_signature(b"data", &[0u8; 64], "not-hex!");
-        assert!(result.is_err(), "bad hex should return error");
+    fn test_verify_signature_bad_key_b64() {
+        let result = verify_signature(b"data", &[0u8; 64], "not-base64!!!");
+        assert!(result.is_err(), "bad base64 should return error");
     }
 
     #[test]
     fn test_verify_signature_wrong_key_length() {
-        let result = verify_signature(b"data", &[0u8; 64], "aabbccdd");
+        use base64::Engine;
+        let short_key = base64::engine::general_purpose::STANDARD.encode(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let result = verify_signature(b"data", &[0u8; 64], &short_key);
         assert!(result.is_err(), "wrong key length should return error");
     }
 
     #[test]
     fn test_verify_signature_wrong_sig_length() {
-        let (pub_key_hex, _) = test_sign(b"data");
-        let result = verify_signature(b"data", &[0u8; 32], &pub_key_hex);
+        let (pub_key_b64, _) = test_sign(b"data");
+        let result = verify_signature(b"data", &[0u8; 32], &pub_key_b64);
         assert!(result.is_err(), "wrong sig length should return error");
     }
 
@@ -239,14 +246,14 @@ mod tests {
         use std::io::Write;
 
         let digest = b"hello-world-digest-for-testing!!";
-        let (pub_key_hex, sig_bytes) = test_sign(digest);
+        let (pub_key_b64, sig_bytes) = test_sign(digest);
 
         let dir = tempfile::tempdir().unwrap();
         let sig_path = dir.path().join("test.sig");
         let mut f = fs::File::create(&sig_path).unwrap();
         f.write_all(&sig_bytes).unwrap();
 
-        let result = verify_digest_with_sig_file(digest, &sig_path, &pub_key_hex).unwrap();
+        let result = verify_digest_with_sig_file(digest, &sig_path, &pub_key_b64).unwrap();
         assert!(result, "should verify with sig file");
     }
 }

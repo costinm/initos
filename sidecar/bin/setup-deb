@@ -1,0 +1,511 @@
+#!/bin/sh
+
+# Build scripts for a debian rootfs 'distro less' images:
+#
+# - no 'apt' or package operations after the image is built 
+#   read-only and signed.
+# - kernel/modules/boot loader are separate, not included.
+#
+# Variants for cloud and 'host'.
+# 
+
+set -x
+set -e
+
+export DEBIAN_FRONTEND=noninteractive
+APTINSTALL='apt install -o Dpkg::Options::=--force-confold --assume-yes --no-install-recommends '
+
+# Will make sure the user exists - useful in pods for
+# running as a custom username.
+USERNAME=${USERNAME:-build}
+
+# Host - most basic form
+host() {
+  apt update
+  min_host
+}
+
+clean() {
+  #apt clean
+
+  rm -f /etc/ssh/ssh_host_*_key* || true
+  rm -f /etc/machine-id || true
+
+}
+
+# Host with dev, ui, tools and everything else.
+hostui() {
+  base
+  deb_sidecar
+  dev
+  ui
+}
+
+base() {
+  apt update
+  
+  tools
+
+  add_base_users
+  #apt clean
+}
+
+
+# Users built into the docker image. 
+add_base_users() {
+  local u=${USERNAME:-build}
+  local h=${USER_HOME:-/home/${u}}
+
+  # Template home directory.
+  mkdir -p /home/log
+  mkdir -p /work
+  mkdir -p /home
+
+  # For ubuntu based images - there is a default user with 1000
+  if id -u "$u" >/dev/null 2>&1; then
+    return
+  fi
+
+  useradd -u ${USERID:-1000} -g users -G users -s /bin/bash \
+         -d ${h} ${u} || true
+  usermod -p '*' ${u} || true
+
+  groupadd -g 2000 restic || true
+  useradd -u 2000 -g restic -G restic -s /bin/bash \
+         -d /x/backup restic || true
+
+  # -p takes an encrypted pass - so this disables pass login
+  usermod -p '*' restic || true
+
+  mkdir -p ${h}
+  chown ${u} ${h}
+  echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
+
+  # usermod -aG input ${u}
+  # usermod -aG video ${u}
+}
+
+## Install sets of packages for different features.
+
+# Common debian files
+add_deb_core() {
+  $APTINSTALL ca-certificates curl gpg \
+     tini  bsdutils  file findutils fuse3 lsof \          
+}
+
+# Minimal host - enough to setup IP.
+min_host() {
+  $APTINSTALL net-tools kmod
+}
+
+add_network() {
+  # Network tools
+  $APTINSTALL iproute2 iputils-ping net-tools \
+    wireless-tools wpasupplicant iw ethtool \
+    dnsutils ifupdown ifupdown-extra bridge-utils \
+    tcpdump iptables nftables iperf3 radvdump \
+    curl wget  \
+    ca-certificates  
+
+  $APTINSTALL openssh-server
+
+  # That's why deb/rpm is really bad for containers (and more) - 
+  # there is an install script that creates keys that would be distributed.
+  rm /etc/ssh/ssh_host_*
+}
+
+# Common tools and networking for a host.
+tools() {
+  $APTINSTALL gpg \
+      vim mc tmux \
+      git less bash-completion \
+      rsync bsdutils fuse3 findutils file lsof \
+      locales kmod
+
+  add_network 
+
+  # locales should be regenereted - dpkg-reconfigure locales
+  # or /etc/locale.gen and run locale-gen
+  locale-gen 
+
+  # Include basic container ability.
+  # toolbox adds flatpak too
+  $APTINSTALL podman 
+  $APTINSTALL podman-docker  
+  $APTINSTALL podman-compose 
+
+  $APTINSTALL podman-toolbox 
+  $APTINSTALL nix-bin 
+
+  # kmod needed for modprobe, etc
+
+  # Note that ssh won't start now - keys need to be regenerated on install.
+
+  echo N | $APTINSTALL sudo
+}
+ 
+# Not sure:
+# syncthing - optional, may use the APP volume instead or docker image
+
+# For mounting gocryptfs, sshfs, etc - may not work in docker/lxc
+
+# 77MB on top of istio image
+
+# ca-certificates - installs openssl (+18M)
+
+# Busybox has:
+
+# dnsutils: 48M, bind9-dnsutils. busybox nslookup instead
+# netcat-openbsd
+# iputils-ping
+# wget xz-utils bzip2
+
+# sshfs(4M): fuse3, openssh-client(14M), 5M
+
+# Setup a debian-based host sidecar
+deb_sidecar() {
+  # $APTINSTALL tpm2-tools  
+  $APTINSTALL efibootmgr
+  # ext4 manipulation as user. 
+  $APTINSTALL e2tools  
+
+  $APTINSTALL fdisk gdisk hdparm
+
+  $APTINSTALL fwupd
+
+   #$APTINSTALL squashfs-tools  cryptsetup 
+    
+  $APTINSTALL pciutils dosfstools  
+
+  $APTINSTALL   btrfs-progs 
+    
+  $APTINSTALL   erofs-utils erofsfuse
+  
+  #$APTINSTALL   e2fsprogs fscrypt fsverity  genext2fs 
+  $APTINSTALL   e2fsprogs genext2fs 
+
+  $APTINSTALL sbsigntool
+
+  $APTINSTALL  lxc
+
+  # Openrc or systemd need to be installed (openrc is simpler)
+  # sysvinit-core
+  # Openrc errors:
+  # checkroot umountroot - for cryptdisks
+  # mountkernfs urandom for networking
+  # umountroot for udev
+  #$APTINSTALL openrc tini  sysvinit-utils init-system-helpers
+    
+  # TODO: iw dev and other tools
+  # ifupdown-ng, wifi, openssl,
+  # rsync openssh binutil brdige , openssh-sftp-server
+  # wpa, iputils, smartmontools, lvm2, htop,
+  # findutils
+}
+
+
+ui() {
+  #apt update
+
+  # This adds fonts and a lot of stuff - let's add sway and labwc too.
+  # for use as real rootfs. Alpine is great for sidecars but still not
+  # for desktop.
+  add_kasm
+  add_ui
+  add_chrome
+
+  #apt clean
+}
+
+
+
+add_kasm() {
+  KASM_VER=${KASM_VER:-1.4.0}
+  local DIST=${1:-bookworm}
+
+  # 220M
+  curl -fsSL -o /tmp/kasmvnc.deb \
+    https://github.com/kasmtech/KasmVNC/releases/download/v${KASM_VER}/kasmvncserver_${DIST}_${KASM_VER}_amd64.deb
+
+  $APTINSTALL /tmp/kasmvnc.deb
+  $APTINSTALL libdatetime-perl  
+  rm /tmp/kasmvnc.deb
+
+}
+
+
+
+
+add_ui() {
+  # mako: notifications
+  # rofi: menus (launch, windows)
+
+  # d-feet -
+
+  # i3 instslls i3-wm, dunst, i3lock, i3status suckless-tools
+
+  # x11vnc
+  # others:
+  # xsettingsd lxappearance viewinior
+
+  # xfce4-polkit - display auth dialog
+  # kitty
+  #
+
+  # i3 based UI.
+  # Alternatives: openbox, sway
+
+  # last release: 2010: openbox
+  # fluxbox is similar - 2015 last release
+  
+  # obconf: +65M
+  # obkey - key config 
+
+  # i3 +10M
+
+  # eterm: 1.3M, but can't find font
+  # xfce4-terminal: +74M
+  # kitty: 16M
+
+  # Includes x11-common but not xorg
+  $APTINSTALL  \
+           i3 dbus-x11 desktop-base libdbus-glib-1-2 \
+          kitty i3status rofi tint2 alttab d-feet alttab \
+          libinput-tools keyd  kbd \
+          libnotify-bin fonts-font-awesome wdisplays
+  # For code: 
+  # 12M gtk
+  $APTINSTALL libnss3 libatk1.0-0 libatk-bridge2.0-0
+  #echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+
+  #brighnessctl        
+  # waylock \
+  # bemenu grim slurp
+  # dunst is alternative to mako-notifier - both use dbus org.freedesktop.Notifications
+  # libnotify-bin include notify-send
+
+  # Required for Zed and other GPU apps. 
+  #sudo apt install vulkan-tools libvulkan1 libvulkan-dev
+  #sudo apt install mesa-vulkan-drivers
+  #vulkaninfo # returns a long text block of info
+
+  # wlopm - power management
+  
+  # Zed
+  # curl -f https://zed.dev/install.sh | sh
+
+  # wofi - like d-menu
+
+  # Wayland
+  if [ "$WAYLAND" = "1" ]; then
+    $APTINSTALL  \
+            sway labwc foot wofi \
+            swayidle dunst wlopm waybar 
+  fi
+
+  # For code: 
+  # 12M gtk
+  $APTINSTALL libnss3 libatk1.0-0 libatk-bridge2.0-0
+
+  #echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+}
+
+add_crd() {
+  # i3 based UI.
+  # Alternatives: openbox, sway
+
+  # 219M on top of istio image. Includes x11-common but not xorg
+  DEBIAN_FRONTEND=noninteractive \
+        apt install --assume-yes --no-install-recommends \
+           i3 dbus-x11 desktop-base libdbus-glib-1-2 \
+          kitty i3status rofi tint2
+  # org.gnome.Mutter.DisplayConfig is also used - to get current display configuration
+  
+  echo "exec /etc/X11/Xsession /usr/bin/i3" > /etc/chrome-remote-desktop-session
+
+   curl  https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb -o crd.deb
+   # 47M on top of UI, includes xserver-xorg-video-dummy, xvfb
+   DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends ./crd.deb
+
+    rm crd.deb
+
+    # gsettings-desktop-schemas: required by chrome remote desktop
+    DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+       gsettings-desktop-schemas
+
+}
+
+# function add_cinnamon() {
+# # 496M
+#   DEBIAN_FRONTEND=noninteractive \
+#   apt install --assume-yes --no-install-recommends \
+#      cinnamon-core dbus-x11 desktop-base && \
+#      apt-get clean && \
+#       bash -c 'echo "exec /etc/X11/Xsession /usr/bin/cinnamon-session-cinnamon2d" > /etc/chrome-remote-desktop-session'
+# }
+
+add_chrome() {
+  # requires gnupg
+  DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+        gnupg
+  curl https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor > /tmp/packages.google.gpg 
+
+  install -D -o root -g root -m 644 /tmp/packages.google.gpg /etc/apt/keyrings/packages.google.gpg 
+  echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.google.gpg]  http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list
+  apt update
+
+  # Required for encrypted secrets support
+  DEBIAN_FRONTEND=noninteractive apt install --assume-yes --no-install-recommends \
+          gnome-keyring upower
+
+  # Chrome (for isolated env)
+  # Must happen after curl is installed
+  # ~100M
+  apt-get -y -q install google-chrome-stable 
+  #--no-install-recommends
+}
+
+## Apt packages required for building kernel
+add_dev_kernel() {
+  apt update
+  # erofs-utils is extra - for generating modules.
+  $APTINSTALL \
+    ca-certificates                             \
+    bc                                          \
+    bison                                       \
+    flex                                        \
+    gcc                                         \
+    git                                         \
+    make                                        \
+    libelf-dev \
+    libssl-dev \
+    erofs-utils \
+    lz4 kmod ncurses-dev \
+    python3 gawk
+
+  # Nvidia
+  $APTINSTALL curl gpg
+
+  # For initos
+  $APTINSTALL age minisign cpio xxd file sbsigntool genimage mtools swtpm
+
+}
+
+BRANCH=${BRANCH:-6.16}
+VER=${VER:-6.16.0}
+out=${out:-/data}
+src=${src:-/ws}
+
+kernel() {
+  if [ ! -e {out}/linux ] ; then
+    add_dev_kernel 
+    get_kernel
+    add_firmware
+  fi
+  
+  kernel_build
+
+  kernel_pack
+}
+
+kernel_pack() {
+  mkdir -p ${out}/boot/EFI/BOOT ${out}/img
+  cp ${out}/linux/arch/x86/boot/bzImage ${out}/boot/EFI/BOOT
+  (cd /lib/modules/${VER} && mkfs.erofs -zlz4 ${out}/img/modules-${VER}.erofs .)
+  (cd /lib/firmware mkfs.erofs -zlz4 ${out}/img/firmware.erofs .)
+}
+
+get_kernel() {
+  cd ${out}
+  git clone --depth=1 --branch=v${BRANCH} https://github.com/torvalds/linux
+}
+
+# TODO: include initrd and command line into the kernel.
+# Sign it/use secure boot to activate verifications.
+
+kernel_build() {
+  #cp ${src}/linux/dotConfig ${out}/linux/.config
+  cd ${out}/linux
+  make defconfig
+  make allmodconfig
+  ./scripts/kconfig/merge_config.sh .config ${src}/linux/host.merge-config 
+  #make olddefconfig
+  make -j$(($(nproc) * 2 + 1))
+  make modules -j$(($(nproc) * 2 + 1))
+  make modules_install
+  
+}
+
+add_firmware() {
+  echo deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware >> /etc/apt/sources.list
+
+  apt update
+
+  $APTINSTALL \
+    firmware-linux-free firmware-ath9k-htc   \
+    firmware-misc-nonfree firmware-iwlwifi \
+    firmware-realtek firmware-brcm80211 
+}
+
+# Adds Nvidia driver.
+nvidia() {
+  # Will use systemd or script - may start it as 'main' as well, without 
+  # an actual sidecar.
+  # Not the current kernel on the builder machine
+ 
+  curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+  dpkg -i /tmp/cuda.deb
+  
+  if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ] ; then
+     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
+     curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+      tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      apt update
+  fi
+
+  # This has systemd as a dependency...
+  $APTINSTALL cuda-drivers 
+   #  linux-headers-$(cat /boot/cloud-version) 
+
+  $APTINSTALL nvidia-container-toolkit  
+   
+  /usr/lib/dkms/dkms_autoinstaller start ${VER}
+  dkms status
+}
+
+####################
+
+# Generic dev machine, common tools.
+add_dev_tools() {
+  $APTINSTALL \
+        patch file \
+      gcc build-essential libc6-dev make meld
+
+  # bison gawk g++
+  #     autoconf  automake libtool
+  add_code
+}
+
+add_code() {
+  curl -fsSL https://code-server.dev/install.sh | sh 
+  
+  rm -rf /root/.cache
+  
+  # As user:
+  # code-server --install-extension \
+  #   ms-vscode-remote.remote-ssh \
+  #   ms-vscode-remote.remote-ssh-edit \
+  #   ms-vscode-remote.vscode-remote-extensionpack \
+  #   ms-python.python \
+  #   ms-toolsai.jupyter
+ 
+  # Enabled using systemd: 
+  #systemctl enable --now code-server@$USER.service
+
+  # TODO: maybe install zed too?
+  #curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+}
+
+
+"$@"

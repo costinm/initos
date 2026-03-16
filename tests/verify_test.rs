@@ -10,17 +10,18 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Generate an ed25519 keypair, sign data, return (pub_key_hex, sig_bytes).
+/// Generate an ed25519 keypair, sign data, return (pub_key_b64, sig_bytes).
 fn generate_and_sign(data: &[u8]) -> (String, Vec<u8>) {
+    use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
-    let pub_key_hex = hex::encode(verifying_key.as_bytes());
+    let pub_key_b64 = base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
     let signature = signing_key.sign(data);
 
-    (pub_key_hex, signature.to_bytes().to_vec())
+    (pub_key_b64, signature.to_bytes().to_vec())
 }
 
 // ===== Pure Crypto Tests =====
@@ -28,21 +29,21 @@ fn generate_and_sign(data: &[u8]) -> (String, Vec<u8>) {
 #[test]
 fn test_verify_valid_signature() {
     let digest = b"abcdef0123456789abcdef0123456789"; // 32 bytes
-    let (pub_key_hex, sig_bytes) = generate_and_sign(digest);
+    let (pub_key_b64, sig_bytes) = generate_and_sign(digest);
 
-    let result = initos::verify::verify_signature(digest, &sig_bytes, &pub_key_hex).unwrap();
+    let result = initos::verify::verify_signature(digest, &sig_bytes, &pub_key_b64).unwrap();
     assert!(result, "valid signature must verify");
 }
 
 #[test]
 fn test_verify_tampered_signature() {
     let digest = b"abcdef0123456789abcdef0123456789";
-    let (pub_key_hex, mut sig_bytes) = generate_and_sign(digest);
+    let (pub_key_b64, mut sig_bytes) = generate_and_sign(digest);
 
     // Flip a bit in the signature
     sig_bytes[10] ^= 0x01;
 
-    let result = initos::verify::verify_signature(digest, &sig_bytes, &pub_key_hex).unwrap();
+    let result = initos::verify::verify_signature(digest, &sig_bytes, &pub_key_b64).unwrap();
     assert!(!result, "tampered signature must not verify");
 }
 
@@ -59,10 +60,10 @@ fn test_verify_wrong_key() {
 #[test]
 fn test_verify_different_digest() {
     let digest = b"abcdef0123456789abcdef0123456789";
-    let (pub_key_hex, sig_bytes) = generate_and_sign(digest);
+    let (pub_key_b64, sig_bytes) = generate_and_sign(digest);
 
     let wrong_digest = b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-    let result = initos::verify::verify_signature(wrong_digest, &sig_bytes, &pub_key_hex).unwrap();
+    let result = initos::verify::verify_signature(wrong_digest, &sig_bytes, &pub_key_b64).unwrap();
     assert!(!result, "wrong digest must not verify");
 }
 
@@ -71,43 +72,43 @@ fn test_verify_different_digest() {
 #[test]
 fn test_verify_with_sig_file() {
     let digest = b"test-digest-for-file-based-test!"; // 32 bytes
-    let (pub_key_hex, sig_bytes) = generate_and_sign(digest);
+    let (pub_key_b64, sig_bytes) = generate_and_sign(digest);
 
     let dir = tempfile::tempdir().unwrap();
-    let sig_path = dir.path().join("ROOT-A.img.sig");
+    let sig_path = dir.path().join("initos.erofs.sig");
     let mut f = fs::File::create(&sig_path).unwrap();
     f.write_all(&sig_bytes).unwrap();
 
     let result =
-        initos::verify::verify_digest_with_sig_file(digest, &sig_path, &pub_key_hex).unwrap();
+        initos::verify::verify_digest_with_sig_file(digest, &sig_path, &pub_key_b64).unwrap();
     assert!(result, "file-based verification should pass");
 }
 
 #[test]
 fn test_verify_with_tampered_sig_file() {
     let digest = b"test-digest-for-file-based-test!";
-    let (pub_key_hex, mut sig_bytes) = generate_and_sign(digest);
+    let (pub_key_b64, mut sig_bytes) = generate_and_sign(digest);
 
     // Tamper
     sig_bytes[0] ^= 0xFF;
 
     let dir = tempfile::tempdir().unwrap();
-    let sig_path = dir.path().join("ROOT-A.img.sig");
+    let sig_path = dir.path().join("initos.erofs.sig");
     let mut f = fs::File::create(&sig_path).unwrap();
     f.write_all(&sig_bytes).unwrap();
 
     let result =
-        initos::verify::verify_digest_with_sig_file(digest, &sig_path, &pub_key_hex).unwrap();
+        initos::verify::verify_digest_with_sig_file(digest, &sig_path, &pub_key_b64).unwrap();
     assert!(!result, "tampered sig file should fail");
 }
 
 #[test]
 fn test_verify_missing_sig_file() {
     let digest = b"test-digest-for-file-based-test!";
-    let (pub_key_hex, _) = generate_and_sign(digest);
+    let (pub_key_b64, _) = generate_and_sign(digest);
 
     let result =
-        initos::verify::verify_digest_with_sig_file(digest, "/nonexistent/path.sig", &pub_key_hex);
+        initos::verify::verify_digest_with_sig_file(digest, "/nonexistent/path.sig", &pub_key_b64);
     assert!(result.is_err(), "missing sig file should error");
 }
 
@@ -156,22 +157,22 @@ fn test_verify_image_e2e() {
     eprintln!("{}", String::from_utf8_lossy(&output.stdout));
 
     // Read the public key
-    let pub_key_hex = fs::read_to_string(output_dir.path().join("pub_key.hex"))
-        .expect("pub_key.hex not found")
+    let pub_key_b64 = fs::read_to_string(output_dir.path().join("image_key.pub.b64"))
+        .expect("image_key.pub.b64 not found")
         .trim()
         .to_string();
 
-    // The setup script creates ROOT-A.img with verity enabled
-    // and ROOT-A.img.sig with the signature.
+    // The setup script creates initos.erofs with verity enabled
+    // and initos.erofs.sig with the signature.
     // We need to mount the parent filesystem to access the verity-enabled file.
     // For the integration test, we verify using the digest + signature directly.
     let digest_bytes =
         fs::read(output_dir.path().join("digest.bin")).expect("digest.bin not found");
 
     let sig_bytes =
-        fs::read(output_dir.path().join("ROOT-A.img.sig")).expect("ROOT-A.img.sig not found");
+        fs::read(output_dir.path().join("initos.erofs.sig")).expect("initos.erofs.sig not found");
 
-    let result = initos::verify::verify_signature(&digest_bytes, &sig_bytes, &pub_key_hex)
+    let result = initos::verify::verify_signature(&digest_bytes, &sig_bytes, &pub_key_b64)
         .expect("verification call failed");
 
     assert!(result, "e2e: valid image signature should verify");
@@ -179,7 +180,7 @@ fn test_verify_image_e2e() {
     // Also test with tampered digest
     let mut bad_digest = digest_bytes.clone();
     bad_digest[0] ^= 0xFF;
-    let result = initos::verify::verify_signature(&bad_digest, &sig_bytes, &pub_key_hex)
+    let result = initos::verify::verify_signature(&bad_digest, &sig_bytes, &pub_key_b64)
         .expect("verification call failed");
     assert!(!result, "e2e: tampered digest should NOT verify");
 }
@@ -241,13 +242,14 @@ fn test_verify_roundtrip_with_openssl() {
     // Ed25519 DER public key is 44 bytes: 12 byte header + 32 byte key
     assert!(der_bytes.len() >= 32, "DER output too short");
     let raw_pub_key = &der_bytes[der_bytes.len() - 32..];
-    let pub_key_hex = hex::encode(raw_pub_key);
+    use base64::Engine;
+    let pub_key_b64 = base64::engine::general_purpose::STANDARD.encode(raw_pub_key);
 
     // Read signature
     let sig_bytes = fs::read(&sig_path).unwrap();
 
     // Verify using our library
-    let result = initos::verify::verify_signature(digest_data, &sig_bytes, &pub_key_hex).unwrap();
+    let result = initos::verify::verify_signature(digest_data, &sig_bytes, &pub_key_b64).unwrap();
     assert!(
         result,
         "openssl-generated signature should verify with our library"
@@ -256,6 +258,6 @@ fn test_verify_roundtrip_with_openssl() {
     // Tamper with the digest and verify it fails
     let mut bad_digest = digest_data.to_vec();
     bad_digest[0] ^= 0xFF;
-    let result = initos::verify::verify_signature(&bad_digest, &sig_bytes, &pub_key_hex).unwrap();
+    let result = initos::verify::verify_signature(&bad_digest, &sig_bytes, &pub_key_b64).unwrap();
     assert!(!result, "tampered digest should NOT verify");
 }

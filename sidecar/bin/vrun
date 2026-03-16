@@ -1,0 +1,374 @@
+#!/bin/sh
+
+set -e
+
+# Start a VM using cloud-hypervisor.
+#
+# Using virtiofs to access shared files with the host filesystem. A local disk is required as 
+# cache and to keep Java and other apps using fancy filesystem calls happy, virtiofs is not perfect.
+# 
+
+# Can be started with:
+# RC_SVCNAME=NAME supervise-daemon NAME --start /x/opt/virt/vrun -- start
+if [ -n ${RC_SVCNAME} ]; then
+  # If running as a service (alpine init), set the pod name to the service name.
+  POD=${POD:-${RC_SVCNAME}}
+fi
+
+# If the script is named vrun-devvm -> the VM will be devvm
+if [ -z ${POD} ]; then
+   vmsuffix="${0#*vrun-}"
+   if [ -n "$vmsuffix" ]; then
+    POD=$vmsuffix
+  fi
+fi
+
+# POD is required
+
+if [ -z ${POD} ]; then 
+  echo "POD must be set to the target container or VM name"
+  echo FG=1 will start in foreground
+  echo "Options:"
+  echo "  - vrun start - start the VM/pod"
+  echo "  - stop/vmkill - stop (gracefull) or kill th VM"
+  exit 1
+fi
+
+# Directory layout on host:
+#    WORK - tmpfs temp dir for sockets, etc - share will have bind mounts that can be changed at runtime.
+#    SRC - $HOME/apps/${POD} - source directory, configs
+#
+#    VIRT - kernel, initrd, modules - read only
+#    IMGDIR - RW disks for the pod, rootfs and data dirs.
+# 
+# Layout inside container/VM:
+# 
+# /z - virtiofs shared dir, any mounts from the host
+# /x - main btrfs volume, can be used for data, etc.
+# /x/@cache - optional separate volume for cache, swap etc. Not backed up.
+# /home/USER - link to /x/home/USER
+# 
+# Inside the home dir:
+# - .cache link to /x/@cache/home/USER/.cache
+# 
+
+# Directory with hypervisor binaries, kernel, initrd, recovery
+VIRT=${VIRT:-/x/opt/virt}
+# Images - including RW disks
+IMGDIR=${IMGDIR:-/x/vol/images}
+# sockets, temp files
+WORK=${WORK:-/run/virt/${POD}}
+SRC=${SRC:-${HOME}/apps/${POD}}
+
+
+# IMAGE and other parameters loaded from this file
+if [ -f ${SRC}/env ]; then 
+  . ${SRC}/env
+fi
+
+vm_init() {
+  if [ ! -d ${WORK}/share/lib/modules ]; then
+    # Loading Nvidia drivers from share modules doesn't work - using separate volumes.
+    # In the VM, this can be copied over - to avoid creating a separate image.
+    mkdir -p ${WORK}/share/lib/modules
+    mount -o bind /lib/modules ${WORK}/share/lib/modules
+    # TODO: additional bind mounts configured in the lib
+  fi
+
+  # Config and binaries for startup - this sets up the tmpfs work dir
+  # On restart it will not re-create it.
+  if [ ! -d ${WORK}/share/initos ]; then
+    echo "Creating ${WORK}/share/initos and setting bind mounts"
+    mkdir -p ${WORK}/share/initos
+    if [ -f ${SRC}/vm-init ]; then
+      ${SRC}/vm-init share
+    fi
+  fi
+
+  if [ -f ${SRC}/initos.env ]; then 
+    cp ${SRC}/initos.env ${WORK}/share/initos/initos.env
+  fi
+  if [ -f ${SRC}/vm-init ]; then 
+    cp ${SRC}/vm-init ${WORK}/share/initos/init
+  fi
+
+  if [ -f ${SRC}/initos-pod ]; then 
+    cp ${SRC}/initos-pod ${WORK}/share/initos/initos-pod
+  fi 
+  mkdir -p ${WORK}/share/initos ${WORK}/share/bin
+  cp ${VIRT}/initos-init-vm ${WORK}/share/initos/initos-init-vm
+  if [ ! -e ${WORK}/share/bin/sh ]; then
+    cp ${VIRT}/busybox ${WORK}/share/bin
+    (cd ${WORK}/share/bin && ln -s busybox sh)
+  fi
+}
+
+
+# Start a single Virtiofsd - should be mounted as /z - the initrd script will
+# take care of this and also detect if a rootfs is present.
+# Use bind mounts to manage the content.
+run_virtiofsd() {
+  local base=${1:-${WORK}}
+
+  dir=${base}/share
+
+  if [ -f ${WORK}/virtiofsd.pid ]; then 
+    kill -9 $(cat ${WORK}/virtiofsd.pid)  2>&1 || true
+    rm -f ${WORK}/virtiofsd.pid
+  fi
+
+  rm -f ${WORK}/virtiofsd.sock || true
+
+  # Faster than virtio-9p or regular 9p/nfs
+  # FUSE messages over vhost-user socket
+  # DAX (using host buffers) not enabled.
+  #       --log-level debug 
+  ${VIRT}/virtiofsd \
+      --socket-path=${WORK}/virtiofs.sock \
+      --shared-dir=${dir} \
+      --cache=never \
+      --xattr \
+      --thread-pool-size=4 \
+      --allow-direct-io \
+      --sandbox chroot  > ${WORK}/virtiofs.log  2>&1 &
+      
+    # Default sandbox is namespace, doesn't work in chroot  
+    # --allow-mmap should only be used with exclusive access
+    #  --log-level debug \
+    # 
+
+    # Save the PID
+    echo $! > ${WORK}/virtiofsd.pid
+
+    return 0
+}
+
+# Testing: 
+# - DEBUG=init
+# - Run a command before swaproot, poweroff immediatly after.
+#          cmd=/bin/ls
+# - `CMD_OPTS=rdinit=/bin/sh` - start before the /init.
+# - Run a command after pivot, poweroff after
+#      `CMD_OPTS=initos.cmd1="df"`
+# 
+# If set, will be added as a prefix to the command
+#TIME="time "
+#
+# Alpine kernel includes no filesystem - virtiofs is a module - so modules must be loaded
+# by the initrd. Debian has similar issues. Using kernel with 
+# core blk and fs built in.
+
+# Start will run run the pod (VM) in background, like a container.
+# 
+# Few env variables impact the startup:
+#  - DEBUG=init 
+start() {
+  local p="$@"
+
+  vm_init
+
+  # OPTS - cloud-hypervisor/qemu options
+  # CMD_OPTS - kernel command line options
+  
+  if [ "$virt" = "qemu" ] ; then
+    # -initrd - only for testing initrd 
+    OPTS="$OPTS -nodefaults -cpu host -enable-kvm -no-reboot"
+    OPTS="$OPTS -nographic"
+    # mon:stdio - C-a xa
+	  qemu_serial="-chardev stdio,mux=on,id=char0 -serial chardev:char0 -monitor chardev:char0" 
+    # stdio - no input ?
+    # -serial stdio
+
+    OPTS="$OPTS --m ${vm_mem:-8}"
+    OPTS="$OPTS -smp ${vm_cpu:-4}"
+    OPTS="$OPTS -netdev user,id=n1,hostfwd=tcp::10022-:22 -device virtio-net-pci,netdev=n1"
+    #-net user,hostfwd=tcp::10022-:22 
+    # netdev: ,net=192.168.76.0/24,dhcpstart=192.168.76.9
+    # tap works as well
+
+    # -apend "${CMD_OPTS}"
+     # 9p volume exposing current dir
+    # Use: mount -t 9p -o trans=virtio,version=9p2000.L src /src
+    QDISKS="${QDISKS} -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
+    QDISKS="${QDISKS} -fsdev local,security_model=passthrough,id=fsdev0,path=${WORK}/share"
+    
+
+    else 
+        OPTS="$OPTS -kernel ${VIRT}/vmlinuz"
+    fi
+    if [ -z "${QEMU_UI}" ]; then
+        qemu_base="${qemu_base} -nographic"
+    else
+        qemu_base="${qemu_base} -display gtk -vga std"
+    fi
+  fi
+  else
+    # Using the rootfs as root or shared
+    run_virtiofsd ${WORK}  
+
+    OPTS="$OPTS --pvpanic"
+    OPTS="$OPTS --api-socket=${WORK}/ch.sock"
+    OPTS="$OPTS --memory size=${vm_mem:-8},shared=on"
+    OPTS="$OPTS --cpus boot=${vm_cpu:-4}"
+    OPTS="$OPTS --balloon size=1G,deflate_on_oom=on "
+
+    # Only 2 supported ?
+    OPTS="$OPTS --fs tag=/dev/root,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
+    OPTS="$OPTS --kernel ${VIRT}/vmlinuz"
+    
+    # virtio-net is used for eth
+    # tap is the address of the tap on the VM side
+    # Adding --net tap=ex,ip=10.0.0.1,mask=255.0.0.0 to kernel cmdline adds 10 sec delay - so using the vm script to set the IP, based on other command params.
+    
+    OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
+  fi 
+  
+  CMD_OPTS="$CMD_OPTS initos_host=${POD}"
+  CMD_OPTS="$CMD_OPTS net.ifnames=0 initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
+  
+  CMD_OPTS="$CMD_OPTS root=/dev/root rootfstype=virtiofs init=/initos/initos-init-vm rw"
+
+  CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
+  
+  DISKS="--disk "
+
+  if [ -f ${IMGDIR}/${POD}-rootfs.img ] ; then
+      DISKS="${DISKS} path=${IMGDIR}/${POD}-rootfs.img "
+      QDISKS="${QDISKS} -drive file=${IMGDIR}/${POD}-rootfs.img,format=raw,if=virtio"
+      CMD_OPTS="${CMD_OPTS} initos_root=/dev/vda "
+        
+      #QDISKS="${QDISKS} -device nvme,serial=deadbeef,drive=nvm -drive file=${BIN_DIR}/sidecar.ext4,format=raw,if=none,id=nvm,readonly=on" 
+
+  fi
+
+  # Not sure if this is still useful.
+  DISKS="${DISKS} path=${VIRT}/modules.ext4,readonly=on"
+
+  # All disks under ${IMGDIR} with file name starting with ${POD} are added as additional disks.
+  # This allows to add data disks, cache disks, etc.
+  EXTRA_DISKS=$(ls ${IMGDIR}/${POD}-data*.img 2>/dev/null || echo "")
+
+  echo "${EXTRA_DISKS}"
+  for disk in $EXTRA_DISKS; do
+    if [ -f ${disk} ]; then
+      DISKS="$DISKS path=${disk}"
+    fi
+  done
+  
+  if [ -n "${EXTRA_DISKS}" ]; then
+    CMD_OPTS="${CMD_OPTS} initos_data=LABEL=X"
+  fi
+
+  if [ -f ${IMGDIR}/${POD}-cache.img ]; then
+    DISKS="$DISKS path=${IMGDIR}/${POD}-cache.img" 
+    CMD_OPTS="${CMD_OPTS} initos_data=LABEL=CACHE"
+  fi
+
+  if [ -f ${IMGDIR}/sidecar.img ]; then
+    DISKS="$DISKS path=${IMGDIR}/sidecar.img,readonly=on" 
+  fi
+  OPTS="$OPTS $DISKS"
+    
+  #  --vsock \
+  #  --pmem file=${WORK}/boot/efi/recovery.sqfs \
+
+  rm -f ${WORK}/ch.sock
+  rm -f ${WORK}/serial.socket
+  
+  echo $p
+  CMD_OPTS="$CMD_OPTS initos_cmd=\"${p}\""
+  if [ -n "${DEBUG}" ]; then
+    if [ "${DEBUG}" = "init" ]; then
+      # Debian kernel doesn't seem to work with hvc0, serial is fine
+      # Verbose
+      OPTS="$OPTS --serial tty --console off"
+      CMD_OPTS="$CMD_OPTS debug loglevel=8 ignore_loglevel"
+      CMD_OPTS="$CMD_OPTS console=hvc0 console=ttyS0 "
+      CMD_OPTS="$CMD_OPTS systemd.log_level=debug systemd.log_target=console"
+      CMD_OPTS="$CMD_OPTS systemd.debug_shell"
+      # --serial tty --console off --cmdline "console=ttyS0" results in ttyS0 as the console
+      # Otherwise the virtio-console driver is used - faster but less early messages
+    elif [ "${DEBUG}" = "serial" ]; then
+      OPTS="$OPTS --serial tty --console off"    
+      CMD_OPTS="$CMD_OPTS quiet console=ttyS0 "
+    fi
+  else 
+    OPTS="$OPTS --serial socket=${WORK}/serial.socket --console off "
+    CMD_OPTS="$CMD_OPTS quiet"
+    CMD_OPTS="$CMD_OPTS console=ttyS0 "
+  fi
+
+  if [ -n "${DEBUG}" ]; then
+     # For now only debug for qemu  
+     if [ "$virt" = "qemu" ] ; then
+        qemu-system-x86_64 $OPTS -append "${CMD_OPTS}" 
+     else
+      $TIME ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}"
+     fi
+  elif [ "${RC_SVCNAME}" != "" ]; then
+    ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" 
+  else  
+    ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" > ${WORK}/vmcmd.logs 2>&1 &
+    echo $! > ${WORK}/vm.pid
+  fi
+}
+
+# Start a Qemu with kernel and initrd
+qemuvirt() {
+    build=${HOME}/.cache/initos
+    var=deb
+
+    cmd="loglevel=0 quiet earlyprintk=efi foo=bar console=ttyS0,115200 rdinit=/sbin/initos-initrd net.ifnames=0 panic=5 debug_init initos_debug=1 -- test123"
+    cmd="initos_sidecar=/dev/sdc ${cmd}"
+    
+    qemu_disks="-drive file=${build}/initos-${var}/sidecar.sqfs"
+
+    qemu_base="-m 1G -smp 4 -cpu host -enable-kvm"
+    #qemu_common="${qemu_base} -display none"
+    qemu_common="${qemu_base} -nographic"
+    #qemu_common="${qemu_base} -display gtk -vga std"
+    #qemu_serial="-serial stdio"
+    qemu_serial="-chardev stdio,mux=on,id=char0 -serial chardev:char0 -monitor chardev:char0" 
+
+	qemu-system-x86_64 -nodefaults ${qemu_common}  \
+	   -kernel ${build}/efi/EFI/BOOT/BZIMAGE \
+       -initrd ${build}/efi/EFI/BOOT/INITRD.IMG \
+       -append ${cmd} \
+       -hda fat:rw:${build}/efi-unsigned-${var}-ttyS0 \
+	   ${qemu_serial} ${qemu_disks} 
+}
+
+## Stop gracefully (vm_ctrl), expects the socket.
+stop() {
+  ctrl shutdown-vmm
+}
+
+## Kill the VM process. Virtiofsd will terminate itself after VM dies.
+vmkill() {
+  kill -9 $(cat ${WORK}/vm.pid) || true
+}
+
+console() {
+  socat UNIX-CONNECT:${WORK}/serial.socket  -
+}
+
+# Get a console to the VM, using socat and screen.
+screen() {
+  socat UNIX-CONNECT:${WORK}/serial.socket pty,raw,link=${WORK}/pty0 &
+  screen ${WORK}/pty0
+}
+
+# Expose ch-remote control
+# add-disk path=...
+# remove-device _diskN
+ctrl() {
+  ch-remote --api-socket ${WORK}/ch.sock "$@"
+}
+
+fix_perms() {
+    setcap cap_net_admin+ep /x/opt/virt/cloud-hypervisor
+}
+
+CMD=$1
+shift
+$CMD "$@"

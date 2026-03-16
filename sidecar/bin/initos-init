@@ -1,0 +1,351 @@
+#!/bin/sh
+
+# compatible with BusyBox sh and Debian dash/sh.
+
+export PATH=/z/a/initos/bin:/bin:/sbin:/usr/bin:/usr/sbin
+ver=$(uname -r)
+
+#if [ "${initos_dbg}" = 1 ]; then
+  set -x
+# sysctl -w kernel.printk="0 4 1 7" > /dev/null 2>&1
+
+#fi
+
+# /z - ext4 filesystem
+#  - /z/c - encrypted disk
+#  - /z/img - verity images - erofs
+
+# /x - virtiofs/9p on VM, btrfs or ext4 on hosts 
+
+# / - read-only on secure boot, rw otherwise - and same as /z
+
+logi() {
+	echo "INITOS: $*" > /dev/kmsg
+}
+
+mount_sys() {
+    local b=${1:-}
+    mount -o noexec,nosuid,mode=0755 -t devtmpfs devtmpfs /dev || true
+    
+    
+    mount -o noexec,nosuid,nodev -t proc proc /proc 2>/dev/null || true
+    mount -o noexec,nosuid,nodev -t sysfs sysfs /sys 2>/dev/null || true
+    
+    mkdir -p /dev/pts ${b}/dev/shm
+    mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts  
+    mount -t tmpfs tmpfs /run
+    mount -t tmpfs tmpfs /tmp
+    mount -t tmpfs tmpfs /dev/shm
+
+#   mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null \
+#     || mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev && mdev -f -s
+
+    chmod 1777 /dev/shm
+}
+
+# ovl mounts an image named $1 from /z/img/$n.erofs to /z/a/$n 
+# as overlayfs. RW data will be in /z/initos/rw/$n
+# 
+# /z is the main ext4 drive and is R/W.
+ovl() {
+    local n=$1
+    local OVL_BASE=/z/initos
+    
+    # TODO: verify the image signature with the rust binary !!!
+
+    mkdir -p /z/a/${n} ${OVL_BASE}/mnt/$n/ro ${OVL_BASE}/mnt/$n/rw ${OVL_BASE}/mnt/$n/work 
+
+    mount /z/img/$n.erofs ${OVL_BASE}/mnt/$n/ro
+
+    mount -t overlay \
+        -o lowerdir=${OVL_BASE}/mnt/$n/ro,upperdir=${OVL_BASE}/mnt/$n/rw,workdir=${OVL_BASE}/mnt/$n/work \
+        overlayfs /z/a/$n
+}
+
+# Mounts the main ext4 drive as /z
+init_host() {
+    # PARTLABEL doesn't work with busybox mount
+    mount -o rw,noatime -O encrypt,verity LABEL=${INITOS_DATA:-STATE} /z
+    mkdir -p /z/initos /z/a
+    # TODO: insecure only !!!
+    if [ -f /z/initos/start.sh ]; then
+        exec /z/initos/start.sh step2
+    fi
+}
+
+# Initial boot is a readonly verified image. We verify additional
+# images and pivot to ROOTA image.
+# 
+# After this function:
+# - root is RW overlayfs, based on ROOTA.erofs
+# - /z/ is the R/W ext4 driver
+# - /z/a/initos has busybox and the scripts
+init_rootfs() {
+    if [ "${INITOS_DEV}" = "1" ]; then
+        # For dev, the root disk is not verified or read only.
+        # It has /z subdir with the exepcted files.
+        mount -o remount,noatime -O encrypt,verity /
+        mkkdir -p /z/a/ROOTA
+        mount -o bind / /z/a/ROOTA
+        return
+    fi
+    # TODO: remove all files in RW for secure boot. 
+    # Still want disk backed files while running, not tmpfs
+    # Alternative: unlock encrypted dir first.
+
+    # For secure boot, we mount the ROOTA image as read only
+    # and overlay it with the RW data in /z/initos/rw/ROOTA
+    ovl ROOTA # /z/a/ROOTA
+  
+    # Move to the new image - typically debian.    
+    cd /z/a/ROOTA
+    # /z/a/initos is the old root - still has mounts
+    mount --bind /z/a/ROOTA /z/a/ROOTA
+    mkdir -p /z/a/initos
+    pivot_root . z/a/initos
+    cd /
+    mount_sys
+
+    # The ROOTA may not have /z subdir
+    mkdir -p /z /tmp 
+    mount --move /z/a/initos/z /z
+    
+    # For consistency 
+    mkdir -p /z/a/ROOTA
+    mount -o bind / /z/a/ROOTA
+    
+    # We need to move the old root to /z/initos/old
+    # Now z is the EXT4, z/a/initos is the old root
+}
+
+# Scan /sys for 'modalias', sort and load the modules.
+# This should load TPM if it is available
+hwdrivers() {
+  find /sys -name modalias -type f -print0 | xargs -0 sort -u | xargs modprobe -b -a
+}
+
+
+mount_btrfs_raw() {
+
+  BTRFS_OPTS=" -o noatime -o nodiratime"
+  #  -o compress -o nobarrier 
+
+  mkdir -p /x
+ 
+  btrfs device scan --all-devices
+
+  if ! mount -t btrfs LABEL=X /x; then
+    echo "Failed to mount X"
+    return 1
+  fi
+}
+
+vfio() {
+
+  modprobe vfio_iommu_type1  allow_unsafe_interrupts
+  modprobe vfio_pci
+
+  # Bind nvidia to vfio-pci - this will break Nvidia.
+  # TODO: use a file or read a key to control. Screen will freeze.
+  #  lspci -n -s 0x:0x.0 to find the vendor ID
+  
+  if [ -f /boot/efi/vfio ]; then 
+    set -x 
+    read -t 2 -n 1 key
+    if [ ! "$key" = "t" ]; then 
+      while read V1 V2 ; do
+        echo "$V1" "$V2" > /sys/bus/pci/drivers/vfio-pci/new_id
+      done < /boot/efi/vfio
+    fi 
+  fi
+  # Alternatively, options vfio-pci ids=10de:1f82,10de:10fa
+  # in /etc/modprobe.d - but I think this is more reliable.
+  #echo 10de 1f82 > /sys/bus/pci/drivers/vfio-pci/new_id &
+  #echo 10de 10fa > /sys/bus/pci/drivers/vfio-pci/new_id &
+  # Second device: # echo 0000:02:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
+
+}
+
+# After mounting /lib/modules and firmware, load all drivers.
+load_drivers() {
+  sysctl -w kernel.printk="0 4 1 7" > /dev/null 2>&1
+  # this is normally done by sysinit - we want tpm2 to be loaded
+  # Needs to happen after full firmware and modules are in place
+  hwdrivers > /tmp/hwdrivers.log 2>&1
+  hwdrivers > /tmp/hwdrivers2.log 2>&1 # TPM seems to need some time to init  
+  sysctl -w kernel.printk="2 4 1 7" > /dev/null 2>&1
+
+}
+
+# All remaining mounted dirs will be moved under same dir in /sysroot,
+# ready to switch_root
+move_mounted_to_sysroot() {
+  # From original alpine init
+  while read DEV DIR TYPE OPTS ; do
+    if [ "$DIR" != "/" ] && \
+         [ "$DIR" != "/sysroot" ] && \
+         [ -d "$DIR" ]; then
+      mkdir -p "/sysroot${DIR}"
+      mount -o move "$DIR" "/sysroot${DIR}"
+    fi
+  done < /proc/mounts
+
+  sync
+}
+
+
+# Additional verified mounts
+mounts() {
+    ovl firmware
+    ovl modules-${ver}
+    mount -o noatime LABEL=BOOT1 /boot
+
+}
+
+unlock_home() {
+    TPM_DIR=/z/initos/tpm
+
+    # fscrypt: use TPM if available, otherwise prompt for password
+    if [ -e /dev/tpmrm0 ] && [ -f ${TPM_DIR}/tpm_handle ]; then
+        if [ -d /z/c ]; then
+            initos fscrypt /z/c
+        else
+            mkdir /z/c 
+            initos fscrypt-setup /z/c
+        fi
+    else
+      for i in 1 2 3; do
+        echo "No TPM available. Enter fscrypt password (or press Enter to skip):"
+        echo
+
+        read -r FSCRYPT_KEY 2>/dev/null || true
+        if [ -n "${FSCRYPT_KEY}" ]; then
+            export FSCRYPT_KEY
+            if [ -d /z/c ]; then
+                if initos fscrypt /z/c ; then
+                    break
+                else
+                    echo "Failed to unlock, try again." 
+                fi
+            else 
+                mkdir /z/c 
+                initos fscrypt-setup /z/c
+                break
+            fi
+            unset FSCRYPT_KEY
+        else
+            echo "No password entered, skipping"
+            break
+        fi
+      done
+    fi
+
+    # TODO: if verified mode, fail if we can't unlock.
+}
+
+end_init() {
+    echo "Press d to enter debug shell in 6 seconds"
+    # Portable timeout read: use busybox if available
+    if command -v busybox >/dev/null; then
+        key=$(busybox timeout 6 busybox sh -c 'read -n 1 k; echo $k' 2>/dev/null || true)
+    elif command -v bash >/dev/null; then
+        key=$(bash -c 'read -t 6 -n 1 key && echo $key')
+    else
+        # Simple read for dash - we can't easily do timeout without stty or complex backgrounding
+        # We'll just skip the timeout or do a simple read if we are desperate.
+        # For now, let's just use a plain read and assume people will press enter or wait.
+        read key || true
+    fi
+
+    if [ "${key}" = "d" ]; then
+        exec /bin/sh 
+    fi
+
+    if [ "${key}" = "s" ]; then
+        hwdrivers > /dev/null 2>&1
+        sleep 3
+        unlock_home
+        if [ -f /z/c/start ]; then
+            /z/c/start
+        else
+            echo "No start found, exec debug shell"
+            exec /bin/sh
+        fi
+    fi
+
+    # Mount the ROOTA.erofs as /z/a/ROOTFS
+    init_rootfs
+
+    exec /usr/bin/systemd --system
+}
+
+localmode() {
+    # TODO: configure IP and start ssh-mesh
+    # Maybe start agetty
+    #exec tini -s sleep -- infinity
+    echo local
+}
+
+poweroff() {
+    echo o > /proc/sysrq-trigger 2>/dev/null
+}
+
+rebuild_root() {
+    # Excluding some directories since for dev the ext4 may 
+    # be an actual root install. It is bind mounted to /z/a/ROOTA,
+    # but includes /z as well.
+    (cd /z/a/ROOTA && \
+        mkfs.erofs -zlz4 /z/img/ROOTA.erofs . \
+        --exclude-path c \
+        --exclude-path tmp \
+        --exclude-path initos \
+        --exclude-path img \
+        --exclude-path z \
+        --exclude-path a \
+        )
+}
+
+rebuild_initos() {
+    (cd /z/a/initos && \
+        mkfs.erofs -zlz4 /z/img/initos.erofs .)
+}
+
+# At this point:
+# - /z is the R/W ext4 drive
+# - / is R/O initos image
+#
+# 
+step2() {
+    mounts
+    unlock_home
+    if [ -d /z/c/home ]; then
+        mount -o bind /z/c/home /home
+    fi
+    lsattr -d /home
+
+    end_init    
+}
+
+if [ "$$" = "1" ] && [ $# -eq 0 ]; then
+  mount_sys
+  logi "Host start"
+
+  init_host
+
+  tag9p=/sys/bus/virtio/drivers/9pnet_virtio/virtio0/mount_tag
+  if [ -f "${tag9p}" ]; then
+    # Testing in QEMU - will run a test script from mount dir.
+    logi "Running custom script from 9p mount"
+    mkdir -p /x
+    mount -t 9p -o trans=virtio,version=9p2000.L "$(cat "${tag9p}")" /x
+    echo Using qemu 9p $(cat "${tag9p}")
+    if [ -f /x/test_img.sh ]; then
+        /x/test_img.sh
+    fi
+    poweroff -f
+  else
+    step2
+  fi
+else
+  "$@"
+fi

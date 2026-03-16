@@ -6,9 +6,9 @@ Choices:
 - Only EFI 
 - kernel compiled with NVME, Sata, MMC, USB and ext4/erofs in the kernel, not as modules.
 - a single rust app in the initrd.
-- Limine as bootloader - with kernel/initrd/cmdline SHA and the 'root' public key loaded into config and signed. 
+- Custom EFI loader for secure boot - verifying the command line and initrd using EFI PK variables. 
 - One 'ext4' data partition, with STATE partition label is loaded - with fsverity and fsencrypt enabled. Inside the 
-img/ROOT-A.img and other images are signed with the public key from kernel command line.
+img/initos.erofs (erofs) and other images are signed with the public key from kernel command line.
 
 The main idea is that the boot partition only changes if the
 kernel or initrd is updated - while rootfs and any other image can be updated independently and signed with the key
@@ -21,8 +21,8 @@ Rationale:
 - options add complexity and risk. I used this for my own machines and I don't want to deal with complexity at home.
 - Clear separation of 'signed EFI path' and rootfs -  starting from EFI signing key verifying the EFI binary including the SHA of the config, config including SHA of kernel/initrd and the public key for rootfs signing.
 - Minimum possible initrd - only verifies rootfs image with fsverity, using the public key from the signed config file.
-- Limine still has too many features, but simple enough to not be worth replacing for now. 
-- We need a writable disk anyway - btrfs can be loaded later, ext4 has fsverity/fscrypt and good enough for a rootfs, images and any normal files.
+- Custom EFI loader is used instead of Limine for better secure boot integration and minimal features.
+- We need a writable disk anyway - ext4 has fsverity/fscrypt and good enough for a STATE partition holding images and configs.
 - Avoiding partitions and complex block magic - just 2 partitions required. 
 - using fsverity/fscrpt is useful post boot for a lot of other use cases, more dynamic. Upgrades involve just copying files.
 - the model works well with central build system - where all 
@@ -40,8 +40,8 @@ volumes are used to start VMs and containers, with no other rootfs.
 
 - 1 or 2 32M partitions for the A/B EFI - P12 EFI-SYSTEM
 - 1 or 2 4G recovery/default disk - read/write ext4, can be ROOT-A/ROOT-B from chromebooks.
-- about 100G for the ext4 rootfs - STATE, or more. Will hold crypted home and images.
-- some space for BTRFS or LVM if needed, in particular for servers or dev machines. For VMs - BTRFS images are simpler.
+- about 100G for the ext4 STATE partition - or more. Will hold crypted home and images.
+- some space for extra partitions if needed, for servers or dev machines.
 
 On multi disk systems - EFI and recovery on each disk.
 

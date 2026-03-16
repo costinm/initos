@@ -2,16 +2,50 @@
 name = "initos"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal rdinit binary for initrd with fs-verity verification"
+description = "Unified initrd binary: verified boot, TPM2 unseal, fscrypt"
+
+[[bin]]
+name = "initos"
+path = "src/main.rs"
+
+[[bin]]
+name = "initos-recover"
+path = "src/bin/initos-recover.rs"
+
+[[bin]]
+name = "efi"
+path = "src/bin/efi.rs"
 
 [dependencies]
+base64 = { version = "0.22", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+x509-cert = { version = "0.2.5", default-features = false }
+
+[target.'cfg(not(target_os = "uefi"))'.dependencies]
 libc = "0.2"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
-hex = "0.4"
+age = { version = "0.11", features = ["armor"] }
+rand_core = { version = "0.6", features = ["std"] }
+chacha20poly1305 = "0.10"
+curve25519-dalek = "4"
+base64 = { version = "0.22", features = ["std"] }
+sha2 = { version = "0.10", features = ["std"] }
+x509-cert = { version = "0.2.5", features = ["std"] }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.35.0", features = ["logger", "alloc", "panic_handler", "global_allocator"] }
+rsa = { version = "0.9.6", default-features = false, features = ["hazmat"] }
+hex = { version = "0.4.3", default-features = false }
+ucs2 = "0.3.0"
+log = "0.4.27"
+sha2 = { version = "0.10.8", default-features = false, features = ["force-soft", "oid"] }
+x509-cert = { version = "0.2.5", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
 rand = "0.8"
+rexpect = "0.6.3"
 tempfile = "3"
 
 [profile.release]

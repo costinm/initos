@@ -90,7 +90,7 @@ pub fn enable_verity_fd(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Format a digest as a hex string.
+/// Format a digest as a hex string (matches fsverity tooling output).
 pub fn digest_to_hex(digest: &[u8]) -> String {
-    hex::encode(digest)
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
 }

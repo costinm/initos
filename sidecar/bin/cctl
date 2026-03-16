@@ -1,0 +1,287 @@
+#!/bin/sh
+
+# Container Run: Script to run a container with basic volumes
+#
+# With podman, can be an OCI image or expanded rootfs, including existing rootfs as read only are used.
+# Additional volumes are added, along with tools to interact with running containers.
+# 
+# Why: too hard to remember the CLI of each of them.
+#
+# First parameter is a command - run, build, start, etc.
+# Second parameter is the name of the container/pod
+#
+#
+TAG=${TAG:-latest}
+REPO=${REPO:-ghcr.io/costinm/initos}
+
+
+# TODO: add ujail, chroot, lxc options
+
+CMD=$1
+shift
+NAME=$1
+shift
+
+
+DOCKER=docker
+# Alternative: unshare -U -r --pid --fork --mount-proc --mount --uts --ipc --cgroup --propagation shared
+
+# Note that '--pid' and '--fork' go together, and will run the command as process 1.
+# Without --mount-proc - because of 'shared' the original proc is mounted - mount -t proc proc /proc to see the mapped processes.
+# PID 1 is only needed for testing init.
+#
+# -U -r -> user namespace, user mapped to root
+# --mount -> separate mount namespace, user can mount stuff
+# --uts -> can set hostname
+
+
+if command -v podman >/dev/null; then
+    DOCKER=podman
+    # Run as the same user ID that is calling podman
+    #export PODMAN_USERNS=keep-id
+elif command -v docker >/dev/null; then
+    DOCKER=docker
+fi
+
+# Run a command in an ephemeral container based on IMG.
+# Out and src are mounted.
+run() {
+    local IMG=$1
+    shift
+    
+    _mounts
+
+    ${DOCKER} run -it --rm \
+      ${CARGS} ${VOLS} \
+      --name $NAME \
+          ${IMG} "$@"
+}
+
+# Start a container based on IMG that stays around.
+# Use exec to run commands.
+start() {
+    local IMG=$1
+    shift
+
+    _mounts
+
+    ${DOCKER} run -d \
+      ${CARGS} ${VOLS} \
+      --name $NAME \
+          ${IMG} sleep infinity
+}
+
+stop() {
+  ${DOCKER} rm -f ${NAME}
+}
+
+_mounts() {
+    mkdir -p ${HOME}/.cache/${NAME} 
+
+    if [ -n "${DATA}" ]; then
+        VOLS="${VOLS} -v ${DATA}:/data -e out=/data"
+    else
+        VOLS="${VOLS} -v ${HOME}/.cache/${NAME}:/data -e out=/data"
+    fi
+
+    VOLS="${VOLS} -v $(pwd):/ws -e src=/ws"
+
+    if [ -n "${SECRETS}" ]; then
+        #${HOME}/.ssh/secrets/${NAME}
+        mkdir -p ${SECRETS}
+        VOLS="${VOLS} -v ${SECRETS}:/var/run/secrets"
+    fi
+}
+
+
+exec() {
+    ${DOCKER} exec -it ${NAME} "$@"
+}
+
+# cpimg copies the content of an image to a dir. 
+cpimg() {
+  SRC=$1
+  DST=$2
+
+  ${DOCKER} run --rm \
+    --mount type=image,source=$SRC,destination=/src \
+    -v $DST:/out \
+    alpine \
+      cp -a /src/* /out/
+}
+
+
+docker_extract() {
+  img=${1}
+  mkdir ${WORK}/rootfs
+
+  docker export $img | \
+    (cd ${WORK}/rootfs && tar -xf  - )
+}
+
+# Export with crane - image must be remote or created.
+exportfs_crane() {
+    local IMG=$1
+    shift
+
+    crane export ${IMG} | tar -C $NAME -xf -
+}
+
+exportfs_podman() {
+    local IMG=$1
+    shift
+
+    local mount_path=$(podman unshare podman image mount $IMG)
+
+    cp -rp $mount_path ./
+
+    podman unshare podman image unmount $IMG
+}
+
+
+build() {
+    # -f PATH/Dockerfile
+    # --build-arg KEY=VALUE
+    # --cache-from IMAGE -
+    # --network host
+    # -o DEST (type=local,dest=path)
+    # --progress plain|tty
+    # --pull - get newer images
+    # --secret id=mysecret,src=PATH
+    # -t name:tag
+    # --target - which part of the dockerfile
+    # 
+    # Podman specific:
+    # --authfile FILE
+    # --cache-to - cache destinations
+    # --creds USER:pass
+    # --layers
+    # --force-rm - remove intermediate even on failure (true by default)
+    # --format oci
+    # --from - replaces the first FROM - better to use build-arg
+    # --omit-history
+    # --squash - new build layers are merged
+    # --squash-all - all layers are merged
+    # --stdin
+    # -v - mount volume
+
+    ${DOCKER} build -t ${NAME} "$@" .
+}
+
+
+x11container() {
+    DOCKER_HOST=$(ip -4 addr show docker0 | grep -Po 'inet \K[\d.]+')
+    #echo HOST $DOCKER_HOST
+
+    #xhost +local:
+
+   VOL="-v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v ${HOME}:${HOME} \
+   -v /dev/shm:/dev/shm \
+   -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket \
+   -v /var/lib/dbus/machine-id:/var/lib/dbus/machine-id \
+   -v $HOME/.config/pulse/cookie:/tmp/pulse/cookie"
+
+   ENV="--device /dev/dri/card0 -e DISPLAY=:0 \
+       -e HOME=${HOME}
+       -e PULSE_SERVER=tcp:$DOCKER_HOST:4713 \
+       -e PULSE_COOKIE=/tmp/pulse/cookie"
+       
+    echo $VOL $ENV
+}
+
+clean() {
+    docker rmi $(docker images -q)
+    docker image prune -a -f
+}
+
+### CHROOT BASED (full access to host)
+
+# Setup a chroot env
+start_chroot() {
+
+  R=${1:-${WORK}}
+  if [ "$POD" = "/sysroot" ]; then
+    R=/sysroot
+  fi
+
+  # https://wiki.gentoo.org/wiki/Chroot/en
+  mount --rbind /dev ${R}/dev
+  mount --make-rslave ${R}/dev
+  mount -t proc /proc ${R}/proc
+  mount --rbind /sys ${R}/sys
+  mount --make-rslave ${R}/sys
+  mount --rbind /tmp ${R}/tmp
+
+  mount -o bind /lib/modules ${R}/lib/modules
+  mount -o bind /lib/firmware ${R}/lib/firmware
+
+  #mount -o bind /ws/initos ${R}/ws/initos
+  #mount -o bind /x/vol/devvm-1/initos ${R}/x/initos/
+  #mount -o bind /x/vol/devvm-1/initos/boot ${R}/boot
+}
+
+run_chroot() {
+  R=${WORK}
+  if [ "$POD" = "/sysroot" ]; then
+    R=/sysroot
+  fi
+
+ chroot ${R} "$@"
+}
+
+run_unshare() {
+ # No --net
+ unshare --root=${WORK} --pid --mount --fork --mount-proc \
+     --uts --ipc --cgroup --propagation shared  -- "$@"
+}
+
+stop_chroot() {
+  X=${WORK:-/sysroot}
+
+  umount ${X}/dev/pts
+  umount  ${X}/dev/
+  umount  ${X}/proc/
+  umount  ${X}/tmp/
+  umount  ${X}/sys/
+}
+#   ctr run -t --cni --rootfs ./rootfs/ devvm /bin/bash
+#   ctr c delete devvm
+
+# Default - run it as a chroot (arch-chroot handles that well)
+sidecar() {
+  # Using chroot to run a different image, not to isolate.
+  mount -o bind /x /initos/sidecar/x
+  mount -o bind / /initos/sidecar/sysroot
+  
+  # The arch script takes care of sys, etc.
+  /initos/sidecar/usr/bin/arch-chroot \
+    /initos/sidecar /sbin/initos init_sidecar &
+
+  # alternative: docker/podman/direct crun to keep it in a 
+  # priv container. 
+}
+
+priv() {
+  docker pull ${REPO}/initos-sidecar:${TAG}
+  docker run --name initos-sidecar \
+    --rm -it \
+    --network host \
+    --cap-add=ALL \
+    --privileged \
+    --security-opt seccomp=unconfined \
+    --device /dev/fuse \
+    --device /dev/kvm \
+    --device /dev/dri \
+    --device /dev/tty0 \
+    -v /x:/x \
+    -v /:/rootfs \
+    ${REPO}/initos-sidecar:${TAG} tini sleep infinity 
+
+    #-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    #-v /run/user/1000/podman/podman.sock:/run/user/1000/podman/podman.sock
+
+}
+
+
+${CMD} "$@"

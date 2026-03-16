@@ -36,6 +36,13 @@ jobs:
           target: efi
           tags: ghcr.io/costinm/initos/initos-efi:latest
 
+      - name: Initos disks image
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          target: disks-initos
+          tags: ghcr.io/costinm/initos/initos-disks:latest
+
 #      - name: Upload EFI image
 #        uses: actions/upload-artifact@v2
 #        with:

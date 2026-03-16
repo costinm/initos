@@ -1,1 +1,8 @@
-out
+target/
+*.erofs
+*.fd
+*.sig
+*.log
+# Backup files from some editors
+*~
+*.swp
