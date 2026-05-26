@@ -1,0 +1,75 @@
+# This is the trickiest part for laptops. Servers can use USB serial,
+# VMs can use serial.
+
+# Not in debian:
+# CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y
+
+
+### Debian
+# --- 1. Enable the Generic EFI Display (Built-in) ---
+CONFIG_FB=y
+CONFIG_FB_EFI=y
+CONFIG_FB_VESA=y
+CONFIG_SYSFB=y
+CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_FB_SIMPLE=y
+
+# for text console on top of DRM
+CONFIG_DRM_FBDEV_EMULATION=y
+
+# --- Console Settings ---
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+# --- 2. Keep the Bootloader Console alive ---
+CONFIG_VT_CONSOLE_SLEEP=y
+CONFIG_HW_CONSOLE=y
+
+# Font support
+CONFIG_FONT_8x16=y
+# Good for HiDPI/4K laptop screens
+CONFIG_FONT_TER16x32=y
+
+CONFIG_INPUT_UINPUT=y  
+
+CONFIG_INPUT_EVDEV=m
+
+# --- 3. For Input (Touchpad & Gesture support) ---
+CONFIG_HID_GENERIC=m
+CONFIG_USB_HID=y
+CONFIG_HID_PID=y
+CONFIG_USB_MULTITOUCH=y
+CONFIG_USB_HIDDEV=y
+CONFIG_INPUT_KEYBOARD=y
+CONFIG_INPUT_MOUSE=y
+
+# Support Laptop Displays (Panel Power)
+CONFIG_DRM_PANEL_ORIENTATION_QUIRKS=m
+CONFIG_BACKLIGHT_CLASS_DEVICE=y
+CONFIG_ACPI_VIDEO=y
+CONFIG_BACKLIGHT_GENERIC=y
+
+# --- Core I2C Stack (Required for Touchpads) ---
+CONFIG_I2C_DESIGNWARE_PLATFORM=m
+CONFIG_I2C_DESIGNWARE_CORE=m
+#CONFIG_I2C_DESIGNWARE_SLAVE=m
+CONFIG_I2C_DESIGNWARE_PCI=y
+CONFIG_I2C_HID_CORE=y
+
+# --- Specific Input Drivers ---
+CONFIG_HID_MULTITOUCH=m
+CONFIG_HID_WACOM=m
+
+# Most Wayland compositors use libinput, which needs these:
+CONFIG_INPUT_JOYDEV=m
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_I2C_HID_ACPI=y
+
+# 1. Enable Video Drivers (Built-in)
+CONFIG_DRM_KMS_HELPER=m
+CONFIG_DRM_RENDER_NODE=m
+CONFIG_DMA_SHARED_BUFFER=y
+CONFIG_DRM_I915=m
+CONFIG_INTEL_GTT=m
+CONFIG_DRM_AMDGPU=m
+CONFIG_DRM=m

@@ -12,6 +12,8 @@ const FS_IOC_ADD_ENCRYPTION_KEY: libc::c_ulong = 0xC050_6617;
 /// FS_IOC_SET_ENCRYPTION_POLICY = _IOR('f', 19, struct fscrypt_policy_v1)
 /// Works for v2 policies too — kernel checks version byte.
 const FS_IOC_SET_ENCRYPTION_POLICY: libc::c_ulong = 0x800C_6613;
+/// FS_IOC_GET_ENCRYPTION_POLICY = _IOWR('f', 21, struct fscrypt_policy)
+const FS_IOC_GET_ENCRYPTION_POLICY: libc::c_ulong = 0xC00C_6615;
 
 const FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER: u32 = 2;
 const FSCRYPT_KEY_IDENTIFIER_SIZE: usize = 16;
@@ -84,6 +86,19 @@ pub fn set_policy(dir: &str, key_identifier: &[u8]) -> Result<(), Box<dyn std::e
         .open(dir)
         .map_err(|e| format!("open {}: {}", dir, e))?;
 
+    // Check if already encrypted
+    let mut existing_policy = [0u8; 24];
+    let get_ret = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            FS_IOC_GET_ENCRYPTION_POLICY as libc::c_int,
+            existing_policy.as_mut_ptr(),
+        )
+    };
+    if get_ret == 0 {
+        return Err(format!("directory {} is already encrypted", dir).into());
+    }
+
     let ret = unsafe {
         libc::ioctl(
             file.as_raw_fd(),
@@ -92,10 +107,17 @@ pub fn set_policy(dir: &str, key_identifier: &[u8]) -> Result<(), Box<dyn std::e
         )
     };
     if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(22) {
+            return Err(format!(
+                "FS_IOC_SET_ENCRYPTION_POLICY on {}: Invalid argument (check if kernel > 5.4 and filesystem supports fscrypt v2)",
+                dir
+            ).into());
+        }
         return Err(format!(
             "FS_IOC_SET_ENCRYPTION_POLICY on {}: {}",
             dir,
-            io::Error::last_os_error()
+            err
         )
         .into());
     }
@@ -103,7 +125,7 @@ pub fn set_policy(dir: &str, key_identifier: &[u8]) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Format bytes as hex string.
+/// Format bytes as hex string (delegates to verity::digest_to_hex).
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    crate::verity::digest_to_hex(bytes)
 }

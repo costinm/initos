@@ -14,54 +14,82 @@
 #   - Generating boot configs and sigining EFI.
 #
 # Usage (function dispatch):
-#   setup_signed.sh check_prerequisites
-#   setup_signed.sh generate_keypair <output_dir>
+#   setup_signed.sh sign_init
 #   setup_signed.sh sign_digest <digest_file> <private_key_pem> <output_sig>
 #   setup_signed.sh create_signed_image <image_path> <output_dir> [private_key_pem]
 
 set -euo pipefail
 PATH="/usr/sbin:/sbin:${PATH}"
+
 SECRETS=${SECRETS:-/var/run/secrets/uefi-keys}
-
-# --- Prerequisite checks ---
-
-# Check if a command is available.
-# Usage: check_command <cmd> <package_name>
-check_command() {
-    if ! command -v "$1" &>/dev/null; then
-        echo "ERROR: '$1' not found. Please install $2."
-        return 1
-    fi
-}
-
-# Check all required tools.
-check_prerequisites() {
-    local ok=0
-    check_command mkfs.erofs "erofs-utils" || ok=1
-    check_command openssl "openssl" || ok=1
-    if [[ ${ok} -ne 0 ]]; then
-        return 1
-    fi
-    echo "Prerequisites OK"
-}
 
 # --- Key generation ---
 
-# Generate an Ed25519 keypair.
-# Usage: generate_keypair <output_dir>
-# Output files:
-#   ${SECRETS}/image_key.pem  - private key (PEM)
-#   ${SECRETS}/image_key.raw  - raw 32-byte private key seed (wireguard/libsodium compatible)
-#   ${SECRETS}/image_key_pub.pem   - public key (PEM)
-#   ${SECRETS}/image_key.pub.b64      - raw public key (base64-encoded, 44 chars)
-generate_keypair() {
-    local output_dir="${1:?Usage: generate_keypair <output_dir>}"
-    if [ -f "${SECRETS}/image_key.pem" ]; then
-        echo "Private key already exists: ${SECRETS}/image_key.pem"
-        return 0
-    fi
+# Generate the key pairs for signing the kernel and the disk image.
+# This is done before install - as a separate step/process - the rest can be automated easily,
+# but signing must be done on a secure machine and is specific to each user.
+sign_init() {
+    local u=${DOMAIN:-mesh.internal}
 
     mkdir -p "${SECRETS}"
+
+    if [ -f "${SECRETS}/root.key" ] ; then
+        echo "Keys already exist"
+        return 0
+    fi
+    # Alpine only
+    #efi-mkkeys -s ${u} -o ${SECRETS}
+    
+    # Debian - sbsigntool, efitools, openssl
+    local cert_to_siglist="cert-to-siglist"
+    if ! command -v cert-to-siglist >/dev/null 2>&1 && command -v cert-to-efi-sig-list >/dev/null 2>&1; then
+        cert_to_siglist="cert-to-efi-sig-list"
+    fi
+
+    (
+        cd "${SECRETS}"
+
+        openssl req -new -x509 -newkey rsa:2048 \
+            -nodes -days 3650 \
+            -subj "/CN=pk.efi/" \
+            -keyout PK.key -out PK.crt 
+
+        ${cert_to_siglist} PK.crt PK.esl 
+        sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth
+        
+        openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -subj "/CN=kek.efi/" \
+            -keyout KEK.key -out KEK.crt
+
+        ${cert_to_siglist} KEK.crt KEK.esl
+        sign-efi-sig-list -k PK.key -c PK.crt KEK KEK.esl KEK.auth
+
+        openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -subj "/CN=db.efi/" \
+            -keyout db.key -out db.crt    
+        ${cert_to_siglist} db.crt db.esl
+        sign-efi-sig-list -k KEK.key -c KEK.crt db db.esl db.auth
+    )
+
+    # Generate a 'mesh root' - both SSH and https.  
+    # Will be bundled on all signed images, and used to encrypt the LUKS pass.
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+        -out ${SECRETS}/root.key
+
+    openssl ec -in ${SECRETS}/root.key -pubout -out \
+        ${SECRETS}/root.pem
+    
+    ssh-keygen -y -f ${SECRETS}/root.key > ${SECRETS}/authorized_keys
+
+    # SSL and SSH key is the real public - minisign is using the sha.
+
+    minisign -GW -s ${SECRETS}/minisign.key -p ${SECRETS}/minisign.pub
+    PUB=$(sed -n '2p' ${SECRETS}/minisign.pub)
+
+    echo $PUB
+    #cat ${SECRETS}/minisign.pub
+
+    cat ${SECRETS}/authorized_keys
 
     echo "Generating Ed25519 keypair..."
     openssl genpkey -algorithm ed25519 -out "${SECRETS}/image_key.pem" 2>/dev/null
@@ -82,69 +110,9 @@ generate_keypair() {
     echo "  Pub base64:  ${pub_key_b64}"
 }
 
-
-# Generate the key pairs for signing the kernel and the disk image.
-# This is done before install - as a separate step/process - the rest can be automated easily,
-# but signing must be done on a secure machine and is specific to each user.
-sign_init() {
-  local u=${DOMAIN:-mesh.internal}
-
-
-  if [ -f ${SECRETS}/root.key ] ; then
-    echo "Keys already exist"
-    return 0
-  fi
-
-   
-  # Alpine only
-  #efi-mkkeys -s ${u} -o ${SECRETS}
- 
-  # Debian - sbsigntool, efitools, openssl
-  (
-     cd ${SECRETS} 
-     openssl req -new -x509 -newkey rsa:2048 \
-        -nodes -keyout PK.key -out PK.crt 
-     cert-to-siglist PK.crt PK.esl 
-     sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth
-    
-     openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -subj "/CN=kek.mesh.local/" \
-        -keyout KEK.key -out KEK.crt
-     cert-to-siglist KEK.crt KEK.esl
-
-     sign-efi-sig-list -k PK.key -c PK.crt KEK KEK.esl KEK.auth
-
-    openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -subj "/CN=My Signature Database Key/" \
-        -keyout db.key -out db.crt    
-    cert-to-siglist db.crt db.esl
-    sign-efi-sig-list -k KEK.key -c KEK.crt db db.esl db.auth
-   )
-
-  # Generate a 'mesh root' - both SSH and https.  
-  # Will be bundled on all signed images, and used to encrypt the LUKS pass.
-  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-    -out ${SECRETS}/root.key
-
-  openssl ec -in ${SECRETS}/root.key -pubout -out \
-    ${SECRETS}/root.pem
-  
-  ssh-keygen -y -f ${SECRETS}/root.key > ${SECRETS}/authorized_keys
-
-  minisign -GW -s ${SECRETS}/minisign.key -p ${SECRETS}/minisign.pub
-  PUB=$(sed -n '2p' ${SECRETS}/minisign.pub)
-
-  echo $PUB
-  #cat ${SECRETS}/minisign.pub
-
-  cat ${SECRETS}/authorized_keys
-}
-
-
-# --- Signing ---
-
 # Sign a binary digest file with an Ed25519 private key.
 # Usage: sign_digest <digest_file> <private_key_pem> <output_sig>
+# This is used for the STATE erofs disk.
 sign_digest() {
     local digest_file="${1:?Usage: sign_digest <digest_file> <private_key_pem> <output_sig>}"
     local private_key="${2:?Usage: sign_digest <digest_file> <private_key_pem> <output_sig>}"
@@ -189,7 +157,7 @@ image() {
 
     # Generate keypair if not already created, 
     # Using SECRETS env
-    generate_keypair "${SECRETS:-${out}/test/secrets}"
+    sign_init "${SECRETS:-${out}/test/secrets}"
 
     # Compute the fsverity digest offline (does not require root/mounting)
     local digest_hex
@@ -205,11 +173,13 @@ image() {
 # Sign the boot EFI - original limine required embedding the SHA
 # of the config, and the initrd/kernel into config.
 # 
-# Instead - EFI will verify anything signed by PK.key
-# TODO: may also use db.key
+# EFI loader verifies config/initrd signatures using certs from the db variable.
+# The EFI binary itself is signed with db.key for Secure Boot verification.
 efi() {
+    # HOME/.ssh/
     local sec_dir=${1:?Usage: efi <sec_dir>}
     local boot=${2:?Usage: efi <sec_dir> <boot_dir>}
+    local signed="${boot}/EFI/BOOT/BOOTX64.EFI.signed"
 
     mkdir -p "${boot}/EFI/BOOT"
     
@@ -219,8 +189,64 @@ efi() {
 
     sbsign --key "${sec_dir}/db.key" \
            --cert "${sec_dir}/db.crt" \
-           --output  "${boot}/EFI/BOOT/BOOTX64.EFI" \
+           --output  "${signed}" \
            "${boot}/EFI/BOOT/BOOTX64.EFI"
+    mv "${signed}" "${boot}/EFI/BOOT/BOOTX64.EFI"
+
+    ESP_DIR=${boot}
+
+    KEY_ID=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout | openssl rsa -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | sed 's/.*= //' | cut -c 1-16)
+
+    SIG_FILE="$ESP_DIR/EFI/BOOT/${KEY_ID}.sig"
+    echo "Signing config with db.key... (KEY_ID: ${KEY_ID})"
+    
+    openssl dgst -sha256 \
+       -sign ${sec_dir}/db.key \
+       -out "$SIG_FILE" \
+       "$ESP_DIR/EFI/BOOT/config"
+
+    # Create a signature for the kernel file using db.key (RSA)
+    KERNEL_SIG_FILE="$ESP_DIR/EFI/BOOT/${KEY_ID}.kernel.sig"
+    echo "Signing kernel with db.key..."
+    openssl dgst -sha256 -sign ${sec_dir}/db.key \
+       -out "$KERNEL_SIG_FILE" "$ESP_DIR/EFI/BOOT/bzImage"
+
+    # # Create a signature for the initrd file using db.key (RSA)
+    INITRD_SIG_FILE="$ESP_DIR/EFI/BOOT/${KEY_ID}.initrd.sig"
+    echo "Signing initrd with db.key..."
+    openssl dgst -sha256 -sign ${sec_dir}/db.key \
+       -out "$INITRD_SIG_FILE" "$ESP_DIR/EFI/BOOT/initrd.img"
+}
+
+# Similar - but using limine as main loader.
+sign_limine() {
+    SHA_KERNEL=$(cat ${boot}/EFI/BOOT/bzImage | b2sum)
+    SHA_INITRD=$(cat ${boot}/EFI/BOOT/initrd.img | b2sum)
+   echo <<EOF > ${boot}/EFI/BOOT/limine.conf
+timeout: 0
+serial: yes
+graphics: no
+verbose: yes
+editor_enabled: no
+
+/BootA
+  protocol: linux
+  path: boot():/EFI/LINUX/bzImage#${SHA_KERNEL}
+  cmdline: rdinit=/sbin/initos-initrd net.ifnames=0 panic=5 
+  module_path: boot():/EFI/LINUX/initrd.img#${SHA_INITRD}  
+EOF
+
+  CFGSHA=$(cat ${boot}/EFI/BOOT/limine.conf |b2sum)
+
+  cp ${boot}/EFI/BOOT/BOOTX64.EFI /tmp/limine.EFI
+  limine enroll-config /tmp/limine.EFI $CFGSHA
+  
+  sbsign --cert /etc/uefi-keys/db.crt \
+      --key /etc/uefi-keys/db.key \
+      --output ${boot}/EFI/BOOT/limine.EFI \
+       /tmp/limine.EFI 
+
+  rm /tmp/limine.EFI
 }
 
 build_dmverity_boot() {
@@ -267,11 +293,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "Usage: $0 <command> [args...]"
         echo ""
         echo "Commands:"
-        echo "  check_prerequisites              Check required tools"
-        echo "  generate_keypair <dir>            Generate Ed25519 keypair"
+        echo "  sign_init                         Generate EFI and image signing keys"
         echo "  sign_digest <file> <key> <out>    Sign a binary digest"
         echo "  sign_hex_digest <hex> <key> <out> Sign a hex digest string"
-        echo "  create_signed_offline <img> <dir> Create test artifacts (offline)"
+        echo "  image <dir> <file>                Sign an fsverity digest for an image"
+        echo "  efi <sec_dir> <boot_dir>          Sign BOOTX64.EFI in a boot directory"
+        echo "  build_dmverity_boot               Build dm-verity boot config"
         exit 0
     fi
     "$@"

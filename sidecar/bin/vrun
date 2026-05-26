@@ -10,13 +10,13 @@ set -e
 
 # Can be started with:
 # RC_SVCNAME=NAME supervise-daemon NAME --start /x/opt/virt/vrun -- start
-if [ -n ${RC_SVCNAME} ]; then
+if [ -n "${RC_SVCNAME:-}" ]; then
   # If running as a service (alpine init), set the pod name to the service name.
   POD=${POD:-${RC_SVCNAME}}
 fi
 
 # If the script is named vrun-devvm -> the VM will be devvm
-if [ -z ${POD} ]; then
+if [ -z "${POD:-}" ]; then
    vmsuffix="${0#*vrun-}"
    if [ -n "$vmsuffix" ]; then
     POD=$vmsuffix
@@ -25,7 +25,7 @@ fi
 
 # POD is required
 
-if [ -z ${POD} ]; then 
+if [ -z "${POD:-}" ]; then 
   echo "POD must be set to the target container or VM name"
   echo FG=1 will start in foreground
   echo "Options:"
@@ -35,7 +35,7 @@ if [ -z ${POD} ]; then
 fi
 
 # Directory layout on host:
-#    WORK - tmpfs temp dir for sockets, etc - share will have bind mounts that can be changed at runtime.
+#    WORK - tmpfs temp dir for sockets, etc - share will have bind mounts that can be changed at runtime (/run/virt/${POD}
 #    SRC - $HOME/apps/${POD} - source directory, configs
 #
 #    VIRT - kernel, initrd, modules - read only
@@ -53,11 +53,13 @@ fi
 # 
 
 # Directory with hypervisor binaries, kernel, initrd, recovery
-VIRT=${VIRT:-/x/opt/virt}
+VIRT=${VIRT:-/opt/virt}
 # Images - including RW disks
-IMGDIR=${IMGDIR:-/x/vol/images}
+IMGDIR=${IMGDIR:-/z/vol/images}
+
 # sockets, temp files
 WORK=${WORK:-/run/virt/${POD}}
+
 SRC=${SRC:-${HOME}/apps/${POD}}
 
 
@@ -67,13 +69,13 @@ if [ -f ${SRC}/env ]; then
 fi
 
 vm_init() {
-  if [ ! -d ${WORK}/share/lib/modules ]; then
-    # Loading Nvidia drivers from share modules doesn't work - using separate volumes.
-    # In the VM, this can be copied over - to avoid creating a separate image.
-    mkdir -p ${WORK}/share/lib/modules
-    mount -o bind /lib/modules ${WORK}/share/lib/modules
-    # TODO: additional bind mounts configured in the lib
-  fi
+  # if [ ! -d ${WORK}/share/lib/modules ]; then
+  #   # Loading Nvidia drivers from share modules doesn't work - using separate volumes.
+  #   # In the VM, this can be copied over - to avoid creating a separate image.
+  #   mkdir -p ${WORK}/share/lib/modules
+  #   mount -o bind /lib/modules ${WORK}/share/lib/modules
+  #   # TODO: additional bind mounts configured in the lib
+  # fi
 
   # Config and binaries for startup - this sets up the tmpfs work dir
   # On restart it will not re-create it.
@@ -95,8 +97,11 @@ vm_init() {
   if [ -f ${SRC}/initos-pod ]; then 
     cp ${SRC}/initos-pod ${WORK}/share/initos/initos-pod
   fi 
+
   mkdir -p ${WORK}/share/initos ${WORK}/share/bin
+
   cp ${VIRT}/initos-init-vm ${WORK}/share/initos/initos-init-vm
+
   if [ ! -e ${WORK}/share/bin/sh ]; then
     cp ${VIRT}/busybox ${WORK}/share/bin
     (cd ${WORK}/share/bin && ln -s busybox sh)
@@ -193,15 +198,12 @@ start() {
     QDISKS="${QDISKS} -fsdev local,security_model=passthrough,id=fsdev0,path=${WORK}/share"
     
 
-    else 
-        OPTS="$OPTS -kernel ${VIRT}/vmlinuz"
-    fi
+    OPTS="$OPTS -kernel ${VIRT}/vmlinuz"
     if [ -z "${QEMU_UI}" ]; then
         qemu_base="${qemu_base} -nographic"
     else
         qemu_base="${qemu_base} -display gtk -vga std"
     fi
-  fi
   else
     # Using the rootfs as root or shared
     run_virtiofsd ${WORK}  
@@ -226,7 +228,7 @@ start() {
   CMD_OPTS="$CMD_OPTS initos_host=${POD}"
   CMD_OPTS="$CMD_OPTS net.ifnames=0 initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
   
-  CMD_OPTS="$CMD_OPTS root=/dev/root rootfstype=virtiofs init=/initos/initos-init-vm rw"
+  CMD_OPTS="$CMD_OPTS root=/dev/root rootfstype=virtiofs init=/opt/initos/bin/initos-init-vm rw"
 
   CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
   
@@ -242,7 +244,7 @@ start() {
   fi
 
   # Not sure if this is still useful.
-  DISKS="${DISKS} path=${VIRT}/modules.ext4,readonly=on"
+  #DISKS="${DISKS} path=${VIRT}/modules.erofs,readonly=on"
 
   # All disks under ${IMGDIR} with file name starting with ${POD} are added as additional disks.
   # This allows to add data disks, cache disks, etc.
@@ -305,7 +307,7 @@ start() {
      else
       $TIME ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}"
      fi
-  elif [ "${RC_SVCNAME}" != "" ]; then
+  elif [ "${RC_SVCNAME:-}" != "" ]; then
     ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" 
   else  
     ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" > ${WORK}/vmcmd.logs 2>&1 &
@@ -313,29 +315,45 @@ start() {
   fi
 }
 
-# Start a Qemu with kernel and initrd
+set -eu
+
+
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+  ACCEL="-enable-kvm -cpu host"
+else
+  ACCEL="-machine accel=tcg -cpu max"
+fi
+
+# Sanity check using qemu with kernel/image built using
+# scripts/build.sh kernel_cloud 
+# scripts/build.sh build_initos
+# 
+# Unlike tests/run_qemu.sh and tests/test_img.sh - this does not use
+# EFI and the host kernel.
 qemuvirt() {
-    build=${HOME}/.cache/initos
-    var=deb
-
-    cmd="loglevel=0 quiet earlyprintk=efi foo=bar console=ttyS0,115200 rdinit=/sbin/initos-initrd net.ifnames=0 panic=5 debug_init initos_debug=1 -- test123"
-    cmd="initos_sidecar=/dev/sdc ${cmd}"
+  KERNEL="${KERNEL:-${HOME}/.cache/initos-kernel-cloud/img/bzImage}"
+  ROOTFS="${ROOTFS:-$(pwd)/target/disks/state/img/initos.erofs}"
+  
+  cmd="root=/dev/vda rootfstype=erofs rootwait loglevel=7"
+  cmd="${cmd} console=hvc0"
+  cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
+  cmd="${cmd} net.ifnames=0 panic=1 debug_init initos_dbg=1"
     
-    qemu_disks="-drive file=${build}/initos-${var}/sidecar.sqfs"
-
-    qemu_base="-m 1G -smp 4 -cpu host -enable-kvm"
-    #qemu_common="${qemu_base} -display none"
-    qemu_common="${qemu_base} -nographic"
-    #qemu_common="${qemu_base} -display gtk -vga std"
-    #qemu_serial="-serial stdio"
-    qemu_serial="-chardev stdio,mux=on,id=char0 -serial chardev:char0 -monitor chardev:char0" 
-
-	qemu-system-x86_64 -nodefaults ${qemu_common}  \
-	   -kernel ${build}/efi/EFI/BOOT/BZIMAGE \
-       -initrd ${build}/efi/EFI/BOOT/INITRD.IMG \
-       -append ${cmd} \
-       -hda fat:rw:${build}/efi-unsigned-${var}-ttyS0 \
-	   ${qemu_serial} ${qemu_disks} 
+    qemu-system-x86_64 \
+  -nodefaults \
+  -m 1G \
+  -no-reboot \
+  -smp 4 \
+  $ACCEL \
+  -nographic \
+  -kernel "${KERNEL}" \
+  -drive "if=none,id=rootfs,format=raw,readonly=on,file=${ROOTFS}" \
+  -device virtio-blk-pci,drive=rootfs \
+  -device virtio-serial-pci \
+  -chardev stdio,id=console,signal=off \
+  -device virtconsole,chardev=console \
+  -append "${cmd}"
+  
 }
 
 ## Stop gracefully (vm_ctrl), expects the socket.

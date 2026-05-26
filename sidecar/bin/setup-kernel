@@ -1,0 +1,276 @@
+#!/bin/sh
+
+################# Kernel building #######################################
+# This script runs inside a container (userspace podmain) with host directories
+# mounted:
+# 
+# /build (used as ${out}) is the work directory. On host it is mounted as 
+#   $HOME/.cache/initos-kernel-dev
+# ${src} contains the initos repo - default is /ws but typically is the same dir as on the host
+#
+# The script has functions to install deps, firmware and clone the source and
+# build - using a debian base config plus fragments adding extra buildt-in modules
+# to avoid initrd.
+#
+# /build/linux will have the linux source tree
+# /build/open-gpu-kernel-modules will have the nvidia driver source tree
+# /build/img will have the output files, including erofs with modules, bzImage.
+
+set -x
+set -e
+export DEBIAN_FRONTEND=noninteractive
+APTINSTALL='apt install -o Dpkg::Options::=--force-confold --assume-yes --no-install-recommends '
+
+BRANCH=${BRANCH:-6.18}
+
+out=${out:-/build}
+src=${src:-/ws}
+
+ensure_firmware_apt_sources() {
+  local changed=0
+  local f
+
+  if grep -RqsE '^(Components:|deb .* )[[:alnum:][:space:]_-]*non-free-firmware' \
+      /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    return 0
+  fi
+
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    sed -i '/^Components:/ {
+      / contrib/! s/$/ contrib/
+      / non-free/! s/$/ non-free/
+      / non-free-firmware/! s/$/ non-free-firmware/
+    }' "$f"
+    changed=1
+  done
+
+  if [ -f /etc/apt/sources.list ]; then
+    sed -i '/^deb / {
+      / contrib/! s/ main/ main contrib/
+      / non-free/! s/ main/ main non-free/
+      / non-free-firmware/! s/ main/ main non-free-firmware/
+    }' /etc/apt/sources.list
+    changed=1
+  fi
+
+  if [ "$changed" = 1 ]; then
+    apt update
+  fi
+}
+
+
+get_kernel() {
+  cd ${out}
+  git clone --depth=1 --branch linux-${BRANCH}.y --single-branch https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
+}
+
+all() {
+  kernel_build
+  kernel_pack
+}
+
+kernel_pack() {
+  mkdir -p ${out}/img
+  cp ${out}/linux/arch/x86/boot/bzImage ${out}/img/bzImage
+  cp ${out}/linux/.config ${out}/img/
+  VER=$(cat ${out}/linux/include/config/kernel.release)
+  (cd /lib/modules/${VER} && mkfs.erofs -zlz4 ${out}/img/modules-${VER}.erofs .)
+}
+
+kernel() {
+  ${src}/sidecar/bin/setup-deb kernel_build_tools
+
+  #rm -rf /lib/modules/*
+  if [ ! -e ${out}/linux ] ; then
+    get_kernel
+  else 
+    cd ${out}/linux
+    git pull 
+  fi
+
+  kernel_build
+  nvidia
+
+  kernel_pack
+}
+
+kernel_cloud() {
+  if [ ! -e ${out}/linux ] ; then
+    get_kernel
+  else 
+    cd ${out}/linux
+    git pull 
+  fi
+
+  kernel_build_cloud
+  
+  kernel_pack
+}
+
+CONF="./scripts/config"
+BUILTIN="./scripts/config --enable "
+MOD="./scripts/config --module "
+
+kernel_cfg() {
+  cd ${out}/linux
+
+  # load debian and apply overrides.
+  cp  ${src}/linux/${BRANCH}/config.amd64 .config 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/${BRANCH}/config
+    
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/builtins.fragment 
+  
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/filesystems.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/crypto.fragment   
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/containers.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/net.fragment 
+  
+  # Only on host
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/block.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/usb.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/networking.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/mods2.fragment 
+  
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/efi.fragment 
+
+  # One of the laptops was not covered by debian selection
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/host-lenovo.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/cros/hatch.fragment
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/host-chromeos.fragment 
+
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/tpm2.fragment 
+  # Host display - VMs are different
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/display.fragment 
+
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/y-remove.fragment 
+ 
+  # Synchronize config
+  make olddefconfig
+  
+}
+
+kernel_cfg_cloud() {
+  cd ${out}/linux
+
+  cp  ${src}/linux/${BRANCH}/cloud/config.cloud-amd64 .config 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/${BRANCH}/cloud/config.cloud
+
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/builtins.fragment 
+  
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/filesystems.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/crypto.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/containers.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/net.fragment 
+   
+  # Only in cloud image (virtio drivers - not needed on host)
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/cloud.fragment 
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/virtio.fragment 
+
+  # Synchronize config
+  make olddefconfig
+ }
+
+kernel_build_cloud() {
+  kernel_cfg_cloud
+  make -j$(($(nproc) * 2 + 1))
+
+  make modules -j$(($(nproc) * 2 + 1))
+  make modules_install
+
+}
+
+kernel_build() {
+  kernel_cfg
+  make -j$(($(nproc) * 2 + 1))
+
+  make modules -j$(($(nproc) * 2 + 1))
+  make modules_install
+
+}
+  # $CONF --set-str CONFIG_EXTRA_FIRMWARE_DIR "/lib/firmware"
+  # # Add the specific blobs your hardware needs (Example for Intel Laptops)
+  # # Space-separated list relative to /lib/firmware
+  # FW_LIST="i915/adlp_dmc.bin iwlwifi-ty-a0-gf-a0-59.ucode" 
+  # $CONF --set-str CONFIG_EXTRA_FIRMWARE "$FW_LIST"
+  #$CONF --set-str CONFIG_LOCALVERSION "-$VERSION"
+
+
+add_firmware() {
+  ensure_firmware_apt_sources
+
+  $APTINSTALL firmware-linux-free firmware-ath9k-htc  firmware-misc-nonfree   firmware-realtek firmware-brcm80211  \
+    firmware-sof-signed \
+    firmware-intel-sound \
+    firmware-iwlwifi \
+    firmware-linux-nonfree \
+    firmware-nvidia-gsp
+
+  # if [ ! -f ${out}/img/firmware.erofs ]; then
+    #(
+     # cd ${out}
+      # git clone https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+      # mkdir firmware
+      # cd linux-firmware
+      # ./copy-firmware.sh ../firmware
+      # cd ../firmware
+      #mkfs.erofs -zlz4 ${out}/img/firmware.erofs    
+    #)
+  # fi
+  (cd /lib/firmware &&  mkfs.erofs -zlz4 ${out}/img/firmware.erofs . )
+
+  
+
+  # $APTINSTALL \
+  #   firmware-linux-free firmware-ath9k-htc   \
+  #   firmware-misc-nonfree firmware-iwlwifi \
+  #   firmware-realtek firmware-brcm80211
+}
+
+# Adds Nvidia driver.
+nvidia() {
+  cd ${out}
+
+  # Will use systemd or script - may start it as 'main' as well, without
+  # an actual sidecar.
+  # Not the current kernel on the builder machine
+  if [ ! -e open-gpu-kernel-modules ]; then 
+    git clone https://github.com/NVIDIA/open-gpu-kernel-modules.git
+  fi
+  cd open-gpu-kernel-modules
+  export SYSSRC=/build/linux
+  make SYSSRC=/build/linux SYSOUT=/build/linux
+  make modules_install
+
+ # $APTINSTALL dkms nvidia-kernel-source nvidia-cuda-toolkit
+ 
+#   scripts/config --disable CONFIG_LOCKDEP
+#   scripts/config --disable CONFIG_PROVE_LOCKING
+#  scripts/config --disable CONFIG_DEBUG_RT_MUTEXES
+# scripts/config --disable CONFIG_DEBUG_MUTEXES
+# scripts/config --disable CONFIG_DEBUG_WW_MUTEX_SLOWPATH
+# scripts/config --disable CONFIG_DEBUG_LOCK_ALLOC
+
+  # curl -fsSL -o /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+  # dpkg -i /tmp/cuda.deb
+  
+
+  # if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ] ; then
+  #    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |  gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 
+  #    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  #     sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  #     tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  #     apt update
+  # fi
+
+  # This has systemd as a dependency...
+#  $APTINSTALL cuda-drivers 
+   #  linux-headers-$(cat /boot/cloud-version) 
+
+#  $APTINSTALL nvidia-container-toolkit  
+   
+#  /usr/lib/dkms/dkms_autoinstaller start ${VER}
+#  dkms status
+}
+
+"$@"

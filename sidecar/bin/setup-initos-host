@@ -1,8 +1,113 @@
-#!/bin/sh
+#!/opt/busybox/bin/sh
 
 # Helpers for setup and operating the host.
 
 ### Install ###
+
+disk_setup() {
+  DISK=${1:-"/dev/sdb"}
+  
+
+  sfdisk --label gpt "$DISK" <<EOF
+label-id: gpt
+
+partition-101 : size=64M, name="BOOT1", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+partition-102 : size=64M, name="BOOT2", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+partition-111 : size=64M, name="INITOS1"
+partition-112 : size=64M, name="INITOS2"
+partition-1   : size=+, name="ROOT"
+EOF
+}
+
+setup_fs() {
+  DISK=${1:-/dev/sdb}
+
+  mkfs.ext4 -L STATE -O encrypt,verity ${d}1
+  mkfs.vfat -n BOOT1 ${DISK}101
+  mkfs.vfat -n BOOT2 ${DISK}102
+
+  mkfs.ext4 -L INITOS1 ${d}111
+  mkfs.ext4 -L INITOS2 ${d}112
+
+}
+
+upgrade() {
+  cp /z/img/bzImage /mnt/BOOTB/EFI/BOOT/
+  sync
+  /opt/busybox/bin/reboot -f
+
+}
+
+mount_install() {
+  mkdir -p /mnt/STATE /mnt/BOOT1 /mnt/BOOT2 /mnt/INITOS1 /mnt/INITOS2
+  mount LABEL=STATE /mnt/STATE
+  mount LABEL=INITOS1 /mnt/INITOS1
+  mount LABEL=INITOS2 /mnt/INITOS2
+  mount LABEL=BOOT1 /mnt/BOOT1
+  mount LABEL=BOOT2 /mnt/BOOT2
+}
+
+part_labels() {
+  local d=${1}
+
+  sfdisk --part-label $d 101 BOOTA
+  sfdisk --part-label $d 102 BOOTB
+  sfdisk --part-label $d 103 INITOSA
+  sfdisk --part-label $d 104 INITOSB
+  sfdisk --part-label $d 1 STATE
+
+  mkfs.ext4 -L STATE -O encrypt,verity ${d}1
+  mkfs.vfat -n BOOTA ${d}101
+  mkfs.vfat -n BOOTB ${d}102
+
+  # use e2label or fatlabel to change
+}
+
+rebuild_root() {
+    # Excluding some directories since for dev the ext4 may
+    # be an actual root install. It is bind mounted to /z/a/ROOTA,
+    # but includes /z as well.
+    (cd /z/a/ROOTA && \
+        mkfs.erofs -zlz4 /z/img/ROOTA.erofs . \
+        --exclude-path c \
+        --exclude-path tmp \
+        --exclude-path initos \
+        --exclude-path img \
+        --exclude-path z \
+        --exclude-path a \
+        )
+}
+
+rebuild_initos() {
+    (cd /z/a/initos && \
+        mkfs.erofs -zlz4 /z/img/initos.erofs .)
+}
+
+
+part_labels_usb() {
+  local d=${1}
+
+  sfdisk --part-label $d 101 UBOOTA
+  sfdisk --part-label $d 102 UBOOTB
+  sfdisk --part-label $d 103 UINITOSA
+  sfdisk --part-label $d 104 UINITOSB
+  sfdisk --part-label $d 1 USTATE
+
+  mkfs.ext4 -L USTATE -O encrypt,verity ${d}1
+  mkfs.vfat -n UBOOTA ${d}101
+  mkfs.vfat -n UBOOTB ${d}102
+
+  # use e2label or fatlabel to change
+}
+
+init_secrets() {
+  mkdir -p /run/secrets/root
+  chown root /run/secrets/root
+  chmod 600 /run/secrets/root
+  age-keygen -o /run/secrets/root/c_key
+  chmod 600 /run/secrets/root/c_key
+}
+
 
 
 # Will wipe a disk a create the partitions needed for initos.
@@ -25,18 +130,25 @@ install_wipe_disk() {
 
   parted --script --machine -- "${DISK}" mklabel gpt
 
-  parted "$DISK" mkpart primary fat32 101 2048
+  parted "$DISK" mkpart BOOTA vfat 101 2048
   parted "$DISK" set 1 boot on
   parted "$DISK" set 1 esp on
   parted "$DISK" name 1 "BOOTA"
 
-  parted "$DISK" mkpart primary fat32 2048 4096
+  parted "$DISK" mkpart BOOTB fat32 2048 4096
   parted "$DISK" name 2 "BOOTB"
   parted "$DISK" set 2 esp on
-  
-  # Create the LUKS partition
-  parted "$DISK" mkpart primary ext4 4096 100%
-  parted "$DISK" name 3 "INITOSLUKS"
+
+  parted "$DISK" mkpart INITOSA fat32 2048 4096
+  parted "$DISK" name 3 "INITOSA"
+  parted "$DISK" set 3 esp on
+
+  parted "$DISK" mkpart INITOSB fat32 2048 4096
+  parted "$DISK" name 2 "INITOSB"
+  parted "$DISK" set 2 esp on
+
+  parted "$DISK" mkpart STATE ext4 4096 100%
+  parted "$DISK" name 3 "STATE"
 
   partprobe $DISK
 
@@ -63,7 +175,7 @@ install_wipe_usb() {
   parted "$DISK" set 1 boot on
   parted "$DISK" set 1 esp on
   parted "$DISK" name 1 "BOOTUSB"
-  
+
   # Create the LUKS partition
   parted "$DISK" mkpart primary ext4 4096 100%
   parted "$DISK" name 2 "INITOSLUKSUSB"
@@ -75,7 +187,7 @@ install_wipe_usb() {
   #install_boot_options ${DISK}
 }
 
-# Initialize the boot partition - make filesystem, copy the 
+# Initialize the boot partition - make filesystem, copy the
 # EFI files from USB (or primary partition)
 bootd() {
   local PART=$1
@@ -111,10 +223,10 @@ find_installed_deb() {
 ## List PCI devices by IOMMU group - useful for passthrough
 lsgrp() {
   for d in /sys/kernel/iommu_groups/*/devices/*; do
-     n=${d#*/iommu_groups/*}; 
-     n=${n%%/*}; 
-     printf 'IOMMU Group %s ' "$n"; 
-     lspci -nns "${d##*/}"; 
+     n=${d#*/iommu_groups/*};
+     n=${n%%/*};
+     printf 'IOMMU Group %s ' "$n";
+     lspci -nns "${d##*/}";
   done;
 }
 
@@ -191,49 +303,44 @@ adduser() {
   fi
 }
 
+# Add a custom user - with PID, PGID, PUSERNAME ('pod').
+# Should be 'system' on dev containers, 'user' or real user on regular
+# machines (where user may use chrome - but not dev)
+add_main_user() {
+  local u=${USERNAME:-system}
+  local h=${HOME:-/home/${u}}
+  local USERID=${USERID:-1000}
+  #userdel ${u} || true
+
+  echo Adding $u with $h and $USERID
+
+  useradd -u ${USERID} -g users -G users -s /bin/bash \
+         -d ${h} ${USERNAME}
+
+  # Set encrypted password (to invalid). Only ssh login
+  # or VNC
+  usermod -p '*' ${USERNAME}
+
+  #chown ${u} /home /work
+
+  # rm -rf /work && ln -s /x/work /work
+
+  usermod -a -G chrome-remote-desktop ${u} || true
+  usermod -a -G docker ${u} || true
+  usermod -a -G kvm ${u} || true
+  usermod -a -G video ${u} || true
+  usermod -a -G render ${u} || true
+
+  # access to /etc/ssl/private
+  usermod -a -G ssl-certs ${u} || true
+
+  echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
+
+  chmod 4755 /x/sync/app/chrome/chrome-sandbox || true
+}
+
 ### UI ###
 
-start() {
-    rm -f /tmp/.X*-lock /tmp/.X11-unix/X${DISPLAY}
-    adduser
-    echo "STARTING AS $USER"
-    su - ${USER} /sbin/init-pod startX
-}
-
-startX() {
- startKasm &
- sleep 1
- echo "X STARTED"
- kitty &
- i3  &
- echo DONE
- sleep infinity
-}
-
-# StartUI is called as root.
-startui() {
-   # TODO: may execute some startup from /x
-  if [ -f /etc/init.d/seatd ]; then
-    addgroup build seat
-    /etc/init.d/seatd start
-    /etc/init.d/polkit start
-  fi
-
-  /etc/init.d/agetty.tty2 start
-
-  ui
-  #libinput list-devices
-  exec tini -s sleep -- infinity 
-}
-
-ui() {
-  # As user build (can customize it) 
-  export HOME=/home/build
-  export XDG_RUNTIME_DIR=/run/user/$(id -u build)
-    
-  #sway &
-  labwc -s foot &
-}
 
 ### BTRFS ###
 
@@ -312,8 +419,21 @@ boot() {
   install_boot_options "$@"
 }
 
+efi2() {
+  d=${1:-/dev/nvme0n1}
+  efibootmgr -B -b 1001
+  efibootmgr -B -b 1002
+  efibootmgr -B -b 1003
+  efibootmgr -B -b 1004
+
+  efibootmgr -c -d ${d} -p 102 -b 1004 -L "LimineB" -l "\EFI\BOOT\BOOTX64.EFI"
+  efibootmgr -c -d ${d} -p 102 -b 1003 -L "InitosB" -l "\EFI\BOOT\INITOS.EFI"
+  efibootmgr -c -d ${d} -p 101 -b 1002 -L "LimineA" -l "\EFI\BOOT\BOOTX64.EFI"
+  efibootmgr -c -d ${d} -p 101 -b 1001 -L "InitosA" -l "\EFI\BOOT\INITOS.EFI"
+}
+
 # This must be called after changing the partition tables.
-# 
+#
 install_boot_options() {
   d=${1:-/dev/nvme0n1}
   efibootmgr -B -b 1001
@@ -344,12 +464,12 @@ install_boot_options() {
       -L "InitOS SecureA" \
       -b 1001 \
       -l "\initosA.EFI"
- 
 
-  # -a - set active 
-  # -b - modify 
+
+  # -a - set active
+  # -b - modify
   # -o - boot order
-  
+
   # -n - set boot next
   # -N - delete boot next
   # Delete: -B -b n
@@ -359,15 +479,22 @@ install_boot_options() {
 ### Upgrade ###
 
 bootNext() {
-  local id=$1
+  local id=${1:1001}
+
+  mkdir -p /mnt/BOOTB
+  mount LABEL=BOOTB /mnt/BOOTB
+  cp /z/img/bzImage* /mnt/BOOTB/EFI/BOOT/
 
   rm  /sys/firmware/efi/efivars/dump-*
+
   efibootmgr -n $id
   sync
-  reboot -f
+  /opt/busybox/bin/reboot -f
 }
 
-# Run before the upgrade - mounts the 'next' EFI partition, 
+
+
+# Run before the upgrade - mounts the 'next' EFI partition,
 # remove old files if the SQFS has changed (small disk, rsync doesn't work
 # very well)
 # Args: hash of new image (compared to old, will remove to avoid issues)
@@ -381,7 +508,7 @@ upgrade_start() {
   local next=$(cat /var/initos/BOOT_NEXT)
   local label=BOOT${next:-B}
 
-  if [ "$clabel" != "" ]; then 
+  if [ "$clabel" != "" ]; then
     label=$clabel
   fi
 
@@ -405,28 +532,33 @@ upgrade_start() {
 
 # Finish the upgrade. Optional 'reboot' CLI to restart, otherwise on next
 # boot the new image will be used.
-# 
-# After the new image is healthy, a 'swapNext' needs to be called to make 
+#
+# After the new image is healthy, a 'swapNext' needs to be called to make
 # it default.
 upgrade_end() {
   umount /boot/b
 
   rm  /sys/firmware/efi/efivars/dump-*
   local c=$(cat /var/initos/BOOT_CURRENT)
-  if [ "$c" = "1001" ]; then 
-    efibootmgr -n 1002 
-  elif [ "$c" = "1002" ]; then 
-    efibootmgr -n 1001 
-  elif [ "$c" = "1003" ]; then 
-    efibootmgr -n 1004 
-  elif [ "$c" = "1004" ]; then 
-    efibootmgr -n 1003 
-  else 
-    efibootmgr -n 1001 
+  if [ "$c" = "1001" ]; then
+    efibootmgr -n 1002
+  elif [ "$c" = "1002" ]; then
+    efibootmgr -n 1001
+  elif [ "$c" = "1003" ]; then
+    efibootmgr -n 1004
+  elif [ "$c" = "1004" ]; then
+    efibootmgr -n 1003
+  else
+    efibootmgr -n 1001
   fi
 
+# efibootmgr -c -d /dev/nvme0n1 -p 1 \
+#   -L "My Custom Kernel" \
+#   -l /vmlinuz \
+#   -u "root=PARTLABEL=INITOS1 rw rootwait"
+
   sync
-  if [ "$1" = "reboot" ]; then 
+  if [ "$1" = "reboot" ]; then
     /sbin/setup-initos-host upgrade_reboot &
     echo "Rebooting in 5 seconds"
   fi
@@ -438,21 +570,21 @@ upgrade_reboot() {
   sync
   sleep 5
   reboot -f
-  
+
 }
 
-# swapNext is useful for switching A and B as first. 
+# swapNext is useful for switching A and B as first.
 # The other approach is to upgrade B, test if it works, upgrade A while B is running - and reboot.
 # That means 2 reboots and risk that B will have a late failure.
 swapNext() {
   local c=$(cat /var/initos/BOOT_CURRENT)
-  if [ "c" = "1001" ]; then 
+  if [ "c" = "1001" ]; then
     efibootmgr -o 1002,1001
-  elif [ "c" = "1002" ]; then 
+  elif [ "c" = "1002" ]; then
     efibootmgr -o 1001,1002
-  elif [ "c" = "1003" ]; then 
+  elif [ "c" = "1003" ]; then
     efibootmgr -o 1004,1003
-  elif [ "c" = "1004" ]; then 
+  elif [ "c" = "1004" ]; then
     efibootmgr -o 1003,1004
   else
     efibootmgr -o 1002,1001
@@ -468,7 +600,7 @@ mok() {
   mokutil --sb-state
   mokutil --list-enrolled
   mokutil --pk /boot/efi/initos/KEYS/PK.cer
-  mokutil --kek 
+  mokutil --kek
   mokutil --db
   # Looks for /var/lib/sbctl/keys/db/db.key
   # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
@@ -487,6 +619,85 @@ efibackup() {
   # sbctl create-keys
   # sbctl sign /boot/efi/Alpine/linux-lts.efi
   # sbctl enroll-keys -m
+}
+
+update1() {
+  h=${1:-host6}
+
+  ssh $h "mkdir /mnt/INITOSA && mount LABEL=INITOSA /mnt/INITOSA"
+  scp sidecar/bin/* $h:/mnt/INITOSA/opt/initos/bin/
+  ssh $h reboot
+}
+
+
+erofs() {
+    d=$(podman unshare podman mount ${NAME})
+    IMG_DIR=${IMG_DIR:-${HOME}/.cache/img}
+    mkdir -p $IMG_DIR
+    
+    ROOTFS_IMG="${IMG_DIR}/${NAME}.erofs"
+
+    podman unshare mkfs.erofs -zlz4hc "${ROOTFS_IMG}" $d
+
+}
+
+exportfs_podman() {
+    local IMG=$1
+    shift
+
+    local mount_path=$(podman unshare podman image mount $IMG)
+
+    cp -rp $mount_path ./
+
+    podman unshare podman image unmount $IMG
+}
+
+# cpimg copies the content of an image to a dir. 
+cpimg() {
+  SRC=$1
+  DST=$2
+
+  ${DOCKER} run --rm \
+    --mount type=image,source=$SRC,destination=/src \
+    -v $DST:/out \
+    alpine \
+      cp -a /src/* /out/
+}
+
+clean() {
+    docker rmi $(docker images -q)
+    docker image prune -a -f
+}
+
+docker_extract() {
+  img=${1}
+  mkdir ${WORK}/rootfs
+
+  docker export $img | \
+    (cd ${WORK}/rootfs && tar -xf  - )
+}
+
+# Export with crane - image must be remote or created.
+exportfs_crane() {
+    local IMG=$1
+    shift
+
+    crane export ${IMG} | tar -C $NAME -xf -
+}
+
+erofs_img() {
+    d=$(podman unshare podman image mount ${REPO}/${s})
+    
+    ROOTFS_IMG="${out}/test/img/initos.erofs"
+
+    podman unshare mkfs.erofs -zlz4hc "${ROOTFS_IMG}" $d
+
+}
+
+asuid() {
+  UID=${1:1001}
+  shift
+  setpriv --reuid ${UID} --regid ${UID} --clear-groups "$@"
 }
 
 

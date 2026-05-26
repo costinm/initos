@@ -1,0 +1,111 @@
+#!/opt/busybox/bin/sh
+
+export PATH=/opt/initos/bin:/opt/busybox/bin:/z/a/initos/bin:/bin:/sbin:/usr/bin:/usr/sbin
+
+export initos_dbg=1
+set -x
+
+run_tests() {
+    echo "===== Hello World from initos! ====="
+    echo "Kernel: $(uname -r)"
+    echo "Init PID: $$"
+    env
+    set -x
+
+    echo "=== TPM2 TEST ==="
+
+    mkdir -p /z/initos/tpm /z/tmp
+
+    initos primary
+    echo "primary exit=$?"
+    cat /z/initos/tpm/tpm_primary
+
+    export INITOS_PUB_KEY="GOmR9GEy3xbI/4ybZDnv9coSOuD4kMkEkQcGGsbfkus="
+    initos seal "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    echo "seal exit=$?"
+    cat /z/initos/tpm/tpm_handle
+
+    echo "=== FSCRYPT ENV KEY TEST ==="
+    FSCRYPT_DIR=/z/tmp/test_env_encrypted
+    mkdir -p "${FSCRYPT_DIR}"
+
+    FSCRYPT_KEY="my-user-password" initos fscrypt-setup "${FSCRYPT_DIR}"
+    echo "fscrypt-setup (env) exit=$?"
+
+    echo "env-secret-data" > "${FSCRYPT_DIR}/test.txt"
+    echo "write exit=$?"
+    sync
+    EDATA=$(cat "${FSCRYPT_DIR}/test.txt" 2>&1)
+    echo "FSCRYPT ENV READ: [${EDATA}]"
+
+    if [ "${EDATA}" = "env-secret-data" ]; then
+        echo "=== FSCRYPT ENV KEY OK ==="
+    else
+        echo "=== FSCRYPT ENV KEY FAIL (got: ${EDATA}) ==="
+        ls -la "${FSCRYPT_DIR}/" 2>&1
+    fi
+
+    echo "=== FSCRYPT TPM TEST ==="
+    FSCRYPT_DIR2=/z/tmp/test_tpm_encrypted
+    mkdir -p "${FSCRYPT_DIR2}"
+
+    FSCRYPT_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" initos fscrypt-setup "${FSCRYPT_DIR2}"
+    echo "fscrypt-setup (tpm) exit=$?"
+
+    echo "tpm-secret-data" > "${FSCRYPT_DIR2}/test.txt"
+    sync
+    TDATA=$(cat "${FSCRYPT_DIR2}/test.txt" 2>&1)
+    echo "FSCRYPT TPM READ: [${TDATA}]"
+
+    if [ "${TDATA}" = "tpm-secret-data" ]; then
+        echo "=== FSCRYPT TPM OK ==="
+    else
+        echo "=== FSCRYPT TPM FAIL (got: ${TDATA}) ==="
+        ls -la "${FSCRYPT_DIR2}/" 2>&1
+    fi
+
+    echo "=== ANTI-REPLAY TEST ==="
+    initos lock_tpm
+    echo "lock_tpm exit=$?"
+
+    RESULT2=$(initos unseal 2>&1)
+    rc=$?
+    echo "second unseal exit=$rc"
+    if [ $rc -ne 0 ]; then
+        echo "=== ANTI-REPLAY OK (second unseal correctly rejected) ==="
+    else
+        echo "=== ANTI-REPLAY FAIL (second unseal should have failed) ==="
+        echo "${RESULT2}"
+    fi
+
+    echo "=== ALL TESTS COMPLETE ==="
+
+    sleep 2
+    reboot -f
+}
+
+initos-init mount_sys
+
+if ! touch /z/.initos-qemu-state-check 2>/dev/null; then
+    echo "ERROR: /z is not writable; STATE was not bind-mounted before switch_root"
+    reboot -f
+fi
+rm -f /z/.initos-qemu-state-check
+
+tag9p=/sys/bus/virtio/drivers/9pnet_virtio/virtio0/mount_tag
+if [ -r "${tag9p}" ]; then
+    echo "Using qemu 9p $(cat "${tag9p}")"
+    mkdir -p /x
+    if mount -t 9p -o trans=virtio,version=9p2000.L "$(cat "${tag9p}")" /x; then
+        if [ -f /x/test.sh ]; then
+            exec /x/test.sh
+        fi
+        echo "No /x/test.sh found; running built-in qemu tests"
+    else
+        echo "Failed to mount qemu 9p; running built-in qemu tests"
+    fi
+else
+    echo "No qemu 9p mount tag found; running built-in qemu tests"
+fi
+
+run_tests

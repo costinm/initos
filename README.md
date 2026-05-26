@@ -1,52 +1,190 @@
-# Simpler verified OS initialization
+# initos — Simpler Verified OS Boot and Initialization
 
-The goal is to simplify verified boot for common  physical machines, replacing the usual Initrd (dracut, etc) with a minimal and easier to understand and review boot process.
+`initos` is a minimal, unified boot tool and initialization sequence for early host setup. It replaces complex, bloated, machine-specific initramfs systems (like dracut) with a single, easily auditable Rust binary. 
 
-Choices:
-- Only EFI 
-- kernel compiled with NVME, Sata, MMC, USB and ext4/erofs in the kernel, not as modules.
-- a single rust app in the initrd.
-- Custom EFI loader for secure boot - verifying the command line and initrd using EFI PK variables. 
-- One 'ext4' data partition, with STATE partition label is loaded - with fsverity and fsencrypt enabled. Inside the 
-img/initos.erofs (erofs) and other images are signed with the public key from kernel command line.
+By integrating **UEFI Secure Boot**, **fs-verity**, and **TPM2 policies**, it decouples the bootloader and kernel from the host OS, providing a container-like read-only environment to run any Linux distribution.
 
-The main idea is that the boot partition only changes if the
-kernel or initrd is updated - while rootfs and any other image can be updated independently and signed with the key
-included in the verified boot config.
 
-For unverified boot - no need to use initrd, can directly boot
-to rootfs.
+The goal is to simplify verified boot for common  physical machines, replacing the usual Initrd (dracut, etc) with a _minimal_ and easier to understand and review boot process. Minimal is the key, keep only features that can't be removed.
 
-Rationale:
-- options add complexity and risk. I used this for my own machines and I don't want to deal with complexity at home.
-- Clear separation of 'signed EFI path' and rootfs -  starting from EFI signing key verifying the EFI binary including the SHA of the config, config including SHA of kernel/initrd and the public key for rootfs signing.
-- Minimum possible initrd - only verifies rootfs image with fsverity, using the public key from the signed config file.
-- Custom EFI loader is used instead of Limine for better secure boot integration and minimal features.
-- We need a writable disk anyway - ext4 has fsverity/fscrypt and good enough for a STATE partition holding images and configs.
-- Avoiding partitions and complex block magic - just 2 partitions required. 
+---
+
+## Architecture Overview
+
+The boot chain establishes a secure path from the UEFI firmware up to the execution of the target operating system:
+
+```mermaid
+graph TD
+    subgraph UEFI Boot Stage
+        A["UEFI Firmware (Secure Boot)"] -->|Loads & Verifies| B["EFI Loader (efi.rs)"]
+        B -->|Verifies signature against DB cert| C["Kernel & Commandline (bzImage)"]
+    end
+
+    subgraph Initrd Stage (PID 1)
+        C -->|Executes /init| D["initos (initos-init)"]
+        D -->|Mounts| E["Pseudo-FS (proc, sysfs, devtmpfs)"]
+        D -->|Scans by label| F["STATE Partition (ext4)"]
+        D -->|Verifies fs-verity signature| G["Read-Only OS Image (initos.erofs)"]
+        G -->|Loop-mounts as EROFS| H["Verified Rootfs (/mnt/root)"]
+        H -->|Bind-mounts STATE| I["STATE at /z"]
+        I -->|Handover| J["switch_root"]
+    end
+
+    subgraph OS Stage
+        J --> K["Real OS (Debian, Alpine, etc.)"]
+        K -->|TPM2 Policy / fscrypt| L["Decrypt Writable Overlay / Home"]
+    end
+```
+
+### Flow Diagram (ASCII)
+
+```
+┌──────────────────────────────────────────┐
+│        EFI Loader (src/bin/efi.rs)       │
+│  · Reads /EFI/BOOT/config                │
+│  · Verifies config signature using db    │
+│  · Loads/Verifies kernel using db cert   │
+│  · Handover to Linux kernel              │
+└────────────────────┬─────────────────────┘
+                     │
+┌────────────────────▼─────────────────────┐
+│       initos / initos-init (PID 1)       │
+│  ┌─────────────────────────────────────┐ │
+│  │ mount.rs                            │ │
+│  │ · mount_pseudo_fs (proc/sys/dev)    │ │
+│  │ · find_partition_by_label (STATE)   │ │
+│  │ · mount_ext4 / mount_loop           │ │
+│  │ · switch_root                       │ │
+│  └─────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────┐ │
+│  │ verity.rs                           │ │
+│  │ · measure_verity (ioctl)           │ │
+│  │ · digest_to_hex                     │ │
+│  └─────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────┐ │
+│  │ verify.rs                           │ │
+│  │ · verify_signature (Ed25519)        │ │
+│  │ · verify_image                      │ │
+│  └─────────────────────────────────────┘ │
+└──────────────────────────────────────────┘
+```
+
+---
+
+## Core Benefits
+
+- **Zero-Trust Boot Chain**: Validates everything from the UEFI Secure Boot DB keys all the way up to the filesystem blocks using fs-verity Merkle trees.
+- **Host Portability**: Replaces machine-specific ramdisks. The same static `initos` initrd binary works across all physical servers
+- **Frictionless Upgrades**: Upgrading the OS is as simple as copying an `.erofs` image and its accompanying `.sig` signature to the STATE partition.
+- **Hardware Cryptography**: Out-of-the-box support for TPM2 sealing (locked to PCR 7 policies with automatic anti-replay extension lockout) and fscrypt-based folder encryption.
+- **Auditable & Small**: Written in Rust with minimal dependencies, replacing thousands of lines of shell scripting in standard initramfs generators.
+
+---
+
+## Boot Sequence Details
+
+1. **Firmware Stage**: The UEFI firmware executes `initos.EFI` (built from `src/bin/efi.rs`). The loader reads the kernel command line from `\EFI\BOOT\config` and verifies its signature (`config.sig`) against the Secure Boot `db` certificate. It then verifies and executes the kernel (`bzImage` and `initrd.img`).
+2. **Mounting Pseudo Filesystems**: Upon initrd start, `initos` is executed as PID 1. It mounts `/proc`, `/sys`, and `/dev`.
+3. **Partition Discovery**: `initos` scans block devices in sysfs for a partition or EXT4 volume labeled `STATE` and mounts it as /z.
+4. **fs-verity Verification**: Once mounted, it measures the EROFS system image (`img/initos.erofs`) and validates its cryptographic hash against the signature file (`initos.erofs.sig`) using a public key passed via kernel command line `INITOS_PUB_KEY`.
+5. **Switch Root**: The image is loop-mounted, the `STATE` partition is bind-mounted at `/z` inside the new rootfs, and `initos` performs a `switch_root` to run the OS init (defaults `/opt/initos/bin/initos-init-ver` - `INITOS_INIT` command line override).
+
+---
+
+## Partition Layout
+
+A standard installation expects the following drive partitions:
+
+| Partition Name | Typical Size | Filesystem | Purpose |
+|----------------|--------------|------------|---------|
+| `BOOTA`        | 32 MB        | VFAT       | Active UEFI Boot (Kernel, Loader, Configs) |
+| `BOOTB`        | 32 MB        | VFAT       | Alternate UEFI Boot (A/B updates) |
+| `STATE`        | 100+ GB      | EXT4       | Contains read-only system images and encrypted user data |
+
+### Layout on `STATE` Partition:
+
+- `/img/` — Read-only EROFS images (e.g., `initos.erofs`, kernel modules, firmware)
+- `/c/` — `fscrypt`-encrypted directory for home directories, mutable settings, and distro overlays.
+
+---
+
+## Developer Tooling & Verification
+
+`initos` provides tools to manage images, encryption, and TPMs.
+
+### Subcommands
+
+Run `initos help` to list all subcommands:
+- `initos verify <IMG>`: Verify an image against its signature using `INITOS_PUB_KEY`.
+- `initos mount <IMG> <DIR>`: Cryptographically verify and loop-mount an EROFS image.
+- `initos primary`: Create an RSA-2048 primary storage key in the TPM owner hierarchy.
+- `initos seal <SECRET>`: Seal a key to the TPM under PCR SHA256:7.
+- `initos unseal`: Unseal the TPM secret to stdout.
+- `initos lock_tpm`: Extend PCR 7 with random data to prevent further unsealing during this boot.
+- `initos fscrypt-setup <DIR>`: Setup v2 encryption policy on a directory.
+- `initos encrypt` / `decrypt`: Multi-recipient age/X25519-compatible encryption.
+
+---
+
+## Build and Container Cycle
+
+The project uses a containerized runtime environment via `cctl` to build and test the boot sequence cleanly:
+
+```bash
+# Setup the debian container
+./scripts/build.sh initos_dev
+
+# Build all binaries & images inside the container
+POD=initos_dev cctl ./scripts/build.sh
+
+# Run tests
+POD=initos_dev cctl cargo test -p initos
+
+# Boot and verify the images inside QEMU with a simulated TPM2
+POD=initos_dev cctl bash -lc 'TIMEOUT=90 tests/run_qemu.sh'
+```
+
+
+## Background
+
+The main reason for writing this is that I got too frustrated with having to deal with Grub and Dracut and the general model of Linux booting - where each machine has to create its own init image that only work on that machine. Security is so complicated and likely to fail that few bother - and the fundamental design of having each host deal with signing and building the boot image is IMO fundamentally flawed. 
+
+
+## Notes/rationale
+
+- The EFI DB is critical to verify the EFI - zero trust in distributions, so my own key sigining EFI. I can also use the same key to sign kernel, cmdline and the images. Custom EFI loader is used instead of Limine for better secure boot integration and minimal features - the EFI doesn't need to be recompiled or patched with keys. UKI EFI has no clear benefits - looked pretty closely and complexity is not worth it.
+
+- minimum and optional initrd - only verifies rootfs image with fsverity, using the public key from the signed config file. 
+This also works as a separate dm-verity partition - but a bit more complicated. Scripts create this as well.
+
+- We need a writable disk anyway - ext4 has fsverity/fscrypt and good enough for a STATE partition holding signed images, signed configs and encrypted home and configs. Additional btrfs/LVM/etc disks can be used as needed.
+
+- Small A/B partitions for EFI. The EXT4 parititon hold versioned images, modules and everything else.
+
 - using fsverity/fscrpt is useful post boot for a lot of other use cases, more dynamic. Upgrades involve just copying files.
-- the model works well with central build system - where all 
-signing happens. All other machines just get signed images and
- signed configs.
-- UKI EFI has no clear benefits - looked pretty closely and complexity is not worth it.
 
-After switch-root, the rootfs init script will use the pubkey to verify configs and mount other volumes - including for enabling TPM and loading fscrypt directories using TPM or 
-password or via remote access, using public key as authorized SSH CA. 
+- the model works well with central build system - where all signing happens. All other machines just get signed images and signed configs.
 
-At the end of the boot sequence control is passed to the user rootfs, which can be any linux variant, including images extracted from container images. Or the signed configs in 
-volumes are used to start VMs and containers, with no other rootfs.
+Spent a lot of time to get TPM/2 work - but I think it is only useful for unattended server reboot. For laptops - entering a password after boot is not a huge effort.
 
-## Partitions
+## EFI loader
 
-- 1 or 2 32M partitions for the A/B EFI - P12 EFI-SYSTEM
-- 1 or 2 4G recovery/default disk - read/write ext4, can be ROOT-A/ROOT-B from chromebooks.
-- about 100G for the ext4 STATE partition - or more. Will hold crypted home and images.
-- some space for extra partitions if needed, for servers or dev machines.
+1. Limine is a relatively minimal boot loader that works well. The config, initrd can 
+be signed along with the bootloader, it works pretty well.
 
-On multi disk systems - EFI and recovery on each disk.
+2. Using a linux kernel with initrd and command line built in (compling the kernel after 
+the initrd is generated) is also possible and avoids an extra step. It assumes kernel
+doesn't accept additional command line options.
 
-# Background
+3. I wrote (with LLM help) a very minimal loader, using the DB key (same key used to sign
+the EFI) to also sign kernel/config - to simplify the steps and allow them to be updated
+independently of the EFI (not the case with limine). Works well - except on one old
+laptop.
 
-The main reason for writing this is that I got too frustrated with having to deal with Grub and Dracut and the general model of Linux booting - where each machine has to create its own init image that only work on that machine. Security is so complicated and likely to fail that few bother - and the fundamental design of having each host deal with signing and 
-building the boot image is IMO fundamentally flawed. 
+Either one seems to work fine and make different tradeoffs.
 
+The boot partitions only holds the kernel, bootloader and configs (in option 2 - only
+the kernel as EFI/BOOT/BOOTX64.EFI).
+
+Assuming 2 ESP boot partitions (BOOTA and BOOTB) this can be updated safely by replacing
+the entire parition with a new image.

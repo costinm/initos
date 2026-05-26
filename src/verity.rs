@@ -67,7 +67,7 @@ pub fn measure_verity_fd(file: &File) -> io::Result<(u16, Vec<u8>)> {
 }
 
 /// Enable fs-verity on an open file descriptor.
-/// The file must be opened with write access, and the underlying filesystem
+/// The file must be opened read-only (O_RDONLY), and the underlying filesystem
 /// must support fs-verity and be mounted read-write.
 pub fn enable_verity_fd(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();

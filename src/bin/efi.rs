@@ -10,7 +10,6 @@ mod uefi_bin {
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
 use core::arch::asm;
 use core::ptr::addr_of;
 use uefi::prelude::*;
@@ -79,15 +78,9 @@ type HandoverFn = unsafe extern "sysv64" fn(
 
 unsafe fn linux_efi_handover(
     image: Handle,
+    handover_addr: usize,
     setup: *mut SetupHeader,
 ) -> ! {
-    let code32_start = core::ptr::read_unaligned(addr_of!((*setup).code32_start));
-    let handover_offset = core::ptr::read_unaligned(addr_of!((*setup).handover_offset));
-    let handover_addr = (code32_start as usize) + 512 + (handover_offset as usize);
-    
-    println!("Handover info: code32_start=0x{:x}, offset=0x{:x}, addr=0x{:x}", 
-             code32_start, handover_offset, handover_addr);
-    
     let st = uefi::table::system_table_raw().expect("No system table").as_ptr();
     println!("Args: image={:p}, st={:p}, setup={:p}", 
              image.as_ptr(), st, setup);
@@ -169,6 +162,52 @@ fn load_kernel_to_address(
     Ok((addr.as_ptr() as usize, size))
 }
 
+fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    if offset + 4 > data.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]))
+}
+
+fn pe_size_of_image(data: &[u8]) -> Option<usize> {
+    if data.len() < 0x40 || data.get(0..2) != Some(b"MZ") {
+        return None;
+    }
+
+    let pe_offset = read_u32_le(data, 0x3c)? as usize;
+    if pe_offset + 0x5c > data.len() || data.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0") {
+        return None;
+    }
+
+    Some(read_u32_le(data, pe_offset + 0x50)? as usize)
+}
+
+fn load_pe_kernel_to_address(path: &str) -> uefi::Result<(usize, usize, usize)> {
+    let data = load_file_to_memory(path)?;
+    let file_size = data.len();
+    let image_size = pe_size_of_image(&data).unwrap_or(file_size).max(file_size);
+    let pages_needed = (image_size + 4095) / 4096;
+
+    let addr = boot::allocate_pages(
+        AllocateType::MaxAddress(0x40000000),
+        MemoryType::LOADER_DATA,
+        pages_needed,
+    )?;
+
+    unsafe {
+        let dest = core::slice::from_raw_parts_mut(addr.as_ptr(), pages_needed * 4096);
+        core::ptr::write_bytes(dest.as_mut_ptr(), 0, dest.len());
+        core::ptr::copy_nonoverlapping(data.as_ptr(), dest.as_mut_ptr(), file_size);
+    }
+
+    Ok((addr.as_ptr() as usize, file_size, image_size))
+}
+
 fn linux_exec(
     cmdline: &str,
     kernel_addr: usize,
@@ -187,6 +226,12 @@ fn linux_exec(
 
     let version = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).version)) };
     let relocatable = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).relocatable_kernel)) };
+    let xloadflags = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).xloadflags)) };
+
+    println!("Kernel xloadflags: 0x{:x}", xloadflags);
+    if xloadflags & 0x08 == 0 {
+        println!("WARNING: Kernel does not report support for 64-bit EFI handover (bit 3 clear)!");
+    }
 
     if version < 0x20b || relocatable == 0 {
         println!("Unsupported kernel version: 0x{:x}, relocatable: {}", version, relocatable);
@@ -206,20 +251,28 @@ fn linux_exec(
     let boot_setup_ptr = boot_setup_addr.as_ptr() as *mut SetupHeader;
 
     unsafe {
-        core::ptr::write_bytes(boot_setup_ptr as *mut u8, 0, 4096);
-        core::ptr::copy_nonoverlapping(
-            kernel_addr as *const u8,
-            boot_setup_ptr as *mut u8,
-            1024, // Copy first 1024 bytes which includes the whole SetupHeader and more
-        );
-        
+        core::ptr::write_bytes(boot_setup_ptr as *mut u8, 0, pages_needed * 4096);
         let setup = &mut *boot_setup_ptr;
-        setup.loader_id = 0xff;
         
         let setup_secs = core::ptr::read_unaligned(addr_of!((*image_setup).setup_secs));
         let ramdisk_max = core::ptr::read_unaligned(addr_of!((*image_setup).ramdisk_max));
-        println!("Kernel setup_secs: {}, ramdisk_max: 0x{:x}", setup_secs, ramdisk_max);
-        setup.code32_start = (kernel_addr + (setup_secs as usize + 1) * 512) as u32;
+        let handover_offset = core::ptr::read_unaligned(addr_of!((*image_setup).handover_offset));
+        let code32_start = kernel_addr + (setup_secs as usize + 1) * 512;
+        let handover_addr = code32_start + 512 + handover_offset as usize;
+        println!(
+            "Kernel setup_secs: {}, ramdisk_max: 0x{:x}",
+            setup_secs,
+            ramdisk_max
+        );
+        println!(
+            "Handover info: code32_start=0x{:x}, offset=0x{:x}, addr=0x{:x}",
+            code32_start,
+            handover_offset,
+            handover_addr
+        );
+
+        setup.loader_id = 0x21;
+        setup.ramdisk_max = ramdisk_max;
 
         let cmdline_len = cmdline.len();
         let cmdline_pool = boot::allocate_pool(MemoryType::LOADER_DATA, cmdline_len + 1).unwrap();
@@ -232,68 +285,23 @@ fn linux_exec(
             setup.ramdisk_len = initrd_size as u32;
         }
 
-        linux_efi_handover(boot::image_handle(), boot_setup_ptr);
+        linux_efi_handover(boot::image_handle(), handover_addr, boot_setup_ptr);
     }
 }
 
 const EFI_CERT_X509_GUID: uefi::Guid = uefi::guid!("a5c059a1-94e4-4aa7-87b5-ab155c2bf072");
 
-fn extract_cn(name: &x509_cert::name::Name) -> String {
-    use x509_cert::der::asn1::{PrintableStringRef, Utf8StringRef};
-    use x509_cert::der::oid::db::rfc4519::CN;
-    for rdn in name.0.iter() {
-        for atv in rdn.0.iter() {
-            if atv.oid == CN {
-                if let Ok(s) = Utf8StringRef::try_from(&atv.value) {
-                    return s.as_str().to_string();
-                }
-                if let Ok(s) = PrintableStringRef::try_from(&atv.value) {
-                    return s.as_str().to_string();
-                }
-                return String::from_utf8_lossy(atv.value.value()).to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-fn extract_sans(tbs: &x509_cert::TbsCertificate) -> Vec<String> {
-    use x509_cert::ext::pkix::name::GeneralName;
-    use x509_cert::ext::pkix::SubjectAltName;
-
-    let extensions = match &tbs.extensions {
-        Some(exts) => exts,
-        None => return Vec::new(),
-    };
-
-    let san_oid = x509_cert::der::oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME;
-
-    for ext in extensions.iter() {
-        if ext.extn_id == san_oid {
-            if let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) {
-                return san.0.iter().map(|gn| match gn {
-                    GeneralName::DnsName(dns) => dns.as_str().to_string(),
-                    GeneralName::Rfc822Name(email) => email.as_str().to_string(),
-                    GeneralName::UniformResourceIdentifier(uri) => uri.as_str().to_string(),
-                    _ => format!("{:?}", gn),
-                }).collect();
-            }
-        }
-    }
-    Vec::new()
-}
-
-fn verify_data_signature(data: &[u8], pk_data: &[u8], sig_path_template: &str, label: &str) -> bool {
+fn verify_data_signature(data: &[u8], db_data: &[u8], sig_path_template: &str, label: &str) -> bool {
     let mut offset = 0;
     let mut verified = false;
 
     let rsa_oid = x509_cert::der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
-    while offset + 28 <= pk_data.len() {
-        let sig_type = uefi::Guid::from_bytes(pk_data[offset..offset+16].try_into().unwrap());
-        let list_size = u32::from_le_bytes(pk_data[offset+16..offset+20].try_into().unwrap()) as usize;
-        let header_size = u32::from_le_bytes(pk_data[offset+20..offset+24].try_into().unwrap()) as usize;
-        let sig_size = u32::from_le_bytes(pk_data[offset+24..offset+28].try_into().unwrap()) as usize;
+    while offset + 28 <= db_data.len() {
+        let sig_type = uefi::Guid::from_bytes(db_data[offset..offset+16].try_into().unwrap());
+        let list_size = u32::from_le_bytes(db_data[offset+16..offset+20].try_into().unwrap()) as usize;
+        let header_size = u32::from_le_bytes(db_data[offset+20..offset+24].try_into().unwrap()) as usize;
+        let sig_size = u32::from_le_bytes(db_data[offset+24..offset+28].try_into().unwrap()) as usize;
 
         if sig_type != EFI_CERT_X509_GUID {
             if list_size == 0 { break; }
@@ -307,35 +315,42 @@ fn verify_data_signature(data: &[u8], pk_data: &[u8], sig_path_template: &str, l
 
         let mut sig_offset = sigs_start;
         while sig_offset + sig_size <= sigs_end {
-            let der_bytes = &pk_data[sig_offset+16..sig_offset+16+cert_data_size];
+            let der_bytes = &db_data[sig_offset+16..sig_offset+16+cert_data_size];
             if let Ok(cert) = x509_cert::Certificate::from_der(der_bytes) {
                 let tbs = &cert.tbs_certificate;
-                let cn = extract_cn(&tbs.subject);
-                let mut sans = extract_sans(tbs);
                 
-                if sans.is_empty() && !cn.is_empty() {
-                    sans.push(cn.clone());
+                use x509_cert::der::Encode;
+                let spki_der_bytes = tbs.subject_public_key_info.to_der().unwrap_or_default();
+                let pub_key_bytes = tbs.subject_public_key_info.subject_public_key.as_bytes().unwrap_or(&[]);
+                
+                let mut hasher = Sha256::new();
+                hasher.update(&spki_der_bytes);
+                let digest = hasher.finalize();
+                
+                let mut key_id = String::new();
+                for b in &digest[..8] {
+                    use core::fmt::Write;
+                    let _ = write!(&mut key_id, "{:02x}", b);
                 }
 
-                for san in &sans {
-                    let sig_path = sig_path_template.replace("{}", san);
-                    if let Ok(sig_data) = load_file_to_memory(&sig_path) {
-                        println!("  Checking {} signature: {}", label, sig_path);
-                        
-                        let algo_oid = tbs.subject_public_key_info.algorithm.oid;
-                        let mut hasher = Sha256::new();
-                        hasher.update(data);
-                        let digest = hasher.finalize();
+                let sig_path = sig_path_template.replace("{}", &key_id);
+                println!("  Computed key_id: {}, looking for: {}", key_id, sig_path);
+                
+                if let Ok(sig_data) = load_file_to_memory(&sig_path) {
+                    println!("  Checking {} signature: {}", label, sig_path);
+                    
+                    let algo_oid = tbs.subject_public_key_info.algorithm.oid;
+                    let mut data_hasher = Sha256::new();
+                    data_hasher.update(data);
+                    let data_digest = data_hasher.finalize();
 
-                        if algo_oid == rsa_oid {
-                            let pub_key_bytes = tbs.subject_public_key_info.subject_public_key.as_bytes().unwrap();
-                            if let Ok(rsa_pub) = RsaPublicKey::from_pkcs1_der(pub_key_bytes) {
-                                if rsa_pub.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, &sig_data).is_ok() {
-                                    println!("  ✅ RSA Signature VERIFIED for {} SAN: {}", label, san);
-                                    verified = true;
-                                } else {
-                                    println!("  ❌ RSA Signature mismatch for {} SAN: {}", label, san);
-                                }
+                    if algo_oid == rsa_oid {
+                        if let Ok(rsa_pub) = RsaPublicKey::from_pkcs1_der(pub_key_bytes) {
+                            if rsa_pub.verify(Pkcs1v15Sign::new::<Sha256>(), &data_digest, &sig_data).is_ok() {
+                                println!("  ✅ RSA Signature VERIFIED for {} KEY_ID: {}", label, key_id);
+                                verified = true;
+                            } else {
+                                println!("  ❌ RSA Signature mismatch for {} KEY_ID: {}", label, key_id);
                             }
                         }
                     }
@@ -380,20 +395,23 @@ fn main() -> Status {
         Err(_) => false,
     };
 
-    let mut pk_buf = [0u8; 4096];
-    let pk_slice: &[u8] = if secure_boot {
-        println!("Secure Boot is ENABLED. Reading PK variable...");
-        let mut pk_name_buf = [0u16; 16];
-        let pk_name = uefi::CStr16::from_str_with_buf("PK", &mut pk_name_buf).unwrap();
+    // 3. Read db (Signature Database) to get certs for config/initrd verification
+    let mut db_buf = [0u8; 4096];
+    let db_slice: &[u8] = if secure_boot {
+        println!("Secure Boot is ENABLED. Reading db variable...");
+        let mut db_name_buf = [0u16; 16];
+        let db_name = uefi::CStr16::from_str_with_buf("db", &mut db_name_buf).unwrap();
         
+        // db uses the Image Security Database GUID, not the global GUID
+        let db_vendor = VariableVendor(uefi::guid!("d719b2cb-3d3a-4596-a3bc-dad00e67656f"));
         match uefi::runtime::get_variable(
-            pk_name,
-            &VariableVendor::GLOBAL_VARIABLE,
-            &mut pk_buf,
+            db_name,
+            &db_vendor,
+            &mut db_buf,
         ) {
             Ok((data, _)) => data,
             Err(e) => {
-                println!("Failed to read PK variable: {:?}", e);
+                println!("Failed to read db variable: {:?}", e);
                 &[]
             }
         }
@@ -402,10 +420,10 @@ fn main() -> Status {
         &[]
     };
 
-    // 3. Verify config signature
-    if secure_boot && !pk_slice.is_empty() {
+    // 4. Verify config signature using db certs
+    if secure_boot && !db_slice.is_empty() {
         println!("Verifying config signature...");
-        if verify_data_signature(&config_data, pk_slice, "\\EFI\\BOOT\\{}.sig", "config") {
+        if verify_data_signature(&config_data, db_slice, "\\EFI\\BOOT\\{}.sig", "config") {
             println!("✅ CONFIG VERIFIED OK");
         } else {
             println!("❌ CONFIG VERIFICATION FAILED!");
@@ -413,27 +431,44 @@ fn main() -> Status {
         }
     }
 
-    // 4. Load kernel
+    // 5. Load kernel
     println!("Loading kernel...");
-    let (kernel_addr, kernel_size) = match load_kernel_to_address("\\EFI\\BOOT\\BZIMAGE") {
+    let (kernel_addr, kernel_size, kernel_image_size) = match load_pe_kernel_to_address("\\EFI\\BOOT\\BZIMAGE") {
         Ok(res) => res,
         Err(e) => {
             println!("Failed to load kernel: {:?}", e);
             loop {}
         }
     };
-    println!("Kernel loaded at 0x{:x} ({} bytes)", kernel_addr, kernel_size);
+    println!(
+        "Kernel loaded at 0x{:x} ({} bytes file, {} bytes image)",
+        kernel_addr,
+        kernel_size,
+        kernel_image_size
+    );
+    
+    // Verify kernel signature if secure boot is enabled
+    if secure_boot && !db_slice.is_empty() {
+        println!("Verifying kernel signature...");
+        let kernel_data = unsafe { core::slice::from_raw_parts(kernel_addr as *const u8, kernel_size) };
+        if verify_data_signature(kernel_data, db_slice, "\\EFI\\BOOT\\{}.kernel.sig", "kernel") {
+            println!("✅ KERNEL VERIFIED OK");
+        } else {
+            println!("❌ KERNEL VERIFICATION FAILED!");
+            loop {}
+        }
+    }
 
-    // 5. Load initrd (optional)
+    // 6. Load initrd (optional)
     let (initrd_addr, initrd_size) = match load_kernel_to_address("\\EFI\\BOOT\\INITRD.IMG") {
         Ok((addr, size)) => {
             println!("Initrd loaded at 0x{:x} ({} bytes)", addr, size);
             
             // Verify initrd signature if secure boot is enabled
-            if secure_boot && !pk_slice.is_empty() {
+            if secure_boot && !db_slice.is_empty() {
                 println!("Verifying initrd signature...");
                 let initrd_data = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
-                if verify_data_signature(initrd_data, pk_slice, "\\EFI\\BOOT\\{}.initrd.sig", "initrd") {
+                if verify_data_signature(initrd_data, db_slice, "\\EFI\\BOOT\\{}.initrd.sig", "initrd") {
                     println!("✅ INITRD VERIFIED OK");
                 } else {
                     println!("❌ INITRD VERIFICATION FAILED!");

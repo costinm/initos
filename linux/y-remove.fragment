@@ -1,0 +1,11 @@
+# Disable the heaviest debug features
+
+# Importaned if building with 'allmodconfig'
+
+CONFIG_DEBUG_INFO=n
+CONFIG_GDB_SCRIPTS=n
+CONFIG_KASAN=n
+CONFIG_LOCKDEP=n
+
+# Remove unused architectures/features
+CONFIG_COMPILE_TEST=n

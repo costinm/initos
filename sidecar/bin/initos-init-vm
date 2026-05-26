@@ -1,7 +1,11 @@
-#!/bin/sh
+#!/opt/busybox/bin/sh
+
+export PATH=/opt/initos/bin:/opt/busybox/bin:/z/a/initos/bin:/bin:/sbin:/usr/bin:/usr/sbin
+ver=$(uname -r)
 
 if [ "${initos_dbg}" = 1 ]; then
   set -x
+  sh
 fi
 
 mount_disks() {
@@ -14,14 +18,12 @@ mount_disks() {
   fi
 
   # TODO: For a VM, can use a separate swap disk (if we find a way to identify it...)
-  # Like VMs, cache may be on a separate unencrypted disk - it is not supposed to hold secrets. 
   if [ -f /x/@cache/swap ]; then
     swapon /x/@cache/swap
   fi
 
   # Rootfs can be on virtiofs or /dev/vda
   if [ -n "${initos_root}" ]; then
-      #mount -t btrfs -o nobarrier /dev/vda /sysroot
       # We may use custom label for EXT4
       mount ${initos_root} /sysroot
   fi
@@ -31,6 +33,10 @@ mount_disks() {
     mkdir -p /src
     mount -t 9p -o trans=virtio,version=9p2000.L $(cat ${tag9p}) /src
   fi
+
+  #local tagvfs=/sys/fs/virtiofs
+  # TODO: find directory, read tag
+  # mount -t virtiofs $TAG /mnt
 
 }
 
@@ -51,30 +57,28 @@ initramfs_init_vm() {
     exec /initos/initos-pod start
   fi 
 
-
-  # mount -o bind / /z # The shared dir will be /z by pivot
-  
-
   if [ -f /sysroot/sbin/init-pod ]; then
       move_mounted_to_sysroot
       pivot_root /sysroot /z
       exec /sbin/init-pod start
-  elif [ -f /sysroot/usr/bin/systemd ]; then
+  elif [ -f /sysroot/usr/lib/systemd/systemd ]; then
     move_mounted_to_sysroot
-    pivot_root /sysroot /z
-    exec /usr/bin/systemd --system 
+    cd /sysroot
+    mkdir -p mnt/initos
+    pivot_root . mnt/initos || sh
+    exec /usr/lib/systemd/systemd --system 
     #--log-level=err  --system \
     #    --default-standard-output=tty --default-standard-error=tty
     # --unit=rescule.target
   else
-    exec /bin/sh
+    exec sh
   fi 
 }
 
 ## First step - expand busybox and mount the basic filesystems.
 # Extracted from alpine init.
 initramfs_1st() {
-  /bin/busybox mkdir -p \
+  mkdir -p \
     /sbin /usr/bin \
     /usr/sbin \
     /dev \
@@ -86,8 +90,6 @@ initramfs_1st() {
     /run /proc /sys \
     /sysroot /x /z /boot/efi /lib/modules \
     /lib/firmware /var/cache /var/log /home /initos
-
-  /bin/busybox --install -s
 
   [ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
 
@@ -153,88 +155,11 @@ net_cfg() {
   
     ip link set dev eth0 up
 
-    ip addr add ${initos_ip} dev eth0
+    ip addr add ${initos_ip}/22 dev eth0
   fi
 
   route add default gw ${initos_gw}
   hostname $initos_host
-}
-
-# This script is run as root, with $USER set to the name of the user to 
-# be created.
-# 
-# There are few types of users:
-# - admin - equivalent to root, with sudo, etc. 
-# - shell - normal user, typically custom name - with desktop/X access
-#    and user credentials, secrets, etc.
-# - build (or build)- developer, minimal credentials, may have remote desktop
-#   access for IDEs. 
-# - app-XXX - application specific user, to keep apps isolated.
-user_add() {
-    local user=$1
-
-    mkdir -p /var/cache/user/$user
-    chown $user /var/cache/user/$user
-
-    # May work if /var/cache/user is 1777
-    mkdir -p /var/cache/user/$user || true
-
-    mkdir -p /var/cache/user/$user/.cache \
-       /var/cache/user/$user/go
-       /var/cache/user/$user/.venv \
-
-       
-    # As user:
-    rm -rf /home/$user/.cache /home/$user/go
-    ln -s /var/cache/user/$user/.cache /home/$user/.cache
-    ln -s /var/cache/user/$user/go /home/$user/go
-}
-
-prepare_x() {
-  if [ -f /etc/init.d/dbus ]; then
-    /etc/init.d/dbus start
-  fi
-  if [ -f /etc/init.d/x11-common ]; then
-    /etc/init.d/x11-common start
-  fi
-
-  rm -f /tmp/.X*-lock /tmp/.X11-unix/X${DISPLAY} || true
-}
-
-# Add a custom user - with PID, PGID, PUSERNAME ('pod').
-# Should be 'build' on dev containers, 'user' or real user on regular
-# machines (where user may use chrome - but not dev)
-add_main_user() {
-  local u=${USERNAME:-build}
-  local h=${HOME:-/home/${u}}
-  local USERID=${USERID:-1000}
-  userdel ${u} || true
-
-  echo Adding $u with $h and $USERID
-
-  useradd -u ${USERID} -g users -G users -s /bin/bash \
-         -d ${h} ${USERNAME}
-
-  # Set encrypted password (to invalid). Only ssh login
-  # or VNC
-  usermod -p '*' ${USERNAME}
-
-  #chown ${u} /home /work
-
-  # rm -rf /work && ln -s /x/work /work
-
-  usermod -a -G chrome-remote-desktop ${u} || true
-  usermod -a -G docker ${u} || true
-  usermod -a -G kvm ${u} || true
-  usermod -a -G video ${u} || true
-  usermod -a -G render ${u} || true
-
-  # access to /etc/ssl/private
-  usermod -a -G ssl-certs ${u} || true
-
-  echo "${u} ALL=NOPASSWD: ALL" >> /etc/sudoers
-
-  chmod 4755 /x/sync/app/chrome/chrome-sandbox || true
 }
 
 

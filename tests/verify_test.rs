@@ -125,66 +125,6 @@ fn has_fsverity_support() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-#[test]
-#[ignore] // Run with: sudo cargo test -p initos -- --ignored
-fn test_verify_image_e2e() {
-    if !has_fsverity_support() {
-        eprintln!("SKIP: fsverity-utils not available or not running as root");
-        return;
-    }
-
-    // Run the setup script
-    let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts");
-    let setup_script = script_dir.join("setup_test_img.sh");
-
-    let output_dir = tempfile::tempdir().unwrap();
-
-    let output = Command::new("bash")
-        .arg(&setup_script)
-        .arg(output_dir.path())
-        .output()
-        .expect("failed to run setup_test_img.sh");
-
-    if !output.status.success() {
-        eprintln!("Setup script failed:");
-        eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-        eprintln!("SKIP: setup script failed (fs-verity may not be supported)");
-        return;
-    }
-
-    eprintln!("Setup script output:");
-    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
-
-    // Read the public key
-    let pub_key_b64 = fs::read_to_string(output_dir.path().join("image_key.pub.b64"))
-        .expect("image_key.pub.b64 not found")
-        .trim()
-        .to_string();
-
-    // The setup script creates initos.erofs with verity enabled
-    // and initos.erofs.sig with the signature.
-    // We need to mount the parent filesystem to access the verity-enabled file.
-    // For the integration test, we verify using the digest + signature directly.
-    let digest_bytes =
-        fs::read(output_dir.path().join("digest.bin")).expect("digest.bin not found");
-
-    let sig_bytes =
-        fs::read(output_dir.path().join("initos.erofs.sig")).expect("initos.erofs.sig not found");
-
-    let result = initos::verify::verify_signature(&digest_bytes, &sig_bytes, &pub_key_b64)
-        .expect("verification call failed");
-
-    assert!(result, "e2e: valid image signature should verify");
-
-    // Also test with tampered digest
-    let mut bad_digest = digest_bytes.clone();
-    bad_digest[0] ^= 0xFF;
-    let result = initos::verify::verify_signature(&bad_digest, &sig_bytes, &pub_key_b64)
-        .expect("verification call failed");
-    assert!(!result, "e2e: tampered digest should NOT verify");
-}
-
 /// Test the verify_image function with an openssl-generated keypair+signature.
 /// This test creates test artifacts using openssl directly in the test,
 /// without requiring fs-verity kernel support.

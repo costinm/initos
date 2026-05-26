@@ -1,29 +1,54 @@
 #!/bin/sh
 
-# Container Run: Script to run a container with basic volumes
+# Container control: Script to run a container with opinionated volumes and layout.
 #
-# With podman, can be an OCI image or expanded rootfs, including existing rootfs as read only are used.
-# Additional volumes are added, along with tools to interact with running containers.
+# This may execute podman, docker - or bubblewrap, unshare (and eventually VMs with
+# qemu, cloud-hypervisor, etc). 
 # 
-# Why: too hard to remember the CLI of each of them.
+# Regardless of implementation tools, it expects:
 #
-# First parameter is a command - run, build, start, etc.
-# Second parameter is the name of the container/pod
+# - a command as first param (start, run, sh, etc) - $CMD
+# - a container name as second param (example-deb) - $NAME - not needed if RC_SVCNAME is set.
 #
+# Environment on host:
+# - ${HOME}/.cache/c/${NAME} - base dir, 
+# - ${HOME}/.cache/c/${NAME}/share - shared with the container as /z, 
+# - ${HOME}/.cache/c/${NAME}/.env - environment
+# - ${HOME}/.cache/c/${NAME}/mnt/ro - read only base, may be a symlink
+# - ${HOME}/.cache/c/${NAME}/rootfs - optional overlay mounted dir, may be a symlink
+# 
+# Environment in container/VM/pod:
+# - /z - shared with the host - may be virtio, bind mount for container, 9p for remote
+#    - data - shared with the host, read write
+#    - home/build - the main user.
+# 
+# Why: 
+# - too hard to remember the CLI of each tool, all are different for some reason.
+# - too much flexibility and power - and complexity as result
+# - for remote - ssh, kubectl or other tools can be used - also too many/complex/different.
+# 
+# 
 #
+# Similar to podman toolbox - but no home access.
+# toolbox [create, enter = shell, ]
+# 
 TAG=${TAG:-latest}
 REPO=${REPO:-ghcr.io/costinm/initos}
 
 
 # TODO: add ujail, chroot, lxc options
 
-CMD=$1
-shift
-NAME=$1
-shift
+# Can be started with:
+# RC_SVCNAME=NAME supervise-daemon NAME --start /x/opt/virt/vrun -- start
 
+# If not specified - default to the dev container. No UI.
+NAME=${POD:-initos_dev}
 
-DOCKER=docker
+if [ -n "${RC_SVCNAME}" ]; then
+  # If running as a service (alpine init), set the pod name to the service name.
+  NAME=${RC_SVCNAME}
+fi
+
 # Alternative: unshare -U -r --pid --fork --mount-proc --mount --uts --ipc --cgroup --propagation shared
 
 # Note that '--pid' and '--fork' go together, and will run the command as process 1.
@@ -35,138 +60,132 @@ DOCKER=docker
 # --uts -> can set hostname
 
 
-if command -v podman >/dev/null; then
-    DOCKER=podman
-    # Run as the same user ID that is calling podman
-    #export PODMAN_USERNS=keep-id
-elif command -v docker >/dev/null; then
-    DOCKER=docker
-fi
+DOCKER=podman
+# Run as the same user ID that is calling podman
+#export PODMAN_USERNS=keep-id
 
-# Run a command in an ephemeral container based on IMG.
-# Out and src are mounted.
-run() {
-    local IMG=$1
-    shift
-    
-    _mounts
+# podman unshare 
+# podman unshare --rootless-netns
+# podman system migrate
+#
+# setpriv --reuid 1000 --regid 1000 --clear-groups /bin/bash
 
-    ${DOCKER} run -it --rm \
-      ${CARGS} ${VOLS} \
-      --name $NAME \
-          ${IMG} "$@"
+# The opinionated part of the script: layout on host and guest. Fixed volumes,
+# the script shouldn't allow arbitrary mounts.
+_mounts() {
+  # Ephemeral, can be recreated - mounted as /build
+  OUT_DIR="${OUT_DIR:-${HOME}/.cache/${NAME}}"
+  mkdir -p "${OUT_DIR}" 
+
+  if [ -n "${DATA}" ]; then
+      VOLS="${VOLS} -v ${DATA}:/data"
+  fi
+  VOLS="${VOLS} -v ${OUT_DIR}:/build -e out=/build"
+
+  # Use current directory - so debug paths match.
+  VOLS="${VOLS} -v $(pwd):$(pwd) -e src=$(pwd) -w $(pwd)"
+
+  if [ -n "${SECRETS}" ]; then
+      #${HOME}/.ssh/secrets/${NAME}
+      mkdir -p ${SECRETS}
+      VOLS="${VOLS} -v ${SECRETS}:/var/run/secrets"
+  fi
 }
+
 
 # Start a container based on IMG that stays around.
 # Use exec to run commands.
 start() {
-    local IMG=$1
-    shift
+    local IMG=${1:-debian:trixie-slim}
+    
+    if ! podman container exists "$NAME"; then
+      _mounts
+      ${DOCKER} run -d \
+        ${CARGS} ${VOLS} \
+        --name $NAME \
+            ${IMG} sleep infinity
+    elif [ "$(podman inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
+      podman start "$NAME"
+    fi
+}
 
-    _mounts
+_start_bwrap() {
+  SANDBOX_HOME=${HOME}/.local/virt/${NAME}
 
-    ${DOCKER} run -d \
-      ${CARGS} ${VOLS} \
-      --name $NAME \
-          ${IMG} sleep infinity
+  mkdir -p /tmp/vm/${NAME} ${SANDBOX_HOME}
+
+  #slirp4netns --detach --netns-type=path /tmp/virt/${NAME}/agent-netns tap0
+  # And --netns ... param in bwrap
+  # Uses 10.0.2.100, requires 'ip link set up' in container, -P 8080:80 to forward
+
+  #pasta --config-net --netns /tmp/agent-netns & 
+  # -t PORT, -u PORT.
+  # passt package.
+
+  pasta --config-net \
+  bwrap \
+    --unshare-all \
+    --share-net \
+    --hostname "agent-sandbox" \
+    --netns /tmp/virt/${NAME}/agent-netns \
+    --proc /proc \
+    --dev /dev \
+    --tmpfs /tmp \
+    --tmpfs /run \
+    --dir "$SANDBOX_HOME" \
+    --setenv HOME "$SANDBOX_HOME" \
+    --ro-bind /usr /usr \
+    --ro-bind /bin /bin \
+    --ro-bind /lib /lib \
+    --ro-bind /lib64 /lib64 \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --ro-bind /etc/ssl /etc/ssl \
+    --bind "$PROJECT_DIR" "$PROJECT_DIR" \
+    --chdir "$PROJECT_DIR" \
+    --die-with-parent \
+  /usr/bin/tmux new-session -s agent-control
+}
+
+_tmux_attach() {
+  # Find the PID of the bwrap process
+  AGENT_PID=$(pgrep -f "agent-sandbox")
+  # Enter the namespace to attach
+  sudo nsenter -t $AGENT_PID -m -u -i -n -p tmux attach -t agent-control
+}
+
+_start_x11() {
+  bwrap ... \
+  --setenv DISPLAY :99 \
+  /usr/bin/bash -c "Xvfb :99 -screen 0 1280x1024x24 & your-agent-command"
 }
 
 stop() {
   ${DOCKER} rm -f ${NAME}
 }
 
-_mounts() {
-    mkdir -p ${HOME}/.cache/${NAME} 
 
-    if [ -n "${DATA}" ]; then
-        VOLS="${VOLS} -v ${DATA}:/data -e out=/data"
-    else
-        VOLS="${VOLS} -v ${HOME}/.cache/${NAME}:/data -e out=/data"
-    fi
-
-    VOLS="${VOLS} -v $(pwd):/ws -e src=/ws"
-
-    if [ -n "${SECRETS}" ]; then
-        #${HOME}/.ssh/secrets/${NAME}
-        mkdir -p ${SECRETS}
-        VOLS="${VOLS} -v ${SECRETS}:/var/run/secrets"
-    fi
-}
-
-
-exec() {
+sh() {
     ${DOCKER} exec -it ${NAME} "$@"
 }
 
-# cpimg copies the content of an image to a dir. 
-cpimg() {
-  SRC=$1
-  DST=$2
-
-  ${DOCKER} run --rm \
-    --mount type=image,source=$SRC,destination=/src \
-    -v $DST:/out \
-    alpine \
-      cp -a /src/* /out/
+enter() {
+    ${DOCKER} exec -it ${NAME} bash "$@"
 }
 
-
-docker_extract() {
-  img=${1}
-  mkdir ${WORK}/rootfs
-
-  docker export $img | \
-    (cd ${WORK}/rootfs && tar -xf  - )
+_bwrap() {
+  bwrap \
+  --ro-bind /usr /usr \
+  --ro-bind /bin /bin \
+  --ro-bind /lib /lib \
+  --ro-bind /lib64 /lib64 \
+  --bind "$PWD" "$PWD" \
+  --tmpfs /tmp \
+  --unshare-all \
+  --hostname $NAME \
+  --die-with-parent \
+  /usr/bin/bash -c "$@"
 }
 
-# Export with crane - image must be remote or created.
-exportfs_crane() {
-    local IMG=$1
-    shift
-
-    crane export ${IMG} | tar -C $NAME -xf -
-}
-
-exportfs_podman() {
-    local IMG=$1
-    shift
-
-    local mount_path=$(podman unshare podman image mount $IMG)
-
-    cp -rp $mount_path ./
-
-    podman unshare podman image unmount $IMG
-}
-
-
-build() {
-    # -f PATH/Dockerfile
-    # --build-arg KEY=VALUE
-    # --cache-from IMAGE -
-    # --network host
-    # -o DEST (type=local,dest=path)
-    # --progress plain|tty
-    # --pull - get newer images
-    # --secret id=mysecret,src=PATH
-    # -t name:tag
-    # --target - which part of the dockerfile
-    # 
-    # Podman specific:
-    # --authfile FILE
-    # --cache-to - cache destinations
-    # --creds USER:pass
-    # --layers
-    # --force-rm - remove intermediate even on failure (true by default)
-    # --format oci
-    # --from - replaces the first FROM - better to use build-arg
-    # --omit-history
-    # --squash - new build layers are merged
-    # --squash-all - all layers are merged
-    # --stdin
-    # -v - mount volume
-
-    ${DOCKER} build -t ${NAME} "$@" .
-}
 
 
 x11container() {
@@ -190,10 +209,6 @@ x11container() {
     echo $VOL $ENV
 }
 
-clean() {
-    docker rmi $(docker images -q)
-    docker image prune -a -f
-}
 
 ### CHROOT BASED (full access to host)
 
@@ -283,5 +298,24 @@ priv() {
 
 }
 
+setup() {
+   #docker network create -d ipvlan --subnet 192.168.0.0/17 --gateway 192.168.1.254 --ip-range 192.168.7.0/24 -o parent=br-lan ipvl
+   #docker network create --ipv6 --driver=bridge -o 'com.docker.network.bridge.name=br-lan' br-lan
+   docker network create  -d macvlan -o parent br-lan --subnet 192.168.0.0/17 --gateway 192.168.1.254 
+}
 
-${CMD} "$@"
+CMD=$1
+[ $# -gt 0 ] && shift
+
+case $CMD in
+start) start "$@" ;;
+stop) stop "$@" ;;
+cmd) shift; "$@" ;;
+*)
+  if [ -z "${CMD}" ]; then
+    enter
+  else
+    sh "${CMD}" "$@"
+  fi ;;
+esac
+

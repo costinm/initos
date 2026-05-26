@@ -24,7 +24,7 @@ struct SwtpmSession {
 
 impl SwtpmSession {
     /// Start swtpm and connect to it. Returns a ready-to-use session.
-    fn start() -> Self {
+    fn start() -> Result<Self, String> {
         let state_dir = TempDir::new().expect("failed to create temp dir for swtpm state");
         let port = NEXT_PORT.fetch_add(2, Ordering::SeqCst);
         let ctrl_port = port + 1;
@@ -45,7 +45,7 @@ impl SwtpmSession {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("failed to start swtpm — is it installed?");
+            .map_err(|e| format!("failed to start swtpm - is it installed? {e}"))?;
 
         // Wait for swtpm to start listening
         let mut stream = None;
@@ -58,15 +58,33 @@ impl SwtpmSession {
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
             }
         }
-        let stream = stream.expect("failed to connect to swtpm after 2s");
+        let stream = match stream {
+            Some(stream) => stream,
+            None => {
+                let mut process = process;
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(format!("failed to connect to swtpm on 127.0.0.1:{port} after 2s"));
+            }
+        };
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-            .unwrap();
+            .map_err(|e| format!("set swtpm read timeout: {e}"))?;
 
-        SwtpmSession {
+        Ok(SwtpmSession {
             _process: process,
             stream,
             _state_dir: state_dir,
+        })
+    }
+}
+
+fn start_swtpm_or_skip() -> Option<SwtpmSession> {
+    match SwtpmSession::start() {
+        Ok(session) => Some(session),
+        Err(e) => {
+            eprintln!("SKIP: {e}");
+            None
         }
     }
 }
@@ -95,7 +113,9 @@ impl Write for SwtpmSession {
 
 #[test]
 fn test_create_primary() {
-    let mut tpm = SwtpmSession::start();
+    let Some(mut tpm) = start_swtpm_or_skip() else {
+        return;
+    };
 
     // Create an RSA-2048 primary storage key
     let transient_handle = initos::tpm2::create_primary(&mut tpm).expect("create_primary failed");
@@ -118,7 +138,9 @@ fn test_create_primary() {
 
 #[test]
 fn test_create_primary_and_persist() {
-    let mut tpm = SwtpmSession::start();
+    let Some(mut tpm) = start_swtpm_or_skip() else {
+        return;
+    };
 
     // Create primary key
     let transient = initos::tpm2::create_primary(&mut tpm).expect("create_primary failed");
@@ -137,7 +159,9 @@ fn test_create_primary_and_persist() {
 
 #[test]
 fn test_seal_and_unseal() {
-    let mut tpm = SwtpmSession::start();
+    let Some(mut tpm) = start_swtpm_or_skip() else {
+        return;
+    };
 
     // 1. Create primary key (keep as transient)
     let primary = initos::tpm2::create_primary(&mut tpm).expect("create_primary failed");
@@ -205,7 +229,9 @@ fn test_seal_and_unseal() {
 /// This mirrors the actual `initos primary` + `initos seal` + `initos unseal` flow.
 #[test]
 fn test_full_seal_unseal_with_persist() {
-    let mut tpm = SwtpmSession::start();
+    let Some(mut tpm) = start_swtpm_or_skip() else {
+        return;
+    };
 
     // 1. Create and persist primary key (mirrors `cmd_primary`)
     let transient_primary = initos::tpm2::create_primary(&mut tpm).expect("create_primary failed");

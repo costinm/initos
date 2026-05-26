@@ -1,0 +1,13 @@
+## Networking hardware for host
+CONFIG_ETHERNET=y
+CONFIG_E1000=y
+
+CONFIG_NLMON=m
+CONFIG_BAREUDP=m
+
+# 2. Enable Wireless 
+CONFIG_WLAN=y
+
+CONFIG_IWLWIFI=m
+CONFIG_IWLMVM=m
+

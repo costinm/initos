@@ -1,0 +1,17 @@
+# --- Enabling TPM 2.0 Stack ---
+# 1. Core TPM Support (Built-in)
+CONFIG_TCG_TPM=y
+CONFIG_HW_RANDOM_TPM=y
+
+# 2. TPM 2.0 Specifics
+CONFIG_TCG_TIS=y
+CONFIG_TCG_TIS_I2C_INFINEON=y
+
+# 3. Interface: Choose based on your Laptop CPU
+CONFIG_TCG_CRB=y
+CONFIG_TCG_TIS_SPI=y
+
+# 4. Security Extensions
+CONFIG_TRUSTED_KEYS=y
+CONFIG_ENCRYPTED_KEYS=y
+CONFIG_KEY_NOTIFICATIONS=y

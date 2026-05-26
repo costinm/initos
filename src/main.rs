@@ -6,16 +6,18 @@
 //!   lock_tpm               Extend PCR 7 to prevent further unsealing
 //!   primary                Create a TPM2 primary key and persist it, required for seal.
 //!   seal <SECRET>          Seal a key to TPM2 with PCR SHA256:7 policy
-//!   fscrypt <PATH>         Unseal key + add to filesystem keyring (unlock)
-//!   fscrypt-setup <DIR>    Unseal key + add to keyring + set encryption policy
+//!   fscrypt <PATH>         Check FSCRYPT_KEY env or prompt for key + add to filesystem keyring (unlock)
+//!   fscrypt-setup <DIR>    Check FSCRYPT_KEY env or prompt for key + add to keyring + set encryption policy
 //!   boot                   Full initrd boot sequence (mount, verify, switch_root)
 //!   mount <IMG> <DIR>      Verify verity SHA matches the .sig, and loop-mount an image
 //!   verify <IMG>           Verify fsverity digest + .sig signature of an image
-//!   efi                    Read EFI variables (SecureBoot, BootCurrent, PK)
-//!   encrypt [ARGS]         Encrypt stdin using age to x25519 recipients (args)
-//!   decrypt                Decrypt stdin using age with x25519 identity from KEY_FILE
+//!   efi                    Read EFI variables (SecureBoot, BootCurrent, db)
+//!   encrypt [ARGS]         Encrypt stdin using age to x25519 recipients (args).
+//!   decrypt                Decrypt stdin using age with x25519 identity from KEY_FILE or KEY
+//!   recovery-encrypt <SECRET> [PUB_KEY]
+//!                          Encrypt a secret for recovery using an Ed25519 public key.
 //!
-//! Environment:
+//! Environment for initrd boot:
 //!   INITOS_PUB_KEY   base64 ed25519 public key (empty = skip verification)
 //!   INITOS_IMG       image path (default: /img/initos.erofs, boot mode)
 //!   INITOS_DATA      partition label (default: STATE, boot mode)
@@ -24,7 +26,6 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::process;
-use std::str::FromStr;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -77,13 +78,33 @@ fn main() {
                 cmd_verify(&args[2])
             }
             "efi" => cmd_efi(),
-            "encrypt" => cmd_encrypt(),
-            "decrypt" => cmd_decrypt(),
+            "encrypt" => initos::cmd::cmd_encrypt(),
+            "decrypt" => initos::cmd::cmd_decrypt(),
+            "recovery-encrypt" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: initos recovery-encrypt <SECRET> [PUB_KEY_B64]");
+                    process::exit(1);
+                }
+                let pub_key = if args.len() >= 4 {
+                    args[3].clone()
+                } else {
+                    match env::var("INITOS_PUB_KEY") {
+                        Ok(key) => key,
+                        Err(_) => {
+                            eprintln!("PUB_KEY_B64 argument or INITOS_PUB_KEY is required");
+                            process::exit(1);
+                        }
+                    }
+                };
+                initos::cmd::cmd_recovery_encrypt(&args[2], &pub_key)
+            }
+            "help" | "--help" | "-h" => {
+                initos::cmd::print_help();
+                Ok(())
+            }
             other => {
                 eprintln!("Unknown command: {}", other);
-                eprintln!(
-                    "Usage: initos [unseal|lock_tpm|primary|seal|fscrypt|fscrypt-setup|boot|mount|verify|efi|encrypt|decrypt] ..."
-                );
+                initos::cmd::print_help();
                 process::exit(1);
             }
         }
@@ -121,28 +142,7 @@ fn cmd_lock_tpm() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Get the fscrypt key: from FSCRYPT_KEY env var if set, otherwise from TPM unseal.
-/// AES-256-XTS requires a 64-byte raw key; short keys are padded by repeating.
-fn get_fscrypt_key() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if let Ok(key_str) = env::var("FSCRYPT_KEY") {
-        let raw = key_str.into_bytes();
-        if raw.is_empty() {
-            return Err("FSCRYPT_KEY is empty".into());
-        }
-        // Pad to 64 bytes (AES-256-XTS needs 64) by repeating key material
-        let mut key = vec![0u8; 64];
-        for i in 0..64 {
-            key[i] = raw[i % raw.len()];
-        }
-        eprintln!(
-            "initos: using FSCRYPT_KEY from environment ({} raw bytes, padded to 64)",
-            raw.len()
-        );
-        Ok(key)
-    } else {
-        unseal_key()
-    }
-}
+
 
 /// Unseal and print to stdout.
 fn cmd_unseal() -> Result<(), Box<dyn std::error::Error>> {
@@ -151,9 +151,9 @@ fn cmd_unseal() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fscrypt unlock: get key (env or TPM), add to filesystem keyring.
+/// Fscrypt unlock: get key, add to filesystem keyring.
 fn cmd_fscrypt(mountpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let key = get_fscrypt_key()?;
+    let key = initos::cmd::get_fscrypt_key()?;
     let identifier = initos::fscrypt::add_key(mountpoint, &key)?;
     eprintln!(
         "initos: fscrypt key added (id={}) on {}",
@@ -163,9 +163,9 @@ fn cmd_fscrypt(mountpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fscrypt setup: get key (env or TPM), add to keyring, set v2 policy on empty directory.
+/// Fscrypt setup: get key (env or prompt), add to keyring, set v2 policy on empty directory.
 fn cmd_fscrypt_setup(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let key = get_fscrypt_key()?;
+    let key = initos::cmd::get_fscrypt_key()?;
     let identifier = initos::fscrypt::add_key(dir, &key)?;
     eprintln!(
         "initos: fscrypt key added (id={})",
@@ -198,84 +198,11 @@ fn cmd_primary() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Encrypt the secret for recovery using the provided base64 Ed25519 public key.
-/// Returns the encrypted data (ephemeral public key + nonce + ciphertext).
-fn encrypt_for_recovery(
-    secret: &[u8],
-    pub_key_b64: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    use base64::Engine;
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    use rand_core::{OsRng, RngCore};
 
-    // Decode base64 Ed25519 public key
-    let pub_key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(pub_key_b64)
-        .map_err(|e| format!("bad base64 pub_key: {}", e))?;
-    if pub_key_bytes.len() != 32 {
-        return Err("ed25519 public key must be 32 bytes".into());
-    }
-
-    // Convert Ed25519 public key to X25519 public key (Montgomery point)
-    let compressed_y = CompressedEdwardsY::from_slice(&pub_key_bytes)
-        .map_err(|_| "Invalid Ed25519 public key length")?;
-    let edwards_pt = compressed_y
-        .decompress()
-        .ok_or("Invalid Ed25519 public key point")?;
-    let target_montgomery = edwards_pt.to_montgomery();
-
-    // Generate ephemeral X25519 keypair
-    let mut rng = OsRng;
-    let mut ephemeral_secret_bytes = [0u8; 32];
-    rng.fill_bytes(&mut ephemeral_secret_bytes);
-    let ephemeral_secret =
-        curve25519_dalek::scalar::Scalar::from_bytes_mod_order(ephemeral_secret_bytes);
-    let ephemeral_public = curve25519_dalek::constants::X25519_BASEPOINT * ephemeral_secret;
-    let ephemeral_pub_bytes = ephemeral_public.to_bytes();
-
-    // Compute Diffie-Hellman shared secret
-    let shared_secret = ephemeral_secret * target_montgomery;
-
-    // Hash the shared secret (using SHA-256 for a 32-byte ChaCha20 key)
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(shared_secret.to_bytes());
-    let symmetric_key = hasher.finalize();
-
-    // Encrypt the secret using ChaCha20Poly1305
-    let cipher = ChaCha20Poly1305::new(&symmetric_key);
-    let mut nonce_bytes = [0u8; 12];
-    rng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, secret)
-        .map_err(|e| format!("Encryption failed: {:?}", e))?;
-
-    // Format: [ephemeral_pub_bytes (32)] + [nonce (12)] + [ciphertext]
-    let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
-    result.extend_from_slice(&ephemeral_pub_bytes);
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-
-    Ok(result)
-}
 
 /// Seal: create trial policy, create sealed object, load, persist, save handle.
 fn cmd_seal(secret: &str) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(initos::tpm2::TPM_DIR)?;
-
-    // Recovery encryption (if INITOS_PUB_KEY is provided)
-    if let Ok(pub_key) = env::var("INITOS_PUB_KEY") {
-        if !pub_key.is_empty() {
-            eprintln!("initos: encrypting sealed secret for recovery");
-            let encrypted = encrypt_for_recovery(secret.as_bytes(), &pub_key)?;
-            let recovery_path = format!("{}/recovery", initos::tpm2::TPM_DIR);
-            fs::write(&recovery_path, encrypted)?;
-            eprintln!("initos: saved recovery data to {}", recovery_path);
-        }
-    }
 
     let primary = initos::tpm2::read_handle_file(
         initos::tpm2::PRIMARY_HANDLE_PATH,
@@ -328,23 +255,30 @@ fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
     let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
     let img = env::var("INITOS_IMG").unwrap_or_else(|_| "/img/initos.erofs".to_string());
     let data = env::var("INITOS_DATA").unwrap_or_else(|_| "STATE".to_string());
+    let init = env::var("INITOS_INIT")
+        .unwrap_or_else(|_| "/opt/initos/bin/initos-init-ver".to_string());
     eprintln!(
-        "initos: boot mode (PID {}) img={} data={}",
+        "initos: boot mode (PID {}) img={} data={} init={}",
         process::id(),
         img,
-        data
+        data,
+        init
     );
 
     // 1. Mount pseudo-filesystems
     for (fs, mp) in [("proc", "/proc"), ("sysfs", "/sys"), ("devtmpfs", "/dev")] {
         eprintln!("initos: mounting {}", fs);
-        initos::mount::mount_pseudo_fs(fs, mp)?;
+        match initos::mount::mount_pseudo_fs(fs, mp) {
+            Ok(_) => {}
+            // May happen in debug mode if already mounted
+            Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
+        };
     }
 
-    // 2. Find and mount STATE partition
-    eprintln!("initos: looking for partition '{}'", data);
+    // 2. Find and mount STATE device
+    eprintln!("initos: looking for data device '{}'", data);
     let dev = initos::mount::find_partition_by_label(&data)?;
-    eprintln!("initos: found partition: {:?}", dev);
+    eprintln!("initos: found data device: {:?}", dev);
 
     let mount_point = "/mnt/data";
     initos::mount::mount_filesystem(dev.to_str().unwrap(), mount_point, "ext4", false)?;
@@ -358,9 +292,13 @@ fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("initos: mounting image at {}", root_mount);
     initos::mount::mount_loop(&img_path, root_mount)?;
 
+    let state_mount = format!("{}/z", root_mount);
+    eprintln!("initos: binding {} to {}", mount_point, state_mount);
+    initos::mount::bind_mount(mount_point, &state_mount)?;
+
     // 5. Switch root
-    eprintln!("initos: switching root to {}", root_mount);
-    initos::mount::switch_root(root_mount, "/bin/initos-init")?;
+    eprintln!("initos: switching root to {} init={}", root_mount, init);
+    initos::mount::switch_root(root_mount, &init)?;
     Ok(())
 }
 
@@ -407,105 +345,14 @@ fn verify_image_if_key(img: &str, pub_key: &str) -> Result<(), Box<dyn std::erro
 
 /// Read and display EFI variables.
 fn cmd_efi() -> Result<(), Box<dyn std::error::Error>> {
-    let base_path = env::var("INITOS_EFI_PATH")
-        .unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+    let base_path =
+        env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
     let info = initos::efi::read_efi_info(&base_path)?;
     print!("{}", info);
     Ok(())
 }
 
-/// Encrypt stdin using age with x25519 recipients from args and/or scrypt passphrase from KEY env.
-fn cmd_encrypt() -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Read;
 
-    let args: Vec<String> = std::env::args().skip(2).collect();
-
-    let mut plaintext = Vec::new();
-    io::stdin().read_to_end(&mut plaintext)?;
-
-    let mut recipients: Vec<Box<dyn age::Recipient>> = Vec::new();
-
-    // Add scrypt passphrase recipient if KEY is set
-    if let Ok(pass) = env::var("KEY") {
-        if !pass.is_empty() {
-            recipients.push(Box::new(age::scrypt::Recipient::new(pass.into())));
-        }
-    }
-
-    // Add x25519 recipients from args
-    for key_str in &args {
-        if let Ok(recip) = age::x25519::Recipient::from_str(key_str) {
-            recipients.push(Box::new(recip));
-        }
-    }
-
-    if recipients.is_empty() {
-        return Err("need KEY env var or at least one x25519 recipient argument".into());
-    }
-
-    let encryptor =
-        age::Encryptor::with_recipients(recipients.iter().map(|r| &**r as &dyn age::Recipient))
-            .map_err(|e| format!("encryptor: {}", e))?;
-
-    let mut writer = encryptor
-        .wrap_output(io::stdout())
-        .map_err(|e| format!("wrap_output: {}", e))?;
-    writer
-        .write_all(&plaintext)
-        .map_err(|e| format!("write: {}", e))?;
-    writer.finish().map_err(|e| format!("finish: {}", e))?;
-
-    Ok(())
-}
-
-/// Decrypt stdin using age with scrypt passphrase from KEY env var or x25519 from KEY_FILE.
-fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Read;
-
-    let mut cipher = Vec::new();
-    io::stdin().read_to_end(&mut cipher)?;
-
-    let mut identities: Vec<Box<dyn age::Identity>> = Vec::new();
-
-    // Try scrypt passphrase from KEY
-    if let Ok(pass) = env::var("KEY") {
-        if !pass.is_empty() {
-            identities.push(Box::new(age::scrypt::Identity::new(pass.into())));
-        }
-    } else if let Ok(key_file) = env::var("KEY_FILE") {
-        // Try x25519 identity from file
-        let content = fs::read_to_string(key_file)?;
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Ok(identity) = age::x25519::Identity::from_str(line) {
-                identities.push(Box::new(identity));
-            }
-        }
-    }
-
-    if identities.is_empty() {
-        return Err("need KEY env var or KEY_FILE env var with x25519 identity".into());
-    }
-
-    let decryptor = age::Decryptor::new(std::io::Cursor::new(&cipher))
-        .map_err(|e| format!("decryptor: {}", e))?;
-    let mut reader = decryptor
-        .decrypt(identities.iter().map(|i| &**i as &dyn age::Identity))
-        .map_err(|e| format!("decrypt: {}", e))?;
-
-    let mut result = Vec::new();
-    reader
-        .read_to_end(&mut result)
-        .map_err(|e| format!("read: {}", e))?;
-    io::stdout()
-        .write_all(&result)
-        .map_err(|e| format!("write: {}", e))?;
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -514,6 +361,7 @@ mod tests {
     use std::io::Cursor;
     use std::io::Read;
     use std::process::Command;
+    use std::str::FromStr;
     use tempfile::NamedTempFile;
 
     fn gen_keypair() -> (String, String) {
@@ -552,6 +400,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_encrypt_compatible_with_age_cli() -> Result<(), Box<dyn std::error::Error>> {
         let (identity, recipient) = gen_keypair();
         let plaintext = b"test encrypt compatible";
@@ -587,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_age_cli_encrypt_compatible_with_decrypt() -> Result<(), Box<dyn std::error::Error>> {
         let (identity, recipient) = gen_keypair();
         let plaintext = b"test decrypt compatible";
@@ -619,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_scrypt_encrypt_decrypt() -> Result<(), Box<dyn std::error::Error>> {
         let plaintext = b"test scrypt";
         let pass = "testpassphrase123".to_string();
@@ -642,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_scrypt_compatible_with_age_cli() -> Result<(), Box<dyn std::error::Error>> {
         let pass = "testpassphrase456".to_string();
         let plaintext = b"scrypt compatible test";
@@ -682,4 +534,130 @@ mod tests {
         assert_eq!(&decrypted[..], plaintext);
         Ok(())
     }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_with_ID_env_var() -> Result<(), Box<dyn std::error::Error>> {
+        let (identity_str, recipient) = gen_keypair();
+        let plaintext = b"test decrypt with ID env var";
+        let encrypted = encrypt_for_test(&recipient, plaintext)?;
+
+        // Test with ID environment variable
+        let mut env = std::collections::HashMap::new();
+        env.insert("ID".to_string(), identity_str.clone());
+
+        let mut status = Command::new("initos")
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .args(["decrypt"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Write encrypted data to the process stdin
+        let mut stdin = status.stdin.take().unwrap();
+        stdin.write_all(&encrypted)?;
+        drop(stdin);
+
+        let output = status.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "initos decrypt with ID failed: {:?}",
+            output
+        );
+        assert_eq!(&output.stdout[..], plaintext);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_with_raw_key_on_stdin() -> Result<(), Box<dyn std::error::Error>> {
+        let (identity_str, recipient) = gen_keypair();
+        let plaintext = b"test decrypt with key on stdin";
+        let encrypted = encrypt_for_test(&recipient, plaintext)?;
+
+        // Create a temp file with encrypted data only (no identity)
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+        drop(cipher_file);
+
+        // Pass identity directly on stdin
+        let mut encrypted_bytes = Vec::new();
+        encrypted_bytes.extend_from_slice(identity_str.as_bytes());
+        encrypted_bytes.push(b'\n');
+
+        let mut status = Command::new("initos")
+            .args(["decrypt"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Write identity followed by encrypted data to stdin
+        let mut stdin = status.stdin.take().unwrap();
+        stdin.write_all(&identity_str.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.write_all(&encrypted)?;
+        drop(stdin);
+
+        let output = status.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "initos decrypt with key on stdin failed: {:?}",
+            output
+        );
+        assert_eq!(&output.stdout[..], plaintext);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_with_KEY_FILE_env_var() -> Result<(), Box<dyn std::error::Error>> {
+        let (identity_str, recipient) = gen_keypair();
+        let plaintext = b"test decrypt with KEY_FILE env var";
+        let encrypted = encrypt_for_test(&recipient, plaintext)?;
+
+        // Create temp file with identity for KEY_FILE
+        let mut key_file = NamedTempFile::new()?;
+        key_file.write_all(identity_str.as_bytes())?;
+        key_file.flush()?;
+        let key_path = key_file.path().to_owned();
+        drop(key_file);
+
+        // Create temp file with encrypted data
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+        let cipher_path = cipher_file.path().to_owned();
+        drop(cipher_file);
+
+        // Test with KEY_FILE environment variable
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "KEY_FILE".to_string(),
+            key_path.to_string_lossy().to_string(),
+        );
+
+        let mut status = Command::new("initos")
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .args(["decrypt"])
+            .stdin(std::process::Stdio::from(std::fs::File::open(
+                &cipher_path,
+            )?))
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let output = status.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "initos decrypt with KEY_FILE failed: {:?}",
+            output
+        );
+        assert_eq!(&output.stdout[..], plaintext);
+        Ok(())
+    }
+
 }

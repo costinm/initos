@@ -3,7 +3,7 @@
 //! Reads raw EFI variable files from `/sys/firmware/efi/efivars/` and parses:
 //! - `SecureBoot` → 0 or 1
 //! - `BootCurrent` → boot entry number (u16)
-//! - `PK` (Platform Key) → list of X.509 certificates with public keys and SANs
+//! - `db` (Signature Database) → list of X.509 certificates with public keys and SANs
 
 use std::fmt;
 use std::fs;
@@ -13,11 +13,13 @@ use std::path::Path;
 use base64::Engine;
 use x509_cert::der::{Decode, Encode};
 
-/// Default sysfs path for EFI variables.
-const EFIVARS_DIR: &str = "/sys/firmware/efi/efivars";
+
 
 /// EFI global variable GUID.
 const EFI_GLOBAL_GUID: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+
+/// EFI Image Security Database GUID (used for db, dbx, dbt, dbr).
+const EFI_IMAGE_SECURITY_DB_GUID: &str = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
 
 /// EFI_CERT_X509_GUID: {a5c059a1-94e4-4aa7-87b5-ab155c2bf072}
 const EFI_CERT_X509_GUID: [u8; 16] = [
@@ -27,7 +29,7 @@ const EFI_CERT_X509_GUID: [u8; 16] = [
 
 /// An X.509 certificate extracted from an EFI Signature List.
 #[derive(Debug)]
-pub struct PkCert {
+pub struct EfiCert {
     /// Base64-encoded SubjectPublicKeyInfo (DER).
     pub public_key_b64: String,
     /// Subject Common Name.
@@ -36,7 +38,7 @@ pub struct PkCert {
     pub sans: Vec<String>,
 }
 
-impl fmt::Display for PkCert {
+impl fmt::Display for EfiCert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} CN={}", self.public_key_b64, self.cn)?;
         if !self.sans.is_empty() {
@@ -109,7 +111,7 @@ pub fn read_boot_current(base_path: &str) -> io::Result<u16> {
 ///   [16 bytes] SignatureOwner GUID
 ///   [SignatureSize - 16 bytes] DER X.509 certificate
 /// ```
-pub fn parse_esl(data: &[u8]) -> io::Result<Vec<PkCert>> {
+pub fn parse_esl(data: &[u8]) -> io::Result<Vec<EfiCert>> {
     let mut certs = Vec::new();
     let mut offset = 0;
 
@@ -168,14 +170,21 @@ pub fn parse_esl(data: &[u8]) -> io::Result<Vec<PkCert>> {
     Ok(certs)
 }
 
-/// Read PK (Platform Key) EFI variable. Returns parsed certificates.
-pub fn read_pk(base_path: &str) -> io::Result<Vec<PkCert>> {
-    let payload = read_efi_var("PK", base_path)?;
-    parse_esl(&payload)
+/// Read db (Signature Database) EFI variable. Returns parsed certificates.
+pub fn read_db(base_path: &str) -> io::Result<Vec<EfiCert>> {
+    let path = format!("{}/db-{}", base_path, EFI_IMAGE_SECURITY_DB_GUID);
+    let data = std::fs::read(&path)?;
+    if data.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("EFI variable too short: {} bytes", data.len()),
+        ));
+    }
+    parse_esl(&data[4..])
 }
 
 /// Parse a DER-encoded X.509 certificate, extracting the public key and SANs.
-fn parse_x509_cert(der_bytes: &[u8]) -> io::Result<PkCert> {
+fn parse_x509_cert(der_bytes: &[u8]) -> io::Result<EfiCert> {
     let cert = x509_cert::Certificate::from_der(der_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("DER parse: {}", e)))?;
 
@@ -194,7 +203,7 @@ fn parse_x509_cert(der_bytes: &[u8]) -> io::Result<PkCert> {
     // Extract SANs from extensions
     let sans = extract_sans(tbs);
 
-    Ok(PkCert {
+    Ok(EfiCert {
         public_key_b64,
         cn,
         sans,
@@ -291,16 +300,16 @@ pub fn read_efi_info(base_path: &str) -> io::Result<String> {
         Err(e) => out.push_str(&format!("BootCurrent: error: {}\n", e)),
     }
 
-    match read_pk(base_path) {
+    match read_db(base_path) {
         Ok(certs) => {
             for (i, cert) in certs.iter().enumerate() {
-                out.push_str(&format!("PK[{}]: {} CN={}\n", i, cert.public_key_b64, cert.cn));
+                out.push_str(&format!("db[{}]: {} CN={}\n", i, cert.public_key_b64, cert.cn));
                 if !cert.sans.is_empty() {
-                    out.push_str(&format!("PK[{}] SAN: {}\n", i, cert.sans.join(", ")));
+                    out.push_str(&format!("db[{}] SAN: {}\n", i, cert.sans.join(", ")));
                 }
             }
         }
-        Err(e) => out.push_str(&format!("PK: error: {}\n", e)),
+        Err(e) => out.push_str(&format!("db: error: {}\n", e)),
     }
 
     Ok(out)
@@ -332,11 +341,11 @@ mod tests {
     }
 
     #[test]
-    fn test_efi_pk() {
-        let path = test_data_dir().join("PK-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+    fn test_efi_db() {
+        let path = test_data_dir().join("db-d719b2cb-3d3a-4596-a3bc-dad00e67656f");
         let payload = read_efi_var_file(&path).unwrap();
         let certs = parse_esl(&payload).unwrap();
-        assert_eq!(certs.len(), 1, "test PK should contain exactly 1 cert");
+        assert_eq!(certs.len(), 1, "test db should contain exactly 1 cert");
         let cert = &certs[0];
         assert!(
             cert.cn.contains("webinf.info"),
@@ -347,7 +356,7 @@ mod tests {
             !cert.public_key_b64.is_empty(),
             "public key should not be empty"
         );
-        eprintln!("PK cert: {}", cert);
+        eprintln!("db cert: {}", cert);
     }
 
     #[test]
@@ -377,7 +386,7 @@ mod tests {
     #[test]
     #[ignore] // Run on EFI system: cargo test test_efi_live -- --ignored
     fn test_efi_live() {
-        let info = read_efi_info(EFIVARS_DIR).unwrap();
+        let info = read_efi_info("/sys/firmware/efi/efivars").unwrap();
         eprintln!("{}", info);
     }
 }
