@@ -19,7 +19,7 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 
 cd "${src}"
 
-PATH=${src}/prebuilt/bin:${src}/sidecar/bin:$PATH
+PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 cctl() {
     OUT_DIR="${out}/c/${POD:-initos_dev}" command cctl "$@"
@@ -100,7 +100,7 @@ build_initos() {
     
     INITOS_IMG=${ROOTFS_IMG}
     HASH_OFFSET=$(stat -c %s "${INITOS_IMG}")
-    VERITY_OUT=$(/sbin/veritysetup format --hash-offset=$HASH_OFFSET "${INITOS_IMG}" "${INITOS_IMG}")
+    VERITY_OUT=$(veritysetup format --hash-offset=$HASH_OFFSET "${INITOS_IMG}" "${INITOS_IMG}")
     
     ROOT_HASH=$(echo "$VERITY_OUT" | awk '/Root hash:/ {print $3}')
     SALT=$(echo "$VERITY_OUT" | awk '/Salt:/ {print $2}')
@@ -187,11 +187,11 @@ _build_fat_image() {
     local img_name="${2:?Usage: _build_fat_image <boot_path> <img_name>}"
     local img_file="${IMG_DIR}/${img_name}"
 
-    # Calculate size: dir contents + 20% overhead, min 32MB
+    # Calculate size: dir contents + 20% overhead, min 34MB (FAT32 needs ≥65525 clusters)
     local dir_size_kb img_size_mb
     dir_size_kb=$(du -sk "${boot_path}" | cut -f1)
     img_size_mb=$(( (dir_size_kb * 12 / 10 / 1024) + 1 ))
-    [ "${img_size_mb}" -lt 32 ] && img_size_mb=32
+    [ "${img_size_mb}" -lt 64 ] && img_size_mb=64
 
     echo "  Building FAT image: ${img_file} (${img_size_mb}MB)"
 
@@ -388,7 +388,7 @@ build_qemu_state() {
     mkdir -p "${genimage_dir}"
     dd if=/dev/zero of="${genimage_dir}/${data_img}" bs=1M count="${state_size_mb}" status=none
 
-    /usr/sbin/mkfs.ext4 -q -F -b 4096 \
+    mkfs.ext4 -q -F -b 4096 \
         -O inline_data,extents,uninit_bg,dir_index,has_journal,verity,encrypt \
         -L "STATE" -d "${out}/disks/state" \
         "${genimage_dir}/${data_img}"
