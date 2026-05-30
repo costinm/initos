@@ -19,7 +19,7 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 
 cd "${src}"
 
-PATH=${src}/prebuilt/bin:${src}/sidecar/bin:$PATH
+PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 cctl() {
     OUT_DIR="${out}/c/${POD:-initos_dev}" command cctl "$@"
