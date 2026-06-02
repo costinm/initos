@@ -572,6 +572,17 @@ mod tests {
         let plaintext = b"test decrypt with key on stdin";
         let encrypted = encrypt_for_test(&recipient, plaintext)?;
 
+        // Create a temp file with encrypted data only (no identity)
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+        drop(cipher_file);
+
+        // Pass identity directly on stdin
+        let mut encrypted_bytes = Vec::new();
+        encrypted_bytes.extend_from_slice(identity_str.as_bytes());
+        encrypted_bytes.push(b'\n');
+
         let mut status = Command::new("initos")
             .args(["decrypt"])
             .stdin(std::process::Stdio::piped())
@@ -634,7 +645,6 @@ mod tests {
             output
         );
         assert_eq!(&output.stdout[..], plaintext);
-        // Temp files cleaned up when key_file/cipher_file go out of scope
         Ok(())
     }
 

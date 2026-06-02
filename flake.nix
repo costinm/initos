@@ -55,12 +55,11 @@
           '';
         };
 
-        # ── Rust binaries (Crane) ──────────────────────────────────────────
-
+        # Build workspace dependencies for musl
         cargoArtifactsMusl = craneLib.buildDepsOnly (commonArgs // {
           CARGO_BUILD_TARGET = muslTarget;
           CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-          "${muslLinkerVar}" = "${pkgs.pkgsStatic.stdenv.cc}/bin/${muslLinkerName}";
+          "\${muslLinkerVar}" = "\${pkgs.pkgsStatic.stdenv.cc}/bin/\${muslLinkerName}";
           cargoExtraArgs = "--bin initos";
         });
 
@@ -70,7 +69,7 @@
           cargoExtraArgs = "--bin initos";
           CARGO_BUILD_TARGET = muslTarget;
           CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-          "${muslLinkerVar}" = "${pkgs.pkgsStatic.stdenv.cc}/bin/${muslLinkerName}";
+          "\${muslLinkerVar}" = "\${pkgs.pkgsStatic.stdenv.cc}/bin/\${muslLinkerName}";
         });
 
         efi = craneLib.buildPackage (commonArgs // {
@@ -78,12 +77,14 @@
           pname = "efi";
           cargoExtraArgs = "--bin efi";
           CARGO_BUILD_TARGET = efiTarget;
+          
           postInstall = ''
             mkdir -p $out/bin
             EFI_NAME="BOOTX64.EFI"
             if [ "${system}" = "aarch64-linux" ]; then
               EFI_NAME="BOOTAA64.EFI"
             fi
+
             if [ -f $out/bin/efi.efi ]; then
                 cp $out/bin/efi.efi $out/bin/$EFI_NAME
             elif [ -f $out/bin/efi ]; then

@@ -19,19 +19,6 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 
 cd "${src}"
 
-# Build tools come from nix (see scripts/shell.nix for the full list).
-# If run bare, try to re-exec via nix-shell. If already inside nix-shell
-# or nix is unavailable, fall through and hope tools are in PATH.
-if [ -z "${IN_NIX_SHELL:-}" ] && [ -z "${INITOS_NIX_DONE:-}" ] && command -v nix-shell >/dev/null 2>&1; then
-    if [ -f "${SCRIPT_DIR}/shell.nix" ]; then
-        echo "build.sh: entering nix-shell (scripts/shell.nix)..."
-        export INITOS_NIX_DONE=1
-        exec nix-shell "${SCRIPT_DIR}/shell.nix" --run \
-            "src=${src} out=${out} exec bash $0 $*"
-    fi
-fi
-
-# PATH: nix-shell provides tools; prebuilt/ has fallbacks (busybox, limine)
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 cctl() {
@@ -106,31 +93,6 @@ build_initos() {
 	INITOS_BIN="${src}/target/x86_64-unknown-linux-musl/release/initos"
 	cp "${INITOS_BIN}" "${STAGING}/opt/initos/bin/initos"
 	chmod 755 "${STAGING}/opt/initos/bin/initos"
-
-	# Include ssh-mesh binaries from nix store
-	SSH_MESH_DIR="${SSH_MESH_DIR:-/nix/store/sp9vjh5cm6kgwdv43h9vblr1r28xvqd0-ssh-mesh-full-0.1.0}"
-	SSH_MESH_BIN="${SSH_MESH_DIR}/bin"
-	if [ -d "${SSH_MESH_BIN}" ]; then
-		mkdir -p "${STAGING}/opt/ssh-mesh/bin"
-		for bin in mesh-init ssh-mesh dmesh sshmc h2t; do
-			if [ -f "${SSH_MESH_BIN}/${bin}" ]; then
-				cp "${SSH_MESH_BIN}/${bin}" "${STAGING}/opt/ssh-mesh/bin/"
-				chmod 755 "${STAGING}/opt/ssh-mesh/bin/${bin}"
-			fi
-		done
-		echo "  Added ssh-mesh binaries to /opt/ssh-mesh/bin/"
-	fi
-
-	# Build and include meshrelay (static musl) for virtio-serial ↔ UDS relay
-	if [ -f "${src}/tools/meshrelay/Cargo.toml" ]; then
-		(cd "${src}" && cargo build --release --target "${MUSL_TARGET}" --manifest-path tools/meshrelay/Cargo.toml) || true
-		MESHRELAY_BIN="${src}/target/${MUSL_TARGET}/release/meshrelay"
-		if [ -f "${MESHRELAY_BIN}" ]; then
-			cp "${MESHRELAY_BIN}" "${STAGING}/opt/initos/bin/meshrelay"
-			chmod 755 "${STAGING}/opt/initos/bin/meshrelay"
-			echo "  Added meshrelay to /opt/initos/bin/"
-		fi
-	fi
 
 	mkdir -p "${IMG_DIR}"
 
