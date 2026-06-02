@@ -1,0 +1,53 @@
+name: Nix Build
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build disk-initos
+        run: nix build .#disk-initos
+
+      - name: Build EFI
+        run: nix build .#efi
+
+      - name: Build Docker Image
+        run: nix build .#docker-image
+
+      - name: Generate NAR for disk-initos
+        run: |
+          # Get the store path from the result symlink
+          STORE_PATH=$(readlink -f result)
+          # Create a NAR file
+          nix-store --export "$STORE_PATH" > disk-initos.nar
+          echo "NAR_PATH=disk-initos.nar" >> $GITHUB_ENV
+
+      - name: Create Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rolling-release
+          name: Rolling Release
+          draft: false
+          prerelease: true
+          make_latest: true
+          files: |
+            disk-initos.nar
+            result
+          body: "Nix build artifacts including NAR file for disk-initos."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
