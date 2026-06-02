@@ -1,4 +1,0 @@
-# All the files to include for the initrd of the VM
-/sbin/initos*
-/opt/virt/initos*
-/x/opt/virt/initos*

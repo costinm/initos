@@ -1,2 +1,0 @@
-# The admin user has sudo.
-admin ALL=(ALL:ALL) NOPASSWD: ALL
