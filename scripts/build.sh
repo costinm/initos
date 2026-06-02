@@ -97,33 +97,7 @@ build_initos() {
 	mkdir -p "${IMG_DIR}"
 
     mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "${ROOTFS_IMG}" "${STAGING}"
-    
-    INITOS_IMG=${ROOTFS_IMG}
-    HASH_OFFSET=$(stat -c %s "${INITOS_IMG}")
-    VERITY_OUT=$(/sbin/veritysetup format --hash-offset=$HASH_OFFSET "${INITOS_IMG}" "${INITOS_IMG}")
-    
-    ROOT_HASH=$(echo "$VERITY_OUT" | awk '/Root hash:/ {print $3}')
-    SALT=$(echo "$VERITY_OUT" | awk '/Salt:/ {print $2}')
-    DATA_BLOCKS=$(echo "$VERITY_OUT" | awk '/Data blocks:/ {print $3}')
-    
-    echo "ROOT_HASH=$ROOT_HASH" > "${IMG_DIR}/initos.verity.txt"
-    echo "SALT=$SALT" >> "${IMG_DIR}/initos.verity.txt"
-    echo "HASH_OFFSET=$HASH_OFFSET" >> "${IMG_DIR}/initos.verity.txt"
-    echo "DATA_BLOCKS=$DATA_BLOCKS" >> "${IMG_DIR}/initos.verity.txt"
 
-    LENGTH=$((DATA_BLOCKS * 8))
-    HASH_START_BLOCK=$(( (HASH_OFFSET / 4096) + 1 ))
-    
-    DM_STR="vroot,,,ro,0 ${LENGTH} verity 1 PARTLABEL=INITOSA PARTLABEL=INITOSA 4096 4096 ${DATA_BLOCKS} ${HASH_START_BLOCK} sha256 ${ROOT_HASH} ${SALT}"
-    cat > "${IMG_DIR}/config.verity" <<EOF
- root=/dev/dm-0 rootwait rootfstype=erofs dm-mod.create="${DM_STR}" dm-mod.waitfor=PARTLABEL=INITOSA
-EOF
-    
-    DM_STR="vroot,,,ro,0 ${LENGTH} verity 1 PARTLABEL=INITOSB PARTLABEL=INITOSB 4096 4096 ${DATA_BLOCKS} ${HASH_START_BLOCK} sha256 ${ROOT_HASH} ${SALT}"
-    cat > "${IMG_DIR}/configB.verity" <<EOF
- root=/dev/dm-0 rootwait rootfstype=erofs dm-mod.create="${DM_STR}" dm-mod.waitfor=PARTLABEL=INITOSB
-EOF
-   
     echo "  Created: ${ROOTFS_IMG} ($(du -h "${ROOTFS_IMG}" | cut -f1))"
 }
 
@@ -145,34 +119,236 @@ build_initrd() {
         > ${out}/disks/boot/EFI/BOOT/initrd.img )
 }
 
-# 3.1 Copy the additional files for the boot staging.
-# Includes the initos.erofs verity signature for the alternative initrd-free
-# testing.
-# At this point the disks/boot is complete but unsigned. 
-build_boot() {
-    BOOT_PATH="${out}/disks/boot"
-    mkdir -p "${BOOT_PATH}/EFI/BOOT"
+# 3b. Build a self-contained mesh-test initrd that includes busybox,
+# meshrelay, and ssh-mesh binaries — no STATE disk required.
+build_mesh_initrd() {
+    local STAGING="${out}/disks/mesh_initrd"
+    mkdir -p "${STAGING}"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin,dev,proc,sys,run,tmp}
 
-    cp ${src}/prebuilt/boot/EFI/BOOT/bzImage ${BOOT_PATH}/EFI/BOOT/
+    # Busybox
+    cp "${src}/prebuilt/bin/busybox" "${STAGING}/opt/busybox/bin/busybox"
+    chmod 755 "${STAGING}/opt/busybox/bin/busybox"
+    (cd "${STAGING}/opt/busybox/bin" && for a in sh mount ls cat echo sleep kill; do
+        ln -sf /opt/busybox/bin/busybox "$a"
+    done)
 
-    # Both limine and initos loaders included.
-    # initos will be signed and used with efibootmgr.
-    cp ${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI ${BOOT_PATH}/EFI/BOOT/limine.EFI
-    cp ${src}/target/x86_64-unknown-uefi/release/efi.efi ${BOOT_PATH}/EFI/BOOT/initos.EFI
+    # Init script
+    cp "${src}/sidecar/bin/initos-init-mesh-test" "${STAGING}/init"
+    chmod 755 "${STAGING}/init"
 
-    # For testing use initos as default.
-    cp ${src}/target/x86_64-unknown-uefi/release/efi.efi ${BOOT_PATH}/EFI/BOOT/BOOTX64.EFI
+    # meshrelay
+    cp "${src}/target/${MUSL_TARGET}/release/meshrelay" "${STAGING}/opt/initos/bin/meshrelay"
+    chmod 755 "${STAGING}/opt/initos/bin/meshrelay"
 
-    cp ${src}/prebuilt/boot/EFI/BOOT/limine.conf ${BOOT_PATH}/EFI/BOOT/limine.EFI
+    # ssh-mesh binaries
+    SSH_MESH_BIN="${SSH_MESH_DIR:-/nix/store/sp9vjh5cm6kgwdv43h9vblr1r28xvqd0-ssh-mesh-full-0.1.0}/bin"
+    for bin in mesh-init ssh-mesh dmesh sshmc; do
+        if [ -f "${SSH_MESH_BIN}/${bin}" ]; then
+            cp "${SSH_MESH_BIN}/${bin}" "${STAGING}/opt/ssh-mesh/bin/"
+            chmod 755 "${STAGING}/opt/ssh-mesh/bin/${bin}"
+        fi
+    done
 
-    CMDLINE="loglevel=4 console=tty1"
-    CMDLINE="${CMDLINE} rootwait net.ifnames=0 panic=10"
+    echo "  Building mesh-test initrd..."
+    (cd "${STAGING}" && find . | sort | cpio --quiet --renumber-inodes -o -H newc | gzip \
+        > "${out}/disks/boot/EFI/BOOT/mesh-initrd.img")
+    echo "  Created: ${out}/disks/boot/EFI/BOOT/mesh-initrd.img ($(du -h "${out}/disks/boot/EFI/BOOT/mesh-initrd.img" | cut -f1))"
 
-    # Will be concatented with config.verity to use a separate 
-    # partition instead of initrd.
-    echo -n "${CMDLINE} init=/opt/initos/bin/initos-init-ver " \
-       > ${BOOT_PATH}/EFI/BOOT/config.ver
-    cat ${out}/disks/state/img/config.verity >> ${BOOT_PATH}/EFI/BOOT/config.ver
+    # Copy kernel too for convenience
+    cp "${src}/prebuilt/boot/EFI/BOOT/bzImage" "${out}/disks/boot/EFI/BOOT/mesh-bzImage"
+}
+
+# 3.1 Build boot directories — 3 variants:
+#   - Limine unsigned: multiple boot options, no signing
+#   - Limine signed: Secure Boot with embedded SHAs
+#   - InitOS signed: minimal EFI loader, Secure Boot
+# Each includes public UEFI keys (PK/KEK/DB) for firmware enrollment.
+# Each is also built as a FAT filesystem image and copied to img/.
+
+# Common files for all boot variants.
+_boot_common() {
+    local boot_path="${1:?Usage: _boot_common <boot_path>}"
+    mkdir -p "${boot_path}/EFI/BOOT"
+
+    cp "${src}/prebuilt/boot/EFI/BOOT/bzImage" "${boot_path}/EFI/BOOT/"
+    cp "${out}/disks/boot/EFI/BOOT/initrd.img" "${boot_path}/EFI/BOOT/"
+}
+
+# Copy public UEFI keys that users enroll into PK/KEK/DB.
+_copy_uefi_public_keys() {
+    local boot_path="${1:?Usage: _copy_uefi_public_keys <boot_path>}"
+    local keys_src="${src}/prebuilt/testdata/uefi-keys"
+    local keys_dst="${boot_path}/keys"
+
+    mkdir -p "${keys_dst}"
+    for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth; do
+        cp "${keys_src}/${f}" "${keys_dst}/"
+    done
+    echo "  UEFI public keys → ${keys_dst}/"
+}
+
+# Build a FAT32 filesystem image from a boot directory.
+# Uses mtools if available (no root needed), falls back to mkfs.vfat+loop mount.
+_build_fat_image() {
+    local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_name>}"
+    local img_name="${2:?Usage: _build_fat_image <boot_path> <img_name>}"
+    local img_file="${IMG_DIR}/${img_name}"
+
+    # Calculate size: dir contents + 20% overhead, min 34MB (FAT32 needs ≥65525 clusters)
+    local dir_size_kb img_size_mb
+    dir_size_kb=$(du -sk "${boot_path}" | cut -f1)
+    img_size_mb=$(( (dir_size_kb * 12 / 10 / 1024) + 1 ))
+    [ "${img_size_mb}" -lt 64 ] && img_size_mb=64
+
+    echo "  Building FAT image: ${img_file} (${img_size_mb}MB)"
+
+    if command -v mformat >/dev/null 2>&1; then
+        dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
+        mformat -i "${img_file}" -F -v "INITOSBOOT" ::
+        (cd "${boot_path}" && mcopy -i "${img_file}" -s ./* ::)
+    elif command -v mkfs.vfat >/dev/null 2>&1; then
+        dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
+        mkfs.vfat -F 32 -n INITOSBOOT "${img_file}"
+        local mnt
+        mnt="$(mktemp -d)"
+        su -c "mount -o loop ${img_file} ${mnt}"
+        cp -a "${boot_path}/"* "${mnt}/"
+        su -c "umount ${mnt}"
+        rmdir "${mnt}"
+    else
+        echo "  WARNING: neither mtools nor dosfstools installed — skipping FAT image"
+        return 0
+    fi
+
+    echo "  Created: ${img_file} ($(du -h "${img_file}" | cut -f1))"
+}
+
+# --- Variant 1: Limine unsigned, multiple boot options ---
+build_boot_limine_unsigned() {
+    local boot_path="${out}/disks/boot-limine-unsigned"
+    echo "=== Building limine-unsigned boot ==="
+
+    _boot_common "${boot_path}"
+
+    # Limine as the default EFI loader (unsigned).
+    cp "${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+    cp "${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI" "${boot_path}/EFI/BOOT/limine.EFI"
+
+    # Limine config with multiple boot entries.
+    cp "${src}/prebuilt/boot/EFI/BOOT/limine.conf" "${boot_path}/EFI/BOOT/limine.conf"
+
+    # Also include initos.EFI for efibootmgr use.
+    cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/initos.EFI"
+
+    _copy_uefi_public_keys "${boot_path}"
+    _build_fat_image "${boot_path}" "boot-limine-unsigned.img"
+}
+
+# --- Variant 2: Limine signed (Secure Boot) ---
+build_boot_limine_signed() {
+    local boot_path="${out}/disks/boot-limine-signed"
+    local sec_dir="${SECRETS:-${src}/prebuilt/testdata/uefi-keys}"
+    echo "=== Building limine-signed boot ==="
+
+    _boot_common "${boot_path}"
+
+    # Compute SHAs for limine config embedding.
+    local sha_kernel sha_initrd
+    sha_kernel=$(b2sum "${boot_path}/EFI/BOOT/bzImage" | awk '{print $1}')
+    sha_initrd=$(b2sum "${boot_path}/EFI/BOOT/initrd.img" | awk '{print $1}')
+
+    # Create limine.conf with embedded SHAs.
+    cat > "${boot_path}/EFI/BOOT/limine.conf" <<LIMINECFG
+timeout: 2
+serial: yes
+graphics: no
+verbose: yes
+editor_enabled: no
+
+/Boot
+  protocol: linux
+  path: boot():/EFI/BOOT/bzImage#${sha_kernel}
+  cmdline: INITOS_INIT=/opt/initos/bin/initos-init-dev console=ttyS0,115200 console=tty1 net.ifnames=0 panic=5 loglevel=6
+  module_path: boot():/EFI/BOOT/initrd.img#${sha_initrd}
+LIMINECFG
+
+    # Enroll config hash into limine EFI binary (if limine tool available).
+    local cfg_sha
+    cfg_sha=$(b2sum "${boot_path}/EFI/BOOT/limine.conf" | awk '{print $1}')
+    if command -v limine >/dev/null 2>&1; then
+        cp "${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI" /tmp/limine-tmp.EFI
+        limine enroll-config /tmp/limine-tmp.EFI "${cfg_sha}"
+        # Sign with sbsign.
+        sbsign --key "${sec_dir}/db.key" \
+               --cert "${sec_dir}/db.crt" \
+               --output "${boot_path}/EFI/BOOT/BOOTX64.EFI" \
+               /tmp/limine-tmp.EFI
+        rm -f /tmp/limine-tmp.EFI
+    else
+        echo "  WARNING: limine tool not installed — skipping config hash enrollment"
+        echo "  Install limine for full config verification: https://github.com/limine-bootloader/limine"
+        # Sign without config enrollment (Secure Boot only, no config hash verification).
+        local signed_efi="${boot_path}/EFI/BOOT/BOOTX64.EFI.signed"
+        cp "${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+        sbsign --key "${sec_dir}/db.key" \
+               --cert "${sec_dir}/db.crt" \
+               --output "${signed_efi}" \
+               "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+        mv "${signed_efi}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+    fi
+
+    _copy_uefi_public_keys "${boot_path}"
+    _build_fat_image "${boot_path}" "boot-limine-signed.img"
+}
+
+# --- Variant 3: InitOS EFI signed (Secure Boot) ---
+build_boot_initos_signed() {
+    local boot_path="${out}/disks/boot-initos-signed"
+    local sec_dir="${SECRETS:-${src}/prebuilt/testdata/uefi-keys}"
+    local esp_dir="${boot_path}"
+    echo "=== Building initos-signed boot ==="
+
+    _boot_common "${boot_path}"
+
+    # InitOS EFI as the default loader.
+    cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+    cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/initos.EFI"
+
+    # Basic config for initos.
+    cat > "${esp_dir}/EFI/BOOT/config" <<EOF
+INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
+EOF
+
+    # Sign BOOTX64.EFI with sbsign.
+    local signed="${boot_path}/EFI/BOOT/BOOTX64.EFI.signed"
+    sbsign --key "${sec_dir}/db.key" \
+           --cert "${sec_dir}/db.crt" \
+           --output "${signed}" \
+           "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+    mv "${signed}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+
+    # Create signatures for config, kernel, initrd using db.key.
+    local key_id
+    key_id=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout 2>/dev/null | \
+        openssl rsa -pubin -outform DER 2>/dev/null | \
+        openssl dgst -sha256 | sed 's/.*= //' | cut -c 1-16)
+
+    echo "  Signing with db.key (KEY_ID: ${key_id})..."
+
+    openssl dgst -sha256 -sign "${sec_dir}/db.key" \
+        -out "${esp_dir}/EFI/BOOT/${key_id}.sig" \
+        "${esp_dir}/EFI/BOOT/config"
+
+    openssl dgst -sha256 -sign "${sec_dir}/db.key" \
+        -out "${esp_dir}/EFI/BOOT/${key_id}.kernel.sig" \
+        "${esp_dir}/EFI/BOOT/bzImage"
+
+    openssl dgst -sha256 -sign "${sec_dir}/db.key" \
+        -out "${esp_dir}/EFI/BOOT/${key_id}.initrd.sig" \
+        "${esp_dir}/EFI/BOOT/initrd.img"
+
+    _copy_uefi_public_keys "${boot_path}"
+    _build_fat_image "${boot_path}" "boot-initos-signed.img"
 }
 
 # 4. Build a test env for qemu validation.
@@ -190,7 +366,7 @@ build_qemu_test() {
     }
 
     mkdir -p "${esp_dir}/EFI"
-    cp -R "${out}/disks/boot/EFI/BOOT" "${esp_dir}/EFI/"
+    cp -R "${out}/disks/boot-initos-signed/EFI/BOOT" "${esp_dir}/EFI/"
 
     cat > "${esp_dir}/EFI/BOOT/config" <<EOF
 rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${initos_init} rw iommu=relaxed net.ifnames=0 panic=5
@@ -219,7 +395,7 @@ build_qemu_state() {
     mkdir -p "${genimage_dir}"
     dd if=/dev/zero of="${genimage_dir}/${data_img}" bs=1M count="${state_size_mb}" status=none
 
-    /sbin/mkfs.ext4 -q -F -b 4096 \
+    mkfs.ext4 -q -F -b 4096 \
         -O inline_data,extents,uninit_bg,dir_index,has_journal,verity,encrypt \
         -L "STATE" -d "${out}/disks/state" \
         "${genimage_dir}/${data_img}"
@@ -368,6 +544,8 @@ else
     build_rust
     build_initos
     build_initrd
-    build_boot
+    build_boot_limine_unsigned
+    build_boot_limine_signed
+    build_boot_initos_signed
     build_qemu_test
 fi

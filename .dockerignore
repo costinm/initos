@@ -1,0 +1,6 @@
+target/
+.git/
+*.erofs
+*.fd
+*.sig
+*.log

@@ -1,0 +1,32 @@
+# Host-only subsystem parents — not needed for cloud VMs
+# Hardware that only exists on bare metal
+
+# Sound subsystem
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_SOC=y
+
+# Intel-specific platform drivers
+CONFIG_I2C_I801=y
+CONFIG_INTEL_LPSS_PCI=y
+CONFIG_MEI_ME=y
+CONFIG_X86_INTEL_PSTATE=y
+CONFIG_MFD_CROS_EC_DEV=y
+
+# Intel audio (SOF/HDA for laptops)
+CONFIG_SND_SOC_SOF_INTEL_TOPLEVEL=y
+CONFIG_SND_SOC_SOF_HDA_LINK=y
+
+# Intel power/thermal management
+CONFIG_INTEL_PMIC_OPREGION=y
+CONFIG_INT340X_THERMAL=y
+CONFIG_INTEL_PMC_CORE=y
+
+# GPU / DRM (as modules — loaded when hardware present)
+CONFIG_INTEL_GTT=m
+CONFIG_DRM=m
+
+# GPU compute memory (CUDA, ROCm)
+CONFIG_HMM_MIRROR=y
+CONFIG_DEVICE_PRIVATE=y
+CONFIG_MIGRATE_VMA_HELPER=y

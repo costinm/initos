@@ -98,6 +98,8 @@ run() {
         -fsdev "local,security_model=mapped,id=fsdev0,path=${out}/test"
         -device "virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
         -device "virtio-serial-pci"
+        -chardev "socket,id=mesh,path=${out}/test/mesh.sock,server=on,wait=off"
+        -device "virtserialport,chardev=mesh,name=org.ssh-mesh.control"
     )
 
 	# -display none or -nographic ?
