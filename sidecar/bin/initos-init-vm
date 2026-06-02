@@ -51,6 +51,15 @@ initramfs_init_vm() {
   net_cfg
   mount_disks
 
+  # Start ssh-mesh relay if configured on kernel cmdline
+  if [ "${initos_mesh:-0}" = "1" ] || [ "${initos_mesh_tunnel:-0}" = "1" ]; then
+    if [ -f /initos/initos-init-mesh ]; then
+      /initos/initos-init-mesh start
+    elif [ -f /opt/initos/bin/initos-init-mesh ]; then
+      /opt/initos/bin/initos-init-mesh start
+    fi
+  fi
+
   # Simplest case: run a startup script directly, using virtiofs 
   # as root.
   if [ -f /initos/initos-pod ]; then

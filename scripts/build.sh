@@ -19,6 +19,19 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 
 cd "${src}"
 
+# Build tools come from nix (see scripts/shell.nix for the full list).
+# If run bare, try to re-exec via nix-shell. If already inside nix-shell
+# or nix is unavailable, fall through and hope tools are in PATH.
+if [ -z "${IN_NIX_SHELL:-}" ] && [ -z "${INITOS_NIX_DONE:-}" ] && command -v nix-shell >/dev/null 2>&1; then
+    if [ -f "${SCRIPT_DIR}/shell.nix" ]; then
+        echo "build.sh: entering nix-shell (scripts/shell.nix)..."
+        export INITOS_NIX_DONE=1
+        exec nix-shell "${SCRIPT_DIR}/shell.nix" --run \
+            "src=${src} out=${out} exec bash $0 $*"
+    fi
+fi
+
+# PATH: nix-shell provides tools; prebuilt/ has fallbacks (busybox, limine)
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 cctl() {
@@ -94,6 +107,31 @@ build_initos() {
 	cp "${INITOS_BIN}" "${STAGING}/opt/initos/bin/initos"
 	chmod 755 "${STAGING}/opt/initos/bin/initos"
 
+	# Include ssh-mesh binaries from nix store
+	SSH_MESH_DIR="${SSH_MESH_DIR:-/nix/store/sp9vjh5cm6kgwdv43h9vblr1r28xvqd0-ssh-mesh-full-0.1.0}"
+	SSH_MESH_BIN="${SSH_MESH_DIR}/bin"
+	if [ -d "${SSH_MESH_BIN}" ]; then
+		mkdir -p "${STAGING}/opt/ssh-mesh/bin"
+		for bin in mesh-init ssh-mesh dmesh sshmc h2t; do
+			if [ -f "${SSH_MESH_BIN}/${bin}" ]; then
+				cp "${SSH_MESH_BIN}/${bin}" "${STAGING}/opt/ssh-mesh/bin/"
+				chmod 755 "${STAGING}/opt/ssh-mesh/bin/${bin}"
+			fi
+		done
+		echo "  Added ssh-mesh binaries to /opt/ssh-mesh/bin/"
+	fi
+
+	# Build and include meshrelay (static musl) for virtio-serial ↔ UDS relay
+	if [ -f "${src}/tools/meshrelay/Cargo.toml" ]; then
+		(cd "${src}" && cargo build --release --target "${MUSL_TARGET}" --manifest-path tools/meshrelay/Cargo.toml) || true
+		MESHRELAY_BIN="${src}/target/${MUSL_TARGET}/release/meshrelay"
+		if [ -f "${MESHRELAY_BIN}" ]; then
+			cp "${MESHRELAY_BIN}" "${STAGING}/opt/initos/bin/meshrelay"
+			chmod 755 "${STAGING}/opt/initos/bin/meshrelay"
+			echo "  Added meshrelay to /opt/initos/bin/"
+		fi
+	fi
+
 	mkdir -p "${IMG_DIR}"
 
     mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "${ROOTFS_IMG}" "${STAGING}"
@@ -119,6 +157,45 @@ build_initrd() {
         > ${out}/disks/boot/EFI/BOOT/initrd.img )
 }
 
+# 3b. Build a self-contained mesh-test initrd that includes busybox,
+# meshrelay, and ssh-mesh binaries — no STATE disk required.
+build_mesh_initrd() {
+    local STAGING="${out}/disks/mesh_initrd"
+    mkdir -p "${STAGING}"/{opt/busybox/bin,opt/initos/bin,opt/ssh-mesh/bin,dev,proc,sys,run,tmp}
+
+    # Busybox
+    cp "${src}/prebuilt/bin/busybox" "${STAGING}/opt/busybox/bin/busybox"
+    chmod 755 "${STAGING}/opt/busybox/bin/busybox"
+    (cd "${STAGING}/opt/busybox/bin" && for a in sh mount ls cat echo sleep kill; do
+        ln -sf /opt/busybox/bin/busybox "$a"
+    done)
+
+    # Init script
+    cp "${src}/sidecar/bin/initos-init-mesh-test" "${STAGING}/init"
+    chmod 755 "${STAGING}/init"
+
+    # meshrelay
+    cp "${src}/target/${MUSL_TARGET}/release/meshrelay" "${STAGING}/opt/initos/bin/meshrelay"
+    chmod 755 "${STAGING}/opt/initos/bin/meshrelay"
+
+    # ssh-mesh binaries
+    SSH_MESH_BIN="${SSH_MESH_DIR:-/nix/store/sp9vjh5cm6kgwdv43h9vblr1r28xvqd0-ssh-mesh-full-0.1.0}/bin"
+    for bin in mesh-init ssh-mesh dmesh sshmc; do
+        if [ -f "${SSH_MESH_BIN}/${bin}" ]; then
+            cp "${SSH_MESH_BIN}/${bin}" "${STAGING}/opt/ssh-mesh/bin/"
+            chmod 755 "${STAGING}/opt/ssh-mesh/bin/${bin}"
+        fi
+    done
+
+    echo "  Building mesh-test initrd..."
+    (cd "${STAGING}" && find . | sort | cpio --quiet --renumber-inodes -o -H newc | gzip \
+        > "${out}/disks/boot/EFI/BOOT/mesh-initrd.img")
+    echo "  Created: ${out}/disks/boot/EFI/BOOT/mesh-initrd.img ($(du -h "${out}/disks/boot/EFI/BOOT/mesh-initrd.img" | cut -f1))"
+
+    # Copy kernel too for convenience
+    cp "${src}/prebuilt/boot/EFI/BOOT/bzImage" "${out}/disks/boot/EFI/BOOT/mesh-bzImage"
+}
+
 # 3.1 Build boot directories — 3 variants:
 #   - Limine unsigned: multiple boot options, no signing
 #   - Limine signed: Secure Boot with embedded SHAs
@@ -133,12 +210,6 @@ _boot_common() {
 
     cp "${src}/prebuilt/boot/EFI/BOOT/bzImage" "${boot_path}/EFI/BOOT/"
     cp "${out}/disks/boot/EFI/BOOT/initrd.img" "${boot_path}/EFI/BOOT/"
-
-    CMDLINE="loglevel=4 console=tty1"
-    CMDLINE="${CMDLINE} rootwait net.ifnames=0 panic=10"
-    echo -n "${CMDLINE} init=/opt/initos/bin/initos-init-ver " \
-       > "${boot_path}/EFI/BOOT/config.ver"
-    cat "${out}/disks/state/img/config.verity" >> "${boot_path}/EFI/BOOT/config.ver"
 }
 
 # Copy public UEFI keys that users enroll into PK/KEK/DB.
