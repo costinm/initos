@@ -26,6 +26,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+# Auto-enter nix-shell if QEMU isn't in PATH (see scripts/shell.nix)
+if [ -z "${IN_NIX_SHELL:-}" ] && [ -z "${INITOS_NIX_DONE:-}" ] \
+    && ! command -v qemu-system-x86_64 >/dev/null 2>&1 \
+    && command -v nix-shell >/dev/null 2>&1; then
+    if [ -f "${PROJECT_ROOT}/scripts/shell.nix" ]; then
+        echo "run_qemu.sh: entering nix-shell..."
+        export INITOS_NIX_DONE=1
+        exec nix-shell "${PROJECT_ROOT}/scripts/shell.nix" --run "bash $0 $*"
+    fi
+fi
+
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
 src=${src:-${PROJECT_ROOT}}
 out=${out:-${src}/target}
 
@@ -98,6 +114,8 @@ run() {
         -fsdev "local,security_model=mapped,id=fsdev0,path=${out}/test"
         -device "virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
         -device "virtio-serial-pci"
+        -chardev "socket,id=mesh,path=${out}/test/mesh.sock,server=on,wait=off"
+        -device "virtserialport,chardev=mesh,name=org.ssh-mesh.control"
     )
 
 	# -display none or -nographic ?
