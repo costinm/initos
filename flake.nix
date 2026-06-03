@@ -160,7 +160,7 @@
           USE_BUSYBOX=${pkgs.pkgsStatic.busybox}/bin/busybox
 
           # Repo source (read-only nix store path)
-          REPO=${./.}
+          CARGO_TOML=${./Cargo.toml}
           SIDECAR_BIN=${./sidecar/bin}
           SCRIPTS_DIR=${./scripts}
           PREBUILT_DIR=${./prebuilt}
@@ -177,7 +177,7 @@
 
           cp -R "$SIDECAR_BIN/." "$WRITABLE/sidecar/bin/"
           chmod 755 "$WRITABLE/sidecar/bin/"*
-          cp "$REPO/Cargo.toml" "$WRITABLE/" 2>/dev/null || true
+          cp "$CARGO_TOML" "$WRITABLE/Cargo.toml"
 
           BUILD_SRC="$WRITABLE"
           BUILD_OUT="$WRITABLE/target"

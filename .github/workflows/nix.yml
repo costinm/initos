@@ -19,6 +19,24 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Restore rolling release NAR cache
+        continue-on-error: true
+        run: |
+          curl -fL --retry 3 \
+            -o "$RUNNER_TEMP/initos-artifacts.nar" \
+            https://github.com/costinm/initos/releases/download/rolling-release/initos-artifacts.nar
+          nix-store --import < "$RUNNER_TEMP/initos-artifacts.nar"
+
+      - name: Check rolling release cache hit
+        run: |
+          expected="$(nix eval --raw .#packages.x86_64-linux.initos-artifacts.outPath)"
+          echo "Expected initos-artifacts path: ${expected}"
+          if nix-store --verify-path "$expected" >/dev/null 2>&1; then
+            echo "Rolling release cache hit: ${expected}"
+          else
+            echo "Rolling release cache miss; building current flake output."
+          fi
+
       - name: Build initos artifacts
         run: nix build .#initos-artifacts -o result-artifacts
 
