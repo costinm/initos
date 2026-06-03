@@ -151,7 +151,6 @@
 
         mkInitosArtifacts = { withKernels ? false }:
         pkgs.runCommand (if withKernels then "initos-artifacts-with-kernels" else "initos-artifacts") {
-          __noChroot = true;
           nativeBuildInputs = with pkgs; [
             cpio gzip erofs-utils mtools openssl sbsigntool
           ] ++ [ initos efi ]
