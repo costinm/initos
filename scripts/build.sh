@@ -19,19 +19,6 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 
 cd "${src}"
 
-# Build tools come from nix (see scripts/shell.nix for the full list).
-# If run bare, try to re-exec via nix-shell. If already inside nix-shell
-# or nix is unavailable, fall through and hope tools are in PATH.
-if [ -z "${IN_NIX_SHELL:-}" ] && [ -z "${INITOS_NIX_DONE:-}" ] && command -v nix-shell >/dev/null 2>&1; then
-    if [ -f "${SCRIPT_DIR}/shell.nix" ]; then
-        echo "build.sh: entering nix-shell (scripts/shell.nix)..."
-        export INITOS_NIX_DONE=1
-        exec nix-shell "${SCRIPT_DIR}/shell.nix" --run \
-            "src=${src} out=${out} exec bash $0 $*"
-    fi
-fi
-
-# PATH: nix-shell provides tools; prebuilt/ has fallbacks (busybox, limine)
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 cctl() {

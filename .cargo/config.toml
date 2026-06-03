@@ -6,3 +6,13 @@ rustflags = ["-C", "panic=abort"]
 
 [unstable]
 binary-dep-info = true
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+ar = "ar"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-no-pie",
+]
