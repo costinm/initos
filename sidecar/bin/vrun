@@ -196,6 +196,11 @@ start() {
     # Use: mount -t 9p -o trans=virtio,version=9p2000.L src /src
     QDISKS="${QDISKS} -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
     QDISKS="${QDISKS} -fsdev local,security_model=passthrough,id=fsdev0,path=${WORK}/share"
+
+    # virtio-serial port for ssh-mesh host↔guest communication
+    QDISKS="${QDISKS} -chardev socket,id=mesh,path=${WORK}/mesh.sock,server=on,wait=off"
+    QDISKS="${QDISKS} -device virtserialport,chardev=mesh,name=org.ssh-mesh.control"
+    echo "  SSH-MESH: virtio-serial socket at ${WORK}/mesh.sock"
     
 
     OPTS="$OPTS -kernel ${VIRT}/vmlinuz"

@@ -169,9 +169,22 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Read encrypted data from stdin
+    // Read all data from stdin
     let mut cipher = Vec::new();
     io::stdin().read_to_end(&mut cipher)?;
+
+    // If no identity from env vars, try parsing first line of stdin as x25519 identity
+    if identities.is_empty() {
+        if let Some(nl_pos) = cipher.iter().position(|&b| b == b'\n') {
+            let first_line = &cipher[..nl_pos];
+            let first_line_str = std::str::from_utf8(first_line).unwrap_or("");
+            if let Ok(identity) = age::x25519::Identity::from_str(first_line_str.trim()) {
+                identities.push(Box::new(identity));
+                // Use remaining data after the newline as ciphertext
+                cipher.drain(..=nl_pos);
+            }
+        }
+    }
 
     if identities.is_empty() {
         return Err(

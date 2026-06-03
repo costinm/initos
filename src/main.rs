@@ -536,21 +536,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_decrypt_with_ID_env_var() -> Result<(), Box<dyn std::error::Error>> {
         let (identity_str, recipient) = gen_keypair();
         let plaintext = b"test decrypt with ID env var";
         let encrypted = encrypt_for_test(&recipient, plaintext)?;
 
-        // Test with ID environment variable
-        let mut env = std::collections::HashMap::new();
-        env.insert("ID".to_string(), identity_str.clone());
-
+        // Test with ID environment variable (no env_clear, just add ID)
         let mut status = Command::new("initos")
-            .env_clear()
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .env("ID", &identity_str)
             .args(["decrypt"])
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -571,7 +567,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_decrypt_with_raw_key_on_stdin() -> Result<(), Box<dyn std::error::Error>> {
         let (identity_str, recipient) = gen_keypair();
         let plaintext = b"test decrypt with key on stdin";
@@ -591,6 +586,8 @@ mod tests {
         let mut status = Command::new("initos")
             .args(["decrypt"])
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
 
@@ -612,40 +609,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
     fn test_decrypt_with_KEY_FILE_env_var() -> Result<(), Box<dyn std::error::Error>> {
         let (identity_str, recipient) = gen_keypair();
         let plaintext = b"test decrypt with KEY_FILE env var";
         let encrypted = encrypt_for_test(&recipient, plaintext)?;
 
-        // Create temp file with identity for KEY_FILE
+        // Create temp file with identity for KEY_FILE (keep alive until test ends)
         let mut key_file = NamedTempFile::new()?;
         key_file.write_all(identity_str.as_bytes())?;
         key_file.flush()?;
         let key_path = key_file.path().to_owned();
-        drop(key_file);
 
-        // Create temp file with encrypted data
+        // Create temp file with encrypted data (keep alive until test ends)
         let mut cipher_file = NamedTempFile::new()?;
         cipher_file.write_all(&encrypted)?;
         cipher_file.flush()?;
         let cipher_path = cipher_file.path().to_owned();
-        drop(cipher_file);
 
-        // Test with KEY_FILE environment variable
-        let mut env = std::collections::HashMap::new();
-        env.insert(
-            "KEY_FILE".to_string(),
-            key_path.to_string_lossy().to_string(),
-        );
-
+        // Test with KEY_FILE environment variable (no env_clear)
         let mut status = Command::new("initos")
-            .env_clear()
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .env("KEY_FILE", key_path.to_string_lossy().as_ref())
             .args(["decrypt"])
             .stdin(std::process::Stdio::from(std::fs::File::open(
                 &cipher_path,
             )?))
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();

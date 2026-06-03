@@ -9,10 +9,6 @@ name = "initos"
 path = "src/main.rs"
 
 [[bin]]
-name = "initos-recover"
-path = "src/bin/initos-recover.rs"
-
-[[bin]]
 name = "efi"
 path = "src/bin/efi.rs"
 

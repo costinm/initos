@@ -258,7 +258,7 @@ build_dmverity_boot() {
     
     HASH_OFFSET=$(stat -c %s "${INITOS_IMG}")
     
-    VERITY_OUT=$(/sbin/veritysetup format --hash-offset=$HASH_OFFSET "${INITOS_IMG}" "${INITOS_IMG}")
+    VERITY_OUT=$(veritysetup format --hash-offset=$HASH_OFFSET "${INITOS_IMG}" "${INITOS_IMG}")
     
     ROOT_HASH=$(echo "$VERITY_OUT" | awk '/Root hash:/ {print $3}')
     SALT=$(echo "$VERITY_OUT" | awk '/Salt:/ {print $2}')
