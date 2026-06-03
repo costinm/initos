@@ -139,6 +139,7 @@
           gnugrep
           gawk
           mtools
+          minisign
           openssh
           openssl
           sbsigntool
