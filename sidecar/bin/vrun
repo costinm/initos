@@ -89,6 +89,8 @@ virt_resolve_layout() {
   DEBUG=${DEBUG:-}
   qemu_base=${qemu_base:-}
   QEMU_UI=${QEMU_UI:-}
+  NO_NET=${NO_NET:-}
+  SERIAL_LOG=${SERIAL_LOG:-}
 
   if [ -d "${VIRT}/img" ] || [ -d "${VIRT}/boot" ]; then
     VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
@@ -154,6 +156,39 @@ virt_resolve_layout() {
   }
 }
 
+validate_pod_name() {
+  local tap="vm-${POD}"
+  tap_bytes=$(printf '%s' "${tap}" | wc -c | tr -d '[:space:]')
+  if [ "${tap_bytes}" -gt 15 ]; then
+    echo "POD is too long for the Cloud Hypervisor tap name '${tap}'." >&2
+    echo "Linux network interface names are limited to 15 bytes; use a POD name of 12 bytes or less." >&2
+    exit 1
+  fi
+}
+
+cleanup_pid_file() {
+  local pid_file="$1"
+  local pid
+  local n
+
+  [ -f "${pid_file}" ] || return 0
+  pid=$(cat "${pid_file}" 2>/dev/null || true)
+
+  if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+    kill "${pid}" 2>/dev/null || true
+    n=0
+    while [ "${n}" -lt 3 ] && kill -0 "${pid}" 2>/dev/null; do
+      sleep 1
+      n=$((n + 1))
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+  fi
+
+  rm -f "${pid_file}"
+}
+
 vm_init() {
   virt_resolve_layout
 
@@ -186,13 +221,19 @@ vm_init() {
     cp ${SRC}/initos-pod ${WORK}/share/initos/initos-pod
   fi 
 
-  mkdir -p ${WORK}/share/initos ${WORK}/share/bin
+  mkdir -p ${WORK}/share/initos ${WORK}/share/bin \
+    ${WORK}/share/opt/initos/bin ${WORK}/share/opt/busybox/bin
 
   cp ${VIRT_INITOS_INIT_VM} ${WORK}/share/initos/initos-init-vm
+  cp ${VIRT_INITOS_INIT_VM} ${WORK}/share/opt/initos/bin/initos-init-vm
 
   if [ ! -e ${WORK}/share/bin/sh ]; then
     cp ${VIRT_BUSYBOX} ${WORK}/share/bin
     (cd ${WORK}/share/bin && ln -s busybox sh)
+  fi
+  if [ ! -e ${WORK}/share/opt/busybox/bin/sh ]; then
+    cp ${VIRT_BUSYBOX} ${WORK}/share/opt/busybox/bin/busybox
+    (cd ${WORK}/share/opt/busybox/bin && ln -s busybox sh)
   fi
 }
 
@@ -223,7 +264,7 @@ run_virtiofsd() {
       --xattr \
       --thread-pool-size=4 \
       --allow-direct-io \
-      --sandbox chroot  > ${WORK}/virtiofs.log  2>&1 &
+      --sandbox namespace  > ${WORK}/virtiofs.log  2>&1 &
       
     # Default sandbox is namespace, doesn't work in chroot  
     # --allow-mmap should only be used with exclusive access
@@ -258,6 +299,10 @@ run_virtiofsd() {
 start() {
   local p="$@"
 
+  if [ "${virt:-cloud-hypervisor}" != "qemu" ] ; then
+    validate_pod_name
+  fi
+
   vm_init
 
   # OPTS - cloud-hypervisor/qemu options
@@ -272,7 +317,7 @@ start() {
     # stdio - no input ?
     # -serial stdio
 
-    OPTS="$OPTS --m ${vm_mem:-8}"
+    OPTS="$OPTS -m ${vm_mem:-1G}"
     OPTS="$OPTS -smp ${vm_cpu:-4}"
     OPTS="$OPTS -netdev user,id=n1,hostfwd=tcp::10022-:22 -device virtio-net-pci,netdev=n1"
     #-net user,hostfwd=tcp::10022-:22 
@@ -283,7 +328,7 @@ start() {
      # 9p volume exposing current dir
     # Use: mount -t 9p -o trans=virtio,version=9p2000.L src /src
     QDISKS="${QDISKS} -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
-    QDISKS="${QDISKS} -fsdev local,security_model=passthrough,id=fsdev0,path=${WORK}/share"
+    QDISKS="${QDISKS} -fsdev local,security_model=mapped,id=fsdev0,path=${WORK}/share"
 
     # virtio-serial port for ssh-mesh host↔guest communication
     QDISKS="${QDISKS} -chardev socket,id=mesh,path=${WORK}/mesh.sock,server=on,wait=off"
@@ -301,17 +346,23 @@ start() {
         qemu_base="${qemu_base} -display gtk -vga std"
     fi
   else
-    # Using the rootfs as root or shared
+    [ -n "${VIRT_ROOTFS}" ] || {
+      echo "Missing rootfs image. Set VIRT to a Nix VM profile or set VIRT_ROOTFS." >&2
+      exit 1
+    }
+
+    # Use the immutable initos EROFS as root and virtiofs only as the host share.
     run_virtiofsd ${WORK}  
 
     OPTS="$OPTS --pvpanic"
     OPTS="$OPTS --api-socket=${WORK}/ch.sock"
-    OPTS="$OPTS --memory size=${vm_mem:-8},shared=on"
+    OPTS="$OPTS --memory size=${vm_mem:-1G},shared=on"
     OPTS="$OPTS --cpus boot=${vm_cpu:-4}"
-    OPTS="$OPTS --balloon size=1G,deflate_on_oom=on "
+    OPTS="$OPTS --balloon size=${vm_balloon:-256M},deflate_on_oom=on "
 
     # Only 2 supported ?
-    OPTS="$OPTS --fs tag=/dev/root,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
+    OPTS="$OPTS --disk path=${VIRT_ROOTFS},readonly=on"
+    OPTS="$OPTS --fs tag=src,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
     OPTS="$OPTS --kernel ${VIRT_KERNEL}"
     if [ -n "${USE_INITRD:-}" ] && [ -n "${VIRT_INITRD}" ]; then
       OPTS="$OPTS --initramfs ${VIRT_INITRD}"
@@ -321,13 +372,22 @@ start() {
     # tap is the address of the tap on the VM side
     # Adding --net tap=ex,ip=10.0.0.1,mask=255.0.0.0 to kernel cmdline adds 10 sec delay - so using the vm script to set the IP, based on other command params.
     
-    OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
+    if [ -z "${NO_NET}" ]; then
+      OPTS="$OPTS --net tap=vm-${POD},iommu=on $NETX"
+    fi
   fi 
   
   CMD_OPTS="$CMD_OPTS initos_host=${POD}"
-  CMD_OPTS="$CMD_OPTS net.ifnames=0 initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
+  CMD_OPTS="$CMD_OPTS net.ifnames=0"
+  if [ -z "${NO_NET}" ]; then
+    CMD_OPTS="$CMD_OPTS initos_ip=${vm_ip:-192.168.5.2/24} initos_gw=${vm_gw:-192.168.5.1}"
+  fi
   
-  CMD_OPTS="$CMD_OPTS root=/dev/root rootfstype=virtiofs init=/opt/initos/bin/initos-init-vm rw"
+  if [ "$virt" = "qemu" ] ; then
+    CMD_OPTS="$CMD_OPTS root=/dev/root rootfstype=virtiofs init=/opt/initos/bin/initos-init-vm rw"
+  else
+    CMD_OPTS="$CMD_OPTS root=/dev/vda rootfstype=erofs rootwait init=/opt/initos/bin/initos-init-vm ro"
+  fi
 
   CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
   
@@ -394,15 +454,20 @@ start() {
       CMD_OPTS="$CMD_OPTS quiet console=ttyS0 "
     fi
   else 
-    OPTS="$OPTS --serial socket=${WORK}/serial.socket --console off "
+    if [ -n "${SERIAL_LOG}" ]; then
+      OPTS="$OPTS --serial off --console file=${SERIAL_LOG} "
+      CMD_OPTS="$CMD_OPTS console=hvc0 "
+    else
+      OPTS="$OPTS --serial socket=${WORK}/serial.socket --console off "
+      CMD_OPTS="$CMD_OPTS console=ttyS0 "
+    fi
     CMD_OPTS="$CMD_OPTS quiet"
-    CMD_OPTS="$CMD_OPTS console=ttyS0 "
   fi
 
   if [ -n "${DEBUG}" ]; then
      # For now only debug for qemu  
      if [ "$virt" = "qemu" ] ; then
-        ${VIRT_QEMU} $OPTS -append "${CMD_OPTS}"
+        ${VIRT_QEMU} $OPTS $QDISKS -append "${CMD_OPTS}"
      else
       $TIME ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
      fi
@@ -431,6 +496,7 @@ fi
 # EFI and the host kernel.
 qemuvirt() {
   virt_resolve_layout
+  vm_init
 
   KERNEL="${KERNEL:-${VIRT_KERNEL}}"
   ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
@@ -444,7 +510,10 @@ qemuvirt() {
   cmd="root=/dev/vda rootfstype=erofs rootwait loglevel=7"
   cmd="${cmd} console=hvc0"
   cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
-  cmd="${cmd} net.ifnames=0 panic=1 debug_init initos_dbg=1"
+  cmd="${cmd} net.ifnames=0 panic=1"
+  if [ "${DEBUG}" = "init" ]; then
+    cmd="${cmd} debug_init initos_dbg=1"
+  fi
     
   initrd_arg=
   if [ -n "${USE_INITRD:-}" ] && [ -n "${INITRD}" ]; then
@@ -462,6 +531,8 @@ qemuvirt() {
   ${initrd_arg} \
   -drive "if=none,id=rootfs,format=raw,readonly=on,file=${ROOTFS}" \
   -device virtio-blk-pci,drive=rootfs \
+  -fsdev "local,security_model=mapped,id=fsdev0,path=${WORK}/share" \
+  -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src \
   -device virtio-serial-pci \
   -chardev stdio,id=console,signal=off \
   -device virtconsole,chardev=console \
@@ -490,12 +561,21 @@ layout() {
 
 ## Stop gracefully (vm_ctrl), expects the socket.
 stop() {
-  ctrl shutdown-vmm
+  if [ -S "${WORK}/ch.sock" ]; then
+    ctrl shutdown-vmm 2>/dev/null || true
+  fi
+  cleanup_pid_file "${WORK}/vm.pid"
+  cleanup_pid_file "${WORK}/virtiofsd.pid"
+  cleanup_pid_file "${WORK}/virtiofs.sock.pid"
+  rm -f "${WORK}/ch.sock" "${WORK}/serial.socket" "${WORK}/virtiofs.sock"
 }
 
 ## Kill the VM process. Virtiofsd will terminate itself after VM dies.
 vmkill() {
-  kill -9 $(cat ${WORK}/vm.pid) || true
+  cleanup_pid_file "${WORK}/vm.pid"
+  cleanup_pid_file "${WORK}/virtiofsd.pid"
+  cleanup_pid_file "${WORK}/virtiofs.sock.pid"
+  rm -f "${WORK}/ch.sock" "${WORK}/serial.socket" "${WORK}/virtiofs.sock"
 }
 
 console() {
@@ -512,7 +592,19 @@ screen() {
 # add-disk path=...
 # remove-device _diskN
 ctrl() {
-  ch-remote --api-socket ${WORK}/ch.sock "$@"
+  if command -v ch-remote >/dev/null 2>&1; then
+    ch_remote=ch-remote
+  elif [ -x "${VIRT}/bin/ch-remote" ]; then
+    ch_remote="${VIRT}/bin/ch-remote"
+  elif [ -x "${VIRT}/ch-remote" ]; then
+    ch_remote="${VIRT}/ch-remote"
+  elif [ -n "${VIRT_BIN:-}" ] && [ -x "${VIRT_BIN}/ch-remote" ]; then
+    ch_remote="${VIRT_BIN}/ch-remote"
+  else
+    echo "Missing ch-remote. Set VIRT to a Nix VM profile or add ch-remote to PATH." >&2
+    return 1
+  fi
+  "${ch_remote}" --api-socket ${WORK}/ch.sock "$@"
 }
 
 fix_perms() {

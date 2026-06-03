@@ -56,7 +56,7 @@ build_initos() {
     # Base rootfs and busybox in /opt/busybox
     # Only changes when busybox is updated, stable.
     if [ ! -f ${STAGING}/opt/busybox/bin/busybox ]; then
-		mkdir -p "${STAGING}"/{dev,proc,sys,sysroot,home,mnt,run,etc,tmp,x,data,z,a,nix,opt/initos/bin,opt/busybox/bin,usr/bin,usr/sbin,usr/lib,usr/lib64}
+		mkdir -p "${STAGING}"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,opt/initos/bin,opt/busybox/bin,usr/bin,usr/sbin,usr/lib,usr/lib64}
 		mkdir -p "${STAGING}"/usr/lib/modules "${STAGING}"/usr/lib/firmware
 
 		BUSYBOX="${BUSYBOX:-${src}/prebuilt/bin/busybox}"

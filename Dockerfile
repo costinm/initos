@@ -22,8 +22,6 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,id=aptlist \
   echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache; \
   /opt/initos/bin/setup-deb ${SCRIPT}
 
-COPY  ./sidecar/etc  /etc
-COPY  ./sidecar/root /root
 COPY ./sidecar/bin /opt/initos/bin
 RUN mkdir -p /x /c /z
 

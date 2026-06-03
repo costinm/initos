@@ -284,6 +284,7 @@
           done
 
           ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
+          ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
           ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
           ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
           ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
