@@ -223,6 +223,9 @@
 
           ${pkgs.lib.optionalString withKernels ''
           # Cloud kernel
+          if [ -f ${kernel-cloud}/img/vmlinux ]; then
+            cp ${kernel-cloud}/img/vmlinux "$out"/img/vmlinux-cloud
+          fi
           if [ -f ${kernel-cloud}/img/bzImage ]; then
             cp ${kernel-cloud}/img/bzImage "$out"/img/vmlinuz-cloud
           fi
@@ -274,7 +277,7 @@
 
           ln -s ${initos-artifacts}/img/initos.erofs "$out/img/initos.erofs"
           ln -s ${initos-artifacts}/boot/EFI/BOOT/initrd.img "$out/boot/initrd.img"
-          ln -s ${kernel-cloud}/img/bzImage "$out/img/vmlinuz-cloud"
+          ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
           ln -s ${initos-artifacts}/opt "$out/opt"
 
           for m in ${kernel-cloud}/img/modules-*.erofs; do
@@ -287,6 +290,7 @@
           ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
           ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
           ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
+          ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
           ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
           ln -s ${./sidecar/bin/vrun} "$out/bin/vrun"
 
@@ -303,7 +307,7 @@ EOF
 
           Important paths:
             $out/img/initos.erofs
-            $out/img/vmlinuz-cloud
+            $out/img/vmlinux-cloud
             $out/img/modules-cloud.erofs
             $out/boot/initrd.img
             $out/opt

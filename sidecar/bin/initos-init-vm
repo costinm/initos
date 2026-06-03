@@ -80,11 +80,21 @@ initramfs_init_vm() {
   # as root.
   if [ -f /initos/initos-pod ]; then
     echo "INITOS-VM: executing /initos/initos-pod"
-    exec /initos/initos-pod start
+    /initos/initos-pod start
+    pod_exit=$?
+    echo "INITOS-VM: /initos/initos-pod exited with status ${pod_exit}; powering off"
+    sync
+    poweroff -f || reboot -f
+    while true; do sleep 60; done
   fi 
   if [ -f /src/initos/initos-pod ]; then
     echo "INITOS-VM: executing /src/initos/initos-pod"
-    exec /src/initos/initos-pod start
+    /src/initos/initos-pod start
+    pod_exit=$?
+    echo "INITOS-VM: /src/initos/initos-pod exited with status ${pod_exit}; powering off"
+    sync
+    poweroff -f || reboot -f
+    while true; do sleep 60; done
   fi
   echo "INITOS-VM: no initos-pod found"
 

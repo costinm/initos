@@ -14,19 +14,21 @@
   let
     system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};
-    kernel = pkgs.runCommand "initos-microvm-kernel" { } ''
-      mkdir -p "$out"
-      ln -s "${initosProfile}/img/vmlinuz-cloud" "$out/${pkgs.stdenv.hostPlatform.linux-kernel.target}"
+    kernel = pkgs.runCommand "initos-microvm-kernel" { outputs = [ "out" "dev" ]; } ''
+      mkdir -p "$out" "$dev"
+      ln -s "${initosProfile}/img/vmlinux-cloud" "$out/${pkgs.stdenv.hostPlatform.linux-kernel.target}"
+      ln -s "${initosProfile}/img/vmlinux-cloud" "$dev/vmlinux"
     '';
     emptyToplevel = pkgs.runCommand "initos-microvm-empty-toplevel" { } "mkdir -p $out";
-    microvmConfig = rec {
+    mkMicrovmConfig = hypervisor: rec {
       hostName = "initos-microvm";
-      hypervisor = "qemu";
+      inherit hypervisor;
       vmHostPackages = pkgs;
       inherit kernel;
       initrdPath = "${initosProfile}/boot/initrd.img";
       vcpu = 1;
       mem = 512;
+      hugepageMem = false;
       balloon = false;
       initialBalloonMem = 0;
       deflateOnOOM = true;
@@ -38,7 +40,7 @@
       forwardPorts = [];
       devices = [];
       shares = [
-        {
+        ({
           proto = "9p";
           tag = "src";
           source = "../../target/vm/microvm-echo/share";
@@ -47,7 +49,10 @@
           readOnly = false;
           socket = null;
           cache = "auto";
-        }
+        } // pkgs.lib.optionalAttrs (hypervisor == "cloud-hypervisor") {
+          proto = "virtiofs";
+          socket = "../../target/vm/microvm-echo/src.sock";
+        })
       ];
       volumes = [
         {
@@ -64,12 +69,22 @@
           imageType = "raw";
         }
       ];
-      socket = null;
+      socket = if hypervisor == "crosvm" then "../../target/vm/microvm-echo/crosvm.sock" else null;
       vsock = { cid = null; };
       graphics = {
         enable = false;
         backend = "gtk";
         socket = "initos-microvm-gpu.sock";
+      };
+      cloud-hypervisor = {
+        package = pkgs.cloud-hypervisor;
+        extraArgs = [];
+        platformOEMStrings = [];
+      };
+      crosvm = {
+        package = pkgs.crosvm;
+        extraArgs = [ "--disable-sandbox" ];
+        pivotRoot = null;
       };
       storeOnDisk = false;
       storeDisk = "";
@@ -99,14 +114,18 @@
         "initos_host=initos-microvm"
       ];
     };
+    mkRunner = hypervisor: microvm.lib.buildRunner {
+      inherit pkgs;
+      microvmConfig = mkMicrovmConfig hypervisor;
+      toplevel = emptyToplevel;
+    };
   in {
     packages.${system} = rec {
-      runner = microvm.lib.buildRunner {
-        inherit pkgs;
-        microvmConfig = microvmConfig;
-        toplevel = emptyToplevel;
-      };
-      default = runner;
+      runner-qemu = mkRunner "qemu";
+      runner-crosvm = mkRunner "crosvm";
+      runner-cloud-hypervisor = mkRunner "cloud-hypervisor";
+      runner = runner-crosvm;
+      default = runner-crosvm;
     };
   };
 }

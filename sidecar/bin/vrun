@@ -107,9 +107,12 @@ virt_resolve_layout() {
   fi
 
   VIRT_KERNEL=${VIRT_KERNEL:-$(virt_first_file \
+    "${VIRT_IMG}/vmlinux-cloud" \
     "${VIRT_IMG}/vmlinuz-cloud" \
     "${VIRT_IMG}/bzImage" \
+    "${VIRT_ROOT}/vmlinux" \
     "${VIRT_ROOT}/vmlinuz" \
+    "${VIRT}/vmlinux" \
     "${VIRT}/vmlinuz" 2>/dev/null || true)}
   VIRT_ROOTFS=${VIRT_ROOTFS:-$(virt_first_file \
     "${VIRT_IMG}/initos.erofs" \
@@ -141,6 +144,9 @@ virt_resolve_layout() {
   VIRT_QEMU=${VIRT_QEMU:-$(virt_first_file \
     "${VIRT_BIN}/qemu-system-x86_64" \
     "${VIRT}/qemu-system-x86_64" 2>/dev/null || command -v qemu-system-x86_64)}
+  VIRT_CROSVM=${VIRT_CROSVM:-$(virt_first_file \
+    "${VIRT_BIN}/crosvm" \
+    "${VIRT}/crosvm" 2>/dev/null || command -v crosvm)}
 
   [ -n "${VIRT_KERNEL}" ] || {
     echo "Missing VM kernel. Set VIRT to a Nix VM profile or set VIRT_KERNEL." >&2
@@ -251,20 +257,28 @@ run_virtiofsd() {
     rm -f ${WORK}/virtiofsd.pid
   fi
 
-  rm -f ${WORK}/virtiofsd.sock || true
+  rm -f ${WORK}/virtiofs.sock || true
 
   # Faster than virtio-9p or regular 9p/nfs
   # FUSE messages over vhost-user socket
   # DAX (using host buffers) not enabled.
-  #       --log-level debug 
-  ${VIRT_VIRTIOFSD} \
-      --socket-path=${WORK}/virtiofs.sock \
-      --shared-dir=${dir} \
-      --cache=never \
-      --xattr \
-      --thread-pool-size=4 \
-      --allow-direct-io \
-      --sandbox namespace  > ${WORK}/virtiofs.log  2>&1 &
+  # Keep startup lean for the default VM smoke path. The namespace sandbox and
+  # inode file-handle probes are configurable, but both are slow/noisy on the
+  # bind-mounted development filesystems used by these tests.
+  virtiofsd_opts="--socket-path=${WORK}/virtiofs.sock"
+  virtiofsd_opts="${virtiofsd_opts} --shared-dir=${dir}"
+  virtiofsd_opts="${virtiofsd_opts} --cache=${virtiofsd_cache:-auto}"
+  virtiofsd_opts="${virtiofsd_opts} --thread-pool-size=${virtiofsd_thread_pool_size:-0}"
+  virtiofsd_opts="${virtiofsd_opts} --sandbox ${virtiofsd_sandbox:-none}"
+  virtiofsd_opts="${virtiofsd_opts} --inode-file-handles=${virtiofsd_inode_file_handles:-never}"
+  virtiofsd_opts="${virtiofsd_opts} --log-level=${virtiofsd_log_level:-error}"
+  if [ "${virtiofsd_xattr:-0}" != "0" ]; then
+    virtiofsd_opts="${virtiofsd_opts} --xattr"
+  fi
+  if [ "${virtiofsd_allow_direct_io:-1}" != "0" ]; then
+    virtiofsd_opts="${virtiofsd_opts} --allow-direct-io"
+  fi
+  ${VIRT_VIRTIOFSD} ${virtiofsd_opts} > ${WORK}/virtiofs.log  2>&1 &
       
     # Default sandbox is namespace, doesn't work in chroot  
     # --allow-mmap should only be used with exclusive access
@@ -273,6 +287,17 @@ run_virtiofsd() {
 
     # Save the PID
     echo $! > ${WORK}/virtiofsd.pid
+
+    n=0
+    while [ "${n}" -lt 100 ] && [ ! -S "${WORK}/virtiofs.sock" ]; do
+      sleep 0.05
+      n=$((n + 1))
+    done
+    if [ ! -S "${WORK}/virtiofs.sock" ]; then
+      echo "virtiofsd did not create ${WORK}/virtiofs.sock" >&2
+      cat "${WORK}/virtiofs.log" >&2 || true
+      exit 1
+    fi
 
     return 0
 }
@@ -356,9 +381,11 @@ start() {
 
     OPTS="$OPTS --pvpanic"
     OPTS="$OPTS --api-socket=${WORK}/ch.sock"
-    OPTS="$OPTS --memory size=${vm_mem:-1G},shared=on"
-    OPTS="$OPTS --cpus boot=${vm_cpu:-4}"
-    OPTS="$OPTS --balloon size=${vm_balloon:-256M},deflate_on_oom=on "
+    OPTS="$OPTS --memory size=${vm_mem:-512M},shared=on"
+    OPTS="$OPTS --cpus boot=${vm_cpu:-1}"
+    if [ "${vm_balloon:-0}" != "0" ]; then
+      OPTS="$OPTS --balloon size=${vm_balloon},deflate_on_oom=on "
+    fi
 
     # Only 2 supported ?
     OPTS="$OPTS --disk path=${VIRT_ROOTFS},readonly=on"
@@ -506,6 +533,8 @@ qemuvirt() {
     echo "Missing rootfs image. Set VIRT to a Nix VM profile or set ROOTFS." >&2
     exit 1
   }
+
+  run_virtiofsd ${WORK}
   
   cmd="root=/dev/vda rootfstype=erofs rootwait loglevel=7"
   cmd="${cmd} console=hvc0"
@@ -520,24 +549,75 @@ qemuvirt() {
     initrd_arg="-initrd ${INITRD}"
   fi
 
-    ${VIRT_QEMU} \
+  qemu_mem="${vm_mem:-512M}"
+  qemu_cpu="${vm_cpu:-1}"
+
+  ${VIRT_QEMU} \
   -nodefaults \
-  -m 1G \
+  -m "${qemu_mem}" \
+  -object "memory-backend-memfd,id=mem,size=${qemu_mem},share=on" \
+  -machine "memory-backend=mem" \
   -no-reboot \
-  -smp 4 \
+  -smp "${qemu_cpu}" \
   $ACCEL \
   -nographic \
   -kernel "${KERNEL}" \
   ${initrd_arg} \
   -drive "if=none,id=rootfs,format=raw,readonly=on,file=${ROOTFS}" \
   -device virtio-blk-pci,drive=rootfs \
-  -fsdev "local,security_model=mapped,id=fsdev0,path=${WORK}/share" \
-  -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src \
+  -chardev "socket,id=virtfs0,path=${WORK}/virtiofs.sock" \
+  -device "vhost-user-fs-pci,chardev=virtfs0,tag=src" \
   -device virtio-serial-pci \
   -chardev stdio,id=console,signal=off \
   -device virtconsole,chardev=console \
   -append "${cmd}"
   
+}
+
+crosvmvirt() {
+  virt_resolve_layout
+  vm_init
+
+  KERNEL="${KERNEL:-${VIRT_KERNEL}}"
+  ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
+  INITRD="${INITRD:-${VIRT_INITRD}}"
+
+  [ -n "${VIRT_CROSVM}" ] || {
+    echo "Missing crosvm. Set VIRT to a Nix VM profile or set VIRT_CROSVM." >&2
+    exit 1
+  }
+  [ -n "${ROOTFS}" ] || {
+    echo "Missing rootfs image. Set VIRT to a Nix VM profile or set ROOTFS." >&2
+    exit 1
+  }
+
+  cmd="console=ttyS0 reboot=k panic=1"
+  cmd="${cmd} root=/dev/vda rootfstype=erofs rootwait"
+  cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
+  cmd="${cmd} net.ifnames=0 initos_host=${POD}"
+  if [ "${DEBUG}" = "init" ]; then
+    cmd="${cmd} debug_init initos_dbg=1 loglevel=8 ignore_loglevel"
+  fi
+
+  initrd_arg=
+  if [ -n "${USE_INITRD:-}" ] && [ -n "${INITRD}" ]; then
+    initrd_arg="--initrd ${INITRD}"
+  fi
+
+  rm -f "${WORK}/crosvm.sock"
+
+  ${VIRT_CROSVM} --no-syslog run \
+    -m "${vm_mem_mb:-512}" \
+    -c "${vm_cpu:-1}" \
+    --serial "type=stdout,console=true,stdin=true" \
+    -p "${cmd}" \
+    --no-balloon \
+    -s "${WORK}/crosvm.sock" \
+    --block "${ROOTFS},o_direct=false,ro=true" \
+    --shared-dir "${WORK}/share:src:type=fs" \
+    ${initrd_arg} \
+    "${KERNEL}" \
+    --disable-sandbox
 }
 
 layout() {
@@ -557,6 +637,7 @@ layout() {
   echo "VIRT_CLOUD_HYPERVISOR=${VIRT_CLOUD_HYPERVISOR}"
   echo "VIRT_VIRTIOFSD=${VIRT_VIRTIOFSD}"
   echo "VIRT_QEMU=${VIRT_QEMU}"
+  echo "VIRT_CROSVM=${VIRT_CROSVM}"
 }
 
 ## Stop gracefully (vm_ctrl), expects the socket.
@@ -568,6 +649,7 @@ stop() {
   cleanup_pid_file "${WORK}/virtiofsd.pid"
   cleanup_pid_file "${WORK}/virtiofs.sock.pid"
   rm -f "${WORK}/ch.sock" "${WORK}/serial.socket" "${WORK}/virtiofs.sock"
+  rm -f "${WORK}/crosvm.sock"
 }
 
 ## Kill the VM process. Virtiofsd will terminate itself after VM dies.
@@ -576,6 +658,7 @@ vmkill() {
   cleanup_pid_file "${WORK}/virtiofsd.pid"
   cleanup_pid_file "${WORK}/virtiofs.sock.pid"
   rm -f "${WORK}/ch.sock" "${WORK}/serial.socket" "${WORK}/virtiofs.sock"
+  rm -f "${WORK}/crosvm.sock"
 }
 
 console() {

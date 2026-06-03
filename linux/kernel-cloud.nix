@@ -5,6 +5,7 @@ let
   baseKernel = pkgs.linuxKernel.kernels.linux_6_18;
 
   configFragments = [
+    "common.fragment"
     "builtins.fragment"
     "filesystems.fragment"
     "crypto.fragment"
@@ -67,6 +68,14 @@ pkgs.runCommand "initos-kernel-cloud" {
   else
     echo "ERROR: could not find built x86 kernel image in ${kernel}" >&2
     find ${kernel} -maxdepth 2 -type f >&2
+    exit 1
+  fi
+
+  if [ -f ${kernel.dev}/vmlinux ]; then
+    cp ${kernel.dev}/vmlinux "$out/img/vmlinux"
+  else
+    echo "ERROR: could not find built x86 vmlinux in ${kernel.dev}" >&2
+    find ${kernel.dev} -maxdepth 2 -type f >&2
     exit 1
   fi
 

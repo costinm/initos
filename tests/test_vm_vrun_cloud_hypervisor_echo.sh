@@ -27,8 +27,6 @@ case "${1:-start}" in
 	  start)
 	    echo "hi"
 	    echo "hi" > /dev/kmsg 2>/dev/null || true
-	    sync
-	    sleep 300
     ;;
   *)
     echo "unsupported command: $1" >&2
@@ -38,34 +36,48 @@ esac
 EOF
 chmod 755 "${SRC}/initos-pod"
 
-if [[ ! -x "${PROFILE}/bin/initos-vrun" ]]; then
-  nix build "path:${PROJECT_ROOT}#vm-cloud-profile" -o "${PROFILE}"
-fi
+nix build "path:${PROJECT_ROOT}#vm-cloud-profile" -o "${PROFILE}"
 
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-  vm_mem="${vm_mem:-1G}" vm_balloon="${vm_balloon:-256M}" NO_NET=1 SERIAL_LOG="${SERIAL_LOG}" \
+  vm_mem="${vm_mem:-512M}" vm_cpu="${vm_cpu:-1}" vm_balloon="${vm_balloon:-0}" NO_NET=1 SERIAL_LOG="${SERIAL_LOG}" \
   "${PROFILE}/bin/initos-vrun" start
 
-stop_vm() {
-  env POD="${POD}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
-    PATH="${PROFILE}/bin:${PATH}" "${PROFILE}/bin/initos-vrun" stop
-}
-
 deadline=$((SECONDS + ${TIMEOUT:-90}))
+printed=0
 while [[ $SECONDS -lt $deadline ]]; do
-  if [[ -f "${SERIAL_LOG}" ]] && grep -q "hi" "${SERIAL_LOG}"; then
-    stop_vm 2>/dev/null || true
-    echo "cloud-hypervisor one-shot echo test passed"
-    exit 0
+  if [[ -f "${SERIAL_LOG}" ]] && tr -d '\r' < "${SERIAL_LOG}" | grep -qx "hi"; then
+    printed=1
+    break
   fi
-  sleep 1
+  sleep 0.1
 done
 
-stop_vm 2>/dev/null || \
+if [[ "${printed}" != 1 ]]; then
   env POD="${POD}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
     "${PROFILE}/bin/initos-vrun" vmkill 2>/dev/null || true
-if [[ -f "${SERIAL_LOG}" ]]; then
-  cat "${SERIAL_LOG}" >&2
+  if [[ -f "${SERIAL_LOG}" ]]; then
+    cat "${SERIAL_LOG}" >&2
+  fi
+  echo "cloud-hypervisor one-shot echo was not printed to the serial console" >&2
+  exit 1
 fi
-echo "cloud-hypervisor one-shot echo was not printed to the serial console" >&2
-exit 1
+
+pid_file="${VM_STATE}/run/vm.pid"
+if [[ -f "${pid_file}" ]]; then
+  vm_pid="$(cat "${pid_file}")"
+  exit_deadline=$((SECONDS + 10))
+  while [[ $SECONDS -lt $exit_deadline ]] && kill -0 "${vm_pid}" 2>/dev/null; do
+    sleep 0.1
+  done
+  if kill -0 "${vm_pid}" 2>/dev/null; then
+    echo "cloud-hypervisor did not exit after guest poweroff" >&2
+    env POD="${POD}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
+      "${PROFILE}/bin/initos-vrun" vmkill 2>/dev/null || true
+    exit 1
+  fi
+fi
+
+rm -f "${VM_STATE}/run/vm.pid" "${VM_STATE}/run/virtiofsd.pid" "${VM_STATE}/run/virtiofs.sock.pid"
+rm -f "${VM_STATE}/run/ch.sock" "${VM_STATE}/run/serial.socket" "${VM_STATE}/run/virtiofs.sock"
+
+echo "cloud-hypervisor one-shot echo test passed"
