@@ -269,6 +269,49 @@
         initos-artifacts = mkInitosArtifacts { };
         initos-artifacts-with-kernels = mkInitosArtifacts { withKernels = true; };
 
+        vm-cloud-profile = pkgs.runCommand "initos-vm-cloud-profile" { } ''
+          mkdir -p "$out"/{bin,boot,img}
+
+          ln -s ${initos-artifacts}/img/initos.erofs "$out/img/initos.erofs"
+          ln -s ${initos-artifacts}/boot/EFI/BOOT/initrd.img "$out/boot/initrd.img"
+          ln -s ${kernel-cloud}/img/bzImage "$out/img/vmlinuz-cloud"
+          ln -s ${initos-artifacts}/opt "$out/opt"
+
+          for m in ${kernel-cloud}/img/modules-*.erofs; do
+            if [ -f "$m" ]; then
+              ln -s "$m" "$out/img/modules-cloud.erofs"
+            fi
+          done
+
+          ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
+          ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
+          ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
+          ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
+          ln -s ${./sidecar/bin/vrun} "$out/bin/vrun"
+
+          cat > "$out/bin/initos-vrun" <<EOF
+#!${pkgs.runtimeShell}
+export VIRT="\''${VIRT:-$out}"
+export PATH="$out/bin:\$PATH"
+exec "$out/bin/vrun" "\$@"
+EOF
+          chmod 755 "$out/bin/initos-vrun"
+
+          cat > "$out/README" <<EOF
+          initos VM cloud profile
+
+          Important paths:
+            $out/img/initos.erofs
+            $out/img/vmlinuz-cloud
+            $out/img/modules-cloud.erofs
+            $out/boot/initrd.img
+            $out/opt
+
+          sidecar/bin/vrun-compatible entrypoint:
+            $out/bin/initos-vrun
+          EOF
+        '';
+
         # ── Docker image ───────────────────────────────────────────────────
 
         docker-image = pkgs.dockerTools.buildImage {
@@ -300,8 +343,16 @@
         packages = {
           inherit initos efi kernel-cloud kernel-host firmware-erofs
                   initos-artifacts initos-artifacts-with-kernels
+                  vm-cloud-profile
                   docker-image oci-cache-image;
           default = initos-artifacts;
+        };
+
+        apps = {
+          vm-cloud = {
+            type = "app";
+            program = "${vm-cloud-profile}/bin/initos-vrun";
+          };
         };
       }
     );

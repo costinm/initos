@@ -68,7 +68,95 @@ if [ -f ${SRC}/env ]; then
   . ${SRC}/env
 fi
 
+virt_first_file() {
+  for f in "$@"; do
+    if [ -f "${f}" ]; then
+      printf '%s\n' "${f}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+virt_resolve_layout() {
+  virt=${virt:-cloud-hypervisor}
+  OPTS=${OPTS:-}
+  CMD_OPTS=${CMD_OPTS:-}
+  QDISKS=${QDISKS:-}
+  DISKS=${DISKS:-}
+  NETX=${NETX:-}
+  TIME=${TIME:-}
+  DEBUG=${DEBUG:-}
+  qemu_base=${qemu_base:-}
+  QEMU_UI=${QEMU_UI:-}
+
+  if [ -d "${VIRT}/img" ] || [ -d "${VIRT}/boot" ]; then
+    VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
+    VIRT_BIN=${VIRT_BIN:-${VIRT_ROOT}/bin}
+    VIRT_IMG=${VIRT_IMG:-${VIRT_ROOT}/img}
+    VIRT_BOOT=${VIRT_BOOT:-${VIRT_ROOT}/boot}
+    VIRT_OPT=${VIRT_OPT:-${VIRT_ROOT}/opt}
+  else
+    VIRT_ROOT=${VIRT_ROOT:-${VIRT}}
+    VIRT_BIN=${VIRT_BIN:-${VIRT}}
+    VIRT_IMG=${VIRT_IMG:-${VIRT}}
+    VIRT_BOOT=${VIRT_BOOT:-${VIRT}}
+    VIRT_OPT=${VIRT_OPT:-${VIRT}}
+  fi
+
+  VIRT_KERNEL=${VIRT_KERNEL:-$(virt_first_file \
+    "${VIRT_IMG}/vmlinuz-cloud" \
+    "${VIRT_IMG}/bzImage" \
+    "${VIRT_ROOT}/vmlinuz" \
+    "${VIRT}/vmlinuz" 2>/dev/null || true)}
+  VIRT_ROOTFS=${VIRT_ROOTFS:-$(virt_first_file \
+    "${VIRT_IMG}/initos.erofs" \
+    "${VIRT_ROOT}/initos.erofs" \
+    "${VIRT}/initos.erofs" 2>/dev/null || true)}
+  VIRT_INITRD=${VIRT_INITRD:-$(virt_first_file \
+    "${VIRT_BOOT}/initrd.img" \
+    "${VIRT_BOOT}/EFI/BOOT/initrd.img" \
+    "${VIRT_ROOT}/initrd.img" \
+    "${VIRT}/initrd.img" 2>/dev/null || true)}
+  VIRT_MODULES=${VIRT_MODULES:-$(virt_first_file \
+    "${VIRT_IMG}/modules-cloud.erofs" \
+    "${VIRT_ROOT}/modules.erofs" \
+    "${VIRT}/modules.erofs" 2>/dev/null || true)}
+  VIRT_BUSYBOX=${VIRT_BUSYBOX:-$(virt_first_file \
+    "${VIRT_OPT}/busybox/bin/busybox" \
+    "${VIRT_BIN}/busybox" \
+    "${VIRT}/busybox" 2>/dev/null || true)}
+  VIRT_INITOS_INIT_VM=${VIRT_INITOS_INIT_VM:-$(virt_first_file \
+    "${VIRT_OPT}/initos/bin/initos-init-vm" \
+    "${VIRT_BIN}/initos-init-vm" \
+    "${VIRT}/initos-init-vm" 2>/dev/null || true)}
+  VIRT_CLOUD_HYPERVISOR=${VIRT_CLOUD_HYPERVISOR:-$(virt_first_file \
+    "${VIRT_BIN}/cloud-hypervisor" \
+    "${VIRT}/cloud-hypervisor" 2>/dev/null || command -v cloud-hypervisor)}
+  VIRT_VIRTIOFSD=${VIRT_VIRTIOFSD:-$(virt_first_file \
+    "${VIRT_BIN}/virtiofsd" \
+    "${VIRT}/virtiofsd" 2>/dev/null || command -v virtiofsd)}
+  VIRT_QEMU=${VIRT_QEMU:-$(virt_first_file \
+    "${VIRT_BIN}/qemu-system-x86_64" \
+    "${VIRT}/qemu-system-x86_64" 2>/dev/null || command -v qemu-system-x86_64)}
+
+  [ -n "${VIRT_KERNEL}" ] || {
+    echo "Missing VM kernel. Set VIRT to a Nix VM profile or set VIRT_KERNEL." >&2
+    exit 1
+  }
+  [ -n "${VIRT_BUSYBOX}" ] || {
+    echo "Missing busybox. Set VIRT to a Nix VM profile or set VIRT_BUSYBOX." >&2
+    exit 1
+  }
+  [ -n "${VIRT_INITOS_INIT_VM}" ] || {
+    echo "Missing initos-init-vm. Set VIRT to a Nix VM profile or set VIRT_INITOS_INIT_VM." >&2
+    exit 1
+  }
+}
+
 vm_init() {
+  virt_resolve_layout
+
   # if [ ! -d ${WORK}/share/lib/modules ]; then
   #   # Loading Nvidia drivers from share modules doesn't work - using separate volumes.
   #   # In the VM, this can be copied over - to avoid creating a separate image.
@@ -100,10 +188,10 @@ vm_init() {
 
   mkdir -p ${WORK}/share/initos ${WORK}/share/bin
 
-  cp ${VIRT}/initos-init-vm ${WORK}/share/initos/initos-init-vm
+  cp ${VIRT_INITOS_INIT_VM} ${WORK}/share/initos/initos-init-vm
 
   if [ ! -e ${WORK}/share/bin/sh ]; then
-    cp ${VIRT}/busybox ${WORK}/share/bin
+    cp ${VIRT_BUSYBOX} ${WORK}/share/bin
     (cd ${WORK}/share/bin && ln -s busybox sh)
   fi
 }
@@ -128,7 +216,7 @@ run_virtiofsd() {
   # FUSE messages over vhost-user socket
   # DAX (using host buffers) not enabled.
   #       --log-level debug 
-  ${VIRT}/virtiofsd \
+  ${VIRT_VIRTIOFSD} \
       --socket-path=${WORK}/virtiofs.sock \
       --shared-dir=${dir} \
       --cache=never \
@@ -203,7 +291,10 @@ start() {
     echo "  SSH-MESH: virtio-serial socket at ${WORK}/mesh.sock"
     
 
-    OPTS="$OPTS -kernel ${VIRT}/vmlinuz"
+    OPTS="$OPTS -kernel ${VIRT_KERNEL}"
+    if [ -n "${USE_INITRD:-}" ] && [ -n "${VIRT_INITRD}" ]; then
+      OPTS="$OPTS -initrd ${VIRT_INITRD}"
+    fi
     if [ -z "${QEMU_UI}" ]; then
         qemu_base="${qemu_base} -nographic"
     else
@@ -221,7 +312,10 @@ start() {
 
     # Only 2 supported ?
     OPTS="$OPTS --fs tag=/dev/root,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
-    OPTS="$OPTS --kernel ${VIRT}/vmlinuz"
+    OPTS="$OPTS --kernel ${VIRT_KERNEL}"
+    if [ -n "${USE_INITRD:-}" ] && [ -n "${VIRT_INITRD}" ]; then
+      OPTS="$OPTS --initramfs ${VIRT_INITRD}"
+    fi
     
     # virtio-net is used for eth
     # tap is the address of the tap on the VM side
@@ -237,10 +331,10 @@ start() {
 
   CMD_OPTS="$CMD_OPTS trace_clock=global panic=1  panic_on_oops=1 reboot=acpi "
   
-  DISKS="--disk "
+  DISKS=""
 
   if [ -f ${IMGDIR}/${POD}-rootfs.img ] ; then
-      DISKS="${DISKS} path=${IMGDIR}/${POD}-rootfs.img "
+      DISKS="${DISKS} --disk path=${IMGDIR}/${POD}-rootfs.img"
       QDISKS="${QDISKS} -drive file=${IMGDIR}/${POD}-rootfs.img,format=raw,if=virtio"
       CMD_OPTS="${CMD_OPTS} initos_root=/dev/vda "
         
@@ -249,7 +343,7 @@ start() {
   fi
 
   # Not sure if this is still useful.
-  #DISKS="${DISKS} path=${VIRT}/modules.erofs,readonly=on"
+  #DISKS="${DISKS} path=${VIRT_MODULES},readonly=on"
 
   # All disks under ${IMGDIR} with file name starting with ${POD} are added as additional disks.
   # This allows to add data disks, cache disks, etc.
@@ -258,7 +352,7 @@ start() {
   echo "${EXTRA_DISKS}"
   for disk in $EXTRA_DISKS; do
     if [ -f ${disk} ]; then
-      DISKS="$DISKS path=${disk}"
+      DISKS="${DISKS} --disk path=${disk}"
     fi
   done
   
@@ -267,12 +361,12 @@ start() {
   fi
 
   if [ -f ${IMGDIR}/${POD}-cache.img ]; then
-    DISKS="$DISKS path=${IMGDIR}/${POD}-cache.img" 
+    DISKS="${DISKS} --disk path=${IMGDIR}/${POD}-cache.img"
     CMD_OPTS="${CMD_OPTS} initos_data=LABEL=CACHE"
   fi
 
   if [ -f ${IMGDIR}/sidecar.img ]; then
-    DISKS="$DISKS path=${IMGDIR}/sidecar.img,readonly=on" 
+    DISKS="${DISKS} --disk path=${IMGDIR}/sidecar.img,readonly=on"
   fi
   OPTS="$OPTS $DISKS"
     
@@ -308,14 +402,14 @@ start() {
   if [ -n "${DEBUG}" ]; then
      # For now only debug for qemu  
      if [ "$virt" = "qemu" ] ; then
-        qemu-system-x86_64 $OPTS -append "${CMD_OPTS}" 
+        ${VIRT_QEMU} $OPTS -append "${CMD_OPTS}"
      else
-      $TIME ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}"
+      $TIME ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
      fi
   elif [ "${RC_SVCNAME:-}" != "" ]; then
-    ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" 
+    ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}"
   else  
-    ${VIRT}/cloud-hypervisor $OPTS --cmdline "${CMD_OPTS}" > ${WORK}/vmcmd.logs 2>&1 &
+    ${VIRT_CLOUD_HYPERVISOR} $OPTS --cmdline "${CMD_OPTS}" > ${WORK}/vmcmd.logs 2>&1 &
     echo $! > ${WORK}/vm.pid
   fi
 }
@@ -336,15 +430,28 @@ fi
 # Unlike tests/run_qemu.sh and tests/test_img.sh - this does not use
 # EFI and the host kernel.
 qemuvirt() {
-  KERNEL="${KERNEL:-${HOME}/.cache/initos-kernel-cloud/img/bzImage}"
-  ROOTFS="${ROOTFS:-$(pwd)/target/disks/state/img/initos.erofs}"
+  virt_resolve_layout
+
+  KERNEL="${KERNEL:-${VIRT_KERNEL}}"
+  ROOTFS="${ROOTFS:-${VIRT_ROOTFS}}"
+  INITRD="${INITRD:-${VIRT_INITRD}}"
+
+  [ -n "${ROOTFS}" ] || {
+    echo "Missing rootfs image. Set VIRT to a Nix VM profile or set ROOTFS." >&2
+    exit 1
+  }
   
   cmd="root=/dev/vda rootfstype=erofs rootwait loglevel=7"
   cmd="${cmd} console=hvc0"
   cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
   cmd="${cmd} net.ifnames=0 panic=1 debug_init initos_dbg=1"
     
-    qemu-system-x86_64 \
+  initrd_arg=
+  if [ -n "${USE_INITRD:-}" ] && [ -n "${INITRD}" ]; then
+    initrd_arg="-initrd ${INITRD}"
+  fi
+
+    ${VIRT_QEMU} \
   -nodefaults \
   -m 1G \
   -no-reboot \
@@ -352,6 +459,7 @@ qemuvirt() {
   $ACCEL \
   -nographic \
   -kernel "${KERNEL}" \
+  ${initrd_arg} \
   -drive "if=none,id=rootfs,format=raw,readonly=on,file=${ROOTFS}" \
   -device virtio-blk-pci,drive=rootfs \
   -device virtio-serial-pci \
@@ -359,6 +467,25 @@ qemuvirt() {
   -device virtconsole,chardev=console \
   -append "${cmd}"
   
+}
+
+layout() {
+  virt_resolve_layout
+
+  echo "VIRT_ROOT=${VIRT_ROOT}"
+  echo "VIRT_BIN=${VIRT_BIN}"
+  echo "VIRT_IMG=${VIRT_IMG}"
+  echo "VIRT_BOOT=${VIRT_BOOT}"
+  echo "VIRT_OPT=${VIRT_OPT}"
+  echo "VIRT_KERNEL=${VIRT_KERNEL}"
+  echo "VIRT_INITRD=${VIRT_INITRD}"
+  echo "VIRT_ROOTFS=${VIRT_ROOTFS}"
+  echo "VIRT_MODULES=${VIRT_MODULES}"
+  echo "VIRT_BUSYBOX=${VIRT_BUSYBOX}"
+  echo "VIRT_INITOS_INIT_VM=${VIRT_INITOS_INIT_VM}"
+  echo "VIRT_CLOUD_HYPERVISOR=${VIRT_CLOUD_HYPERVISOR}"
+  echo "VIRT_VIRTIOFSD=${VIRT_VIRTIOFSD}"
+  echo "VIRT_QEMU=${VIRT_QEMU}"
 }
 
 ## Stop gracefully (vm_ctrl), expects the socket.
