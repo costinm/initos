@@ -6,3 +6,4 @@ target/
 # Backup files from some editors
 *~
 *.swp
+result

@@ -132,10 +132,10 @@ The project uses a containerized runtime environment via `cctl` to build and tes
 
 ```bash
 # Setup the debian container
-./scripts/build.sh initos_dev
+./scripts/container_build.sh initos_dev
 
 # Build all binaries & images inside the container
-POD=initos_dev cctl ./scripts/build.sh
+./scripts/container_build.sh build
 
 # Run tests
 POD=initos_dev cctl cargo test -p initos

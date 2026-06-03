@@ -5,22 +5,22 @@ let
   baseKernel = pkgs.linuxKernel.kernels.linux_6_18;
 
   configFragments = [
-    "linux/builtins.fragment"
-    "linux/filesystems.fragment"
-    "linux/crypto.fragment"
-    "linux/containers.fragment"
-    "linux/net.fragment"
-    "linux/block.fragment"
-    "linux/usb.fragment"
-    "linux/networking.fragment"
-    "linux/mods2.fragment"
-    "linux/efi.fragment"
-    "linux/host-lenovo.fragment"
-    "linux/cros/hatch.fragment"
-    "linux/host-chromeos.fragment"
-    "linux/tpm2.fragment"
-    "linux/display.fragment"
-    "linux/y-remove.fragment"
+    "builtins.fragment"
+    "filesystems.fragment"
+    "crypto.fragment"
+    "containers.fragment"
+    "net.fragment"
+    "block.fragment"
+    "usb.fragment"
+    "networking.fragment"
+    "mods2.fragment"
+    "efi.fragment"
+    "host-lenovo.fragment"
+    "cros/hatch.fragment"
+    "host-chromeos.fragment"
+    "tpm2.fragment"
+    "display.fragment"
+    "y-remove.fragment"
   ];
 
   mergeFragmentCommands = lib.concatMapStringsSep "\n" (fragment: ''
@@ -45,9 +45,9 @@ let
     mergeRoot="$PWD/merge"
     mkdir -p "$buildRoot" "$mergeRoot"
 
-    install -m 0644 ${src}/linux/${branch}/config.amd64 "$buildRoot/.config"
+    install -m 0644 ${src}/${branch}/config.amd64 "$buildRoot/.config"
     cd "$mergeRoot"
-    "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/linux/${branch}/config
+    "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${branch}/config
     ${mergeFragmentCommands}
 
     make -C "$kernelSrc" O="$buildRoot" ARCH=x86 olddefconfig

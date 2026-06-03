@@ -5,13 +5,13 @@ let
   baseKernel = pkgs.linuxKernel.kernels.linux_6_18;
 
   configFragments = [
-    "linux/builtins.fragment"
-    "linux/filesystems.fragment"
-    "linux/crypto.fragment"
-    "linux/containers.fragment"
-    "linux/net.fragment"
-    "linux/cloud.fragment"
-    "linux/virtio.fragment"
+    "builtins.fragment"
+    "filesystems.fragment"
+    "crypto.fragment"
+    "containers.fragment"
+    "net.fragment"
+    "cloud.fragment"
+    "virtio.fragment"
   ];
 
   mergeFragmentCommands = lib.concatMapStringsSep "\n" (fragment: ''
@@ -36,9 +36,9 @@ let
     mergeRoot="$PWD/merge"
     mkdir -p "$buildRoot" "$mergeRoot"
 
-    install -m 0644 ${src}/linux/${branch}/cloud/config.cloud-amd64 "$buildRoot/.config"
+    install -m 0644 ${src}/${branch}/cloud/config.cloud-amd64 "$buildRoot/.config"
     cd "$mergeRoot"
-    "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/linux/${branch}/cloud/config.cloud
+    "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${branch}/cloud/config.cloud
     ${mergeFragmentCommands}
 
     make -C "$kernelSrc" O="$buildRoot" ARCH=x86 olddefconfig

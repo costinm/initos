@@ -19,22 +19,52 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build disk-initos
-        run: nix build .#disk-initos
+      - name: Build initos artifacts
+        run: nix build .#initos-artifacts -o result-artifacts
 
       - name: Build EFI
-        run: nix build .#efi
+        run: nix build .#efi -o result-efi
 
-      - name: Build Docker Image
-        run: nix build .#docker-image
-
-      - name: Generate NAR for disk-initos
+      - name: Check unsigned artifact layout
         run: |
-          # Get the store path from the result symlink
-          STORE_PATH=$(readlink -f result)
-          # Create a NAR file
-          nix-store --export "$STORE_PATH" > disk-initos.nar
-          echo "NAR_PATH=disk-initos.nar" >> $GITHUB_ENV
+          test -d result-artifacts/boot/EFI/BOOT
+          test -d result-artifacts/opt/busybox
+          test -d result-artifacts/opt/initos
+          test -f result-artifacts/img/initos.erofs
+          if find -L result-artifacts -type f \( -name '*.sig' -o -name '*signed*.img' \) | grep -q .; then
+            echo "unsigned artifact output contains signed artifacts" >&2
+            find -L result-artifacts -type f \( -name '*.sig' -o -name '*signed*.img' \) >&2
+            exit 1
+          fi
+
+      - name: Verify result signer
+        run: |
+          result-artifacts/bin/sign.sh artifacts \
+            result-artifacts \
+            "$RUNNER_TEMP/initos-signed" \
+            "$RUNNER_TEMP/initos-sign-keys"
+          test -f "$RUNNER_TEMP/initos-signed/img/initos.erofs.sig"
+          test -f "$RUNNER_TEMP/initos-signed/img/boot-initos-signed.img"
+          find "$RUNNER_TEMP/initos-signed/boot/EFI/BOOT" -maxdepth 1 -type f -name '*.sig' | grep -q .
+
+      - name: Build OCI cache image
+        run: nix build .#oci-cache-image -o result-oci-cache-image
+
+      - name: Package artifacts
+        run: |
+          STORE_PATH=$(readlink -f result-artifacts)
+          nix-store --export "$STORE_PATH" > initos-artifacts.nar
+          tar -C result-artifacts -czf initos-artifacts.tar.gz .
+          cp --remove-destination "$(readlink -f result-oci-cache-image)" oci-cache-image.tar.gz
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: initos-nix-artifacts
+          path: |
+            initos-artifacts.nar
+            initos-artifacts.tar.gz
+            oci-cache-image.tar.gz
 
       - name: Create Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -46,8 +76,9 @@ jobs:
           prerelease: true
           make_latest: true
           files: |
-            disk-initos.nar
-            result
-          body: "Nix build artifacts including NAR file for disk-initos."
+            initos-artifacts.nar
+            initos-artifacts.tar.gz
+            oci-cache-image.tar.gz
+          body: "Unsigned Nix artifacts, expanded artifact tarball, and OCI cache image."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

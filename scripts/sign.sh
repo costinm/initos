@@ -162,12 +162,15 @@ image() {
     # Compute the fsverity digest offline (does not require root/mounting)
     local digest_hex
     digest_hex=$(fsverity digest "${img_name}" | awk '{print $1}' | sed 's/^sha256://')
-    echo -n "${digest_hex}" | xxd -r -p > "/tmp/digest.bin"
+    local digest_bin
+    digest_bin="$(mktemp)"
+    echo -n "${digest_hex}" | xxd -r -p > "${digest_bin}"
 
     # Sign the digest
-    sign_digest "/tmp/digest.bin" \
+    sign_digest "${digest_bin}" \
       "${SECRETS}/image_key.pem" \
       "${img_name}.sig"
+    rm -f "${digest_bin}"
 }
 
 # Sign the boot EFI - original limine required embedding the SHA
@@ -216,6 +219,52 @@ efi() {
     echo "Signing initrd with db.key..."
     openssl dgst -sha256 -sign ${sec_dir}/db.key \
        -out "$INITRD_SIG_FILE" "$ESP_DIR/EFI/BOOT/initrd.img"
+}
+
+_build_fat_image() {
+    local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_file>}"
+    local img_file="${2:?Usage: _build_fat_image <boot_path> <img_file>}"
+
+    local dir_size_kb img_size_mb
+    dir_size_kb=$(du -sk "${boot_path}" | cut -f1)
+    img_size_mb=$(( (dir_size_kb * 12 / 10 / 1024) + 1 ))
+    [ "${img_size_mb}" -lt 64 ] && img_size_mb=64
+
+    mkdir -p "$(dirname "${img_file}")"
+    dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
+    mformat -i "${img_file}" -F -v "INITOSBOOT" ::
+    (cd "${boot_path}" && mcopy -i "${img_file}" -s ./* ::)
+
+    echo "  Created: ${img_file} ($(du -h "${img_file}" | cut -f1))"
+}
+
+# Sign a Nix artifact tree produced by .#initos-artifacts.
+# Usage: artifacts <artifact_dir> <output_dir> [secrets_dir]
+artifacts() {
+    local artifact_dir="${1:?Usage: artifacts <artifact_dir> <output_dir> [secrets_dir]}"
+    local output_dir="${2:?Usage: artifacts <artifact_dir> <output_dir> [secrets_dir]}"
+    local sec_dir="${3:-${SECRETS}}"
+
+    SECRETS="${sec_dir}"
+    export SECRETS
+    sign_init
+
+    rm -rf "${output_dir}"
+    mkdir -p "${output_dir}/img" "${output_dir}/boot"
+
+    cp -R "${artifact_dir}/boot/." "${output_dir}/boot/"
+    cp -R "${artifact_dir}/img/." "${output_dir}/img/"
+    chmod -R u+w "${output_dir}/boot" "${output_dir}/img"
+
+    if [ -f "${sec_dir}/image_key.pub.b64" ] &&
+       ! grep -q 'INITOS_PUB_KEY=' "${output_dir}/boot/EFI/BOOT/config"; then
+        printf ' INITOS_PUB_KEY=%s\n' "$(cat "${sec_dir}/image_key.pub.b64")" \
+          >> "${output_dir}/boot/EFI/BOOT/config"
+    fi
+
+    image "${output_dir}/img" "initos.erofs"
+    efi "${sec_dir}" "${output_dir}/boot"
+    _build_fat_image "${output_dir}/boot" "${output_dir}/img/boot-initos-signed.img"
 }
 
 # Similar - but using limine as main loader.
@@ -298,6 +347,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "  sign_hex_digest <hex> <key> <out> Sign a hex digest string"
         echo "  image <dir> <file>                Sign an fsverity digest for an image"
         echo "  efi <sec_dir> <boot_dir>          Sign BOOTX64.EFI in a boot directory"
+        echo "  artifacts <result> <out> [keys]   Sign a Nix artifact tree"
         echo "  build_dmverity_boot               Build dm-verity boot config"
         exit 0
     fi

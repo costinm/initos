@@ -37,7 +37,7 @@ clean() {
   rm -f /etc/machine-id || true
 }
 
-# Host with dev, ui, tools and everything else.
+# Host tools, Wayland ui.
 hostui() {
   base
   
@@ -45,15 +45,17 @@ hostui() {
   add_host_ui
 }
 
+# Developer tools - CLI only
 initos_dev() {
   base
   add_dev_tools
 }
 
+# Developer tools, Kasm(or X) remote, code-server.
 initos_devui() {
   initos_dev
   ui
-  # Not local UI - but editor and remote access, plugins
+  # No local UI - but editor and remote access, plugins
   add_code
 }
 

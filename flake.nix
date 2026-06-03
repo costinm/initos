@@ -35,6 +35,7 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
         src = craneLib.cleanCargoSource ./.;
+        kernelConfigSrc = pkgs.lib.cleanSource ./linux;
 
         muslLinkerName = if system == "x86_64-linux" then "x86_64-unknown-linux-musl-gcc"
                          else if system == "aarch64-linux" then "aarch64-unknown-linux-musl-gcc"
@@ -96,14 +97,14 @@
 
         # ── Kernel artifacts ───────────────────────────────────────────────
 
-        kernel-cloud = import ./nix/kernel-cloud.nix {
+        kernel-cloud = import ./linux/kernel-cloud.nix {
           inherit pkgs;
-          src = ./.;
+          src = kernelConfigSrc;
         };
 
-        kernel-host = import ./nix/kernel-host.nix {
+        kernel-host = import ./linux/kernel-host.nix {
           inherit pkgs;
-          src = ./.;
+          src = kernelConfigSrc;
         };
 
         # Firmware: pack pkgs.linux-firmware into a single erofs image.
@@ -130,14 +131,31 @@
           ls -lh $out/img/
         '';
 
+        signRuntimePath = pkgs.lib.makeBinPath (with pkgs; [
+          coreutils
+          efitools
+          findutils
+          fsverity-utils
+          gnugrep
+          gawk
+          mtools
+          openssh
+          openssl
+          sbsigntool
+          tinyxxd
+          util-linux
+        ]);
+
         # ── Assemble all artifacts: initos.erofs, initrd, boot images ─────
         # Use runCommand (single phase) to avoid $out shadowing issues.
 
-        initos-artifacts = pkgs.runCommand "initos-artifacts" {
+        mkInitosArtifacts = { withKernels ? false }:
+        pkgs.runCommand (if withKernels then "initos-artifacts-with-kernels" else "initos-artifacts") {
           __noChroot = true;
           nativeBuildInputs = with pkgs; [
             cpio gzip erofs-utils mtools openssl sbsigntool
-          ] ++ [ initos efi kernel-cloud kernel-host firmware-erofs ];
+          ] ++ [ initos efi ]
+            ++ pkgs.lib.optionals withKernels [ kernel-cloud kernel-host firmware-erofs ];
         } ''
           USE_BUSYBOX=${pkgs.pkgsStatic.busybox}/bin/busybox
 
@@ -173,8 +191,7 @@
 
           # Run build.sh functions — must call individually ( "$@" dispatches only the first)
           export IMG_DIR="$BUILD_OUT/disks/state/img"
-          for fn in build_initos build_initrd \
-              build_boot_limine_unsigned build_boot_limine_signed build_boot_initos_signed; do
+          for fn in build_initos build_initrd build_boot_initos_unsigned; do
             echo "=== build.sh $fn ==="
             src="$BUILD_SRC" out="$BUILD_OUT" \
               bash "$BUILD_SRC/scripts/build.sh" "$fn" 2>&1
@@ -182,27 +199,29 @@
           echo "=== All build.sh functions complete ==="
 
           # ── Assemble into $out ──
-          mkdir -p "$out"/img "$out"/bin
+          mkdir -p "$out"/img "$out"/bin "$out"/boot
 
           # initos rootfs
           if [ -f "$BUILD_OUT/disks/state/img/initos.erofs" ]; then
             cp "$BUILD_OUT/disks/state/img/initos.erofs" "$out"/img/initos.erofs
           fi
 
-          # FAT boot images
-          for img in boot-initos-signed boot-limine-signed boot-limine-unsigned; do
-            if [ -f "$BUILD_OUT/disks/state/img/$img.img" ]; then
-              cp "$BUILD_OUT/disks/state/img/$img.img" "$out"/img/"$img".img
-            fi
-          done
+          # Expanded rootfs tool directories used to inspect or repackage
+          # the unsigned artifact output without unpacking initos.erofs.
+          mkdir -p "$out"/opt
+          cp -R "$BUILD_OUT/disks/initos/opt/busybox" "$out"/opt/
+          cp -R "$BUILD_OUT/disks/initos/opt/initos" "$out"/opt/
 
-          # Kernel (cloud config)
-          if [ -f "$BUILD_OUT/disks/boot-initos-signed/EFI/BOOT/bzImage" ]; then
-            cp "$BUILD_OUT/disks/boot-initos-signed/EFI/BOOT/bzImage" "$out"/img/bzImage-cloud
-          elif [ -f "$WRITABLE/prebuilt/boot/EFI/BOOT/bzImage" ]; then
+          # Expanded unsigned EFI System Partition content. Site-specific
+          # signatures and FAT images are generated later by bin/sign.sh.
+          cp -R "$BUILD_OUT/disks/boot/." "$out"/boot/
+
+          # Kernel staged in boot/
+          if [ -f "$WRITABLE/prebuilt/boot/EFI/BOOT/bzImage" ]; then
             cp "$WRITABLE/prebuilt/boot/EFI/BOOT/bzImage" "$out"/img/bzImage-cloud
           fi
 
+          ${pkgs.lib.optionalString withKernels ''
           # Cloud kernel
           if [ -f ${kernel-cloud}/img/bzImage ]; then
             cp ${kernel-cloud}/img/bzImage "$out"/img/vmlinuz-cloud
@@ -223,17 +242,32 @@
           if [ -f ${firmware-erofs}/img/firmware.erofs ]; then
             cp ${firmware-erofs}/img/firmware.erofs "$out"/img/firmware.erofs
           fi
+          ''}
 
           # bin/
           cp ${initos}/bin/initos "$out"/bin/initos
           cp ${efi}/bin/efi.efi "$out"/bin/efi.efi
           cp ${efi}/bin/BOOTX64.EFI "$out"/bin/BOOTX64.EFI 2>/dev/null || true
-          cp ${./scripts/sign.sh} "$out"/bin/sign.sh
+          cp ${./scripts/sign.sh} "$out"/bin/sign.sh.lib
+          printf '%s\n' \
+            '#!${pkgs.runtimeShell}' \
+            'export PATH="${signRuntimePath}:$PATH"' \
+            "exec \"$out/bin/sign.sh.lib\" \"\$@\"" \
+            > "$out"/bin/sign.sh
           chmod 755 "$out"/bin/*
+
+          if find "$out" -type f \( -name '*.sig' -o -name '*signed*.img' \) | grep -q .; then
+            echo "ERROR: unsigned artifact output contains signed artifacts" >&2
+            find "$out" -type f \( -name '*.sig' -o -name '*signed*.img' \) >&2
+            exit 1
+          fi
 
           echo "initos-artifacts:"
           find "$out" -type f | sort | sed "s|$out/|  |"
         '';
+
+        initos-artifacts = mkInitosArtifacts { };
+        initos-artifacts-with-kernels = mkInitosArtifacts { withKernels = true; };
 
         # ── Docker image ───────────────────────────────────────────────────
 
@@ -247,11 +281,26 @@
           };
         };
 
+        oci-cache-image = pkgs.dockerTools.buildLayeredImage {
+          name = "ghcr.io/costinm/initos/nix-artifact-cache";
+          tag = self.shortRev or "dirty";
+          contents = [ initos-artifacts ];
+          config = {
+            Env = [ "PATH=/bin" ];
+            WorkingDir = "/";
+            Labels = {
+              "org.opencontainers.image.source" = "https://github.com/costinm/initos";
+              "org.opencontainers.image.description" = "Unsigned initos Nix artifact cache";
+            };
+          };
+        };
+
       in
       {
         packages = {
           inherit initos efi kernel-cloud kernel-host firmware-erofs
-                  initos-artifacts docker-image;
+                  initos-artifacts initos-artifacts-with-kernels
+                  docker-image oci-cache-image;
           default = initos-artifacts;
         };
       }

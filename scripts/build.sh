@@ -21,12 +21,6 @@ cd "${src}"
 
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
-cctl() {
-    OUT_DIR="${out}/c/${POD:-initos_dev}" command cctl "$@"
-}
-REPO=${REPO:-ghcr.io/costinm/initos}
-TAG=${TAG:-latest}
-
 IMG_DIR=${IMG_DIR:-${out}/test/img}
 mkdir -p "${out}/test" ${IMG_DIR}
 
@@ -93,31 +87,6 @@ build_initos() {
 	INITOS_BIN="${src}/target/x86_64-unknown-linux-musl/release/initos"
 	cp "${INITOS_BIN}" "${STAGING}/opt/initos/bin/initos"
 	chmod 755 "${STAGING}/opt/initos/bin/initos"
-
-	# Include ssh-mesh binaries from nix store
-	SSH_MESH_DIR="${SSH_MESH_DIR:-/nix/store/sp9vjh5cm6kgwdv43h9vblr1r28xvqd0-ssh-mesh-full-0.1.0}"
-	SSH_MESH_BIN="${SSH_MESH_DIR}/bin"
-	if [ -d "${SSH_MESH_BIN}" ]; then
-		mkdir -p "${STAGING}/opt/ssh-mesh/bin"
-		for bin in mesh-init ssh-mesh dmesh sshmc h2t; do
-			if [ -f "${SSH_MESH_BIN}/${bin}" ]; then
-				cp "${SSH_MESH_BIN}/${bin}" "${STAGING}/opt/ssh-mesh/bin/"
-				chmod 755 "${STAGING}/opt/ssh-mesh/bin/${bin}"
-			fi
-		done
-		echo "  Added ssh-mesh binaries to /opt/ssh-mesh/bin/"
-	fi
-
-	# Build and include meshrelay (static musl) for virtio-serial ↔ UDS relay
-	if [ -f "${src}/tools/meshrelay/Cargo.toml" ]; then
-		(cd "${src}" && cargo build --release --target "${MUSL_TARGET}" --manifest-path tools/meshrelay/Cargo.toml) || true
-		MESHRELAY_BIN="${src}/target/${MUSL_TARGET}/release/meshrelay"
-		if [ -f "${MESHRELAY_BIN}" ]; then
-			cp "${MESHRELAY_BIN}" "${STAGING}/opt/initos/bin/meshrelay"
-			chmod 755 "${STAGING}/opt/initos/bin/meshrelay"
-			echo "  Added meshrelay to /opt/initos/bin/"
-		fi
-	fi
 
 	mkdir -p "${IMG_DIR}"
 
@@ -193,10 +162,14 @@ build_mesh_initrd() {
 # Common files for all boot variants.
 _boot_common() {
     local boot_path="${1:?Usage: _boot_common <boot_path>}"
+    local initrd_src="${out}/disks/boot/EFI/BOOT/initrd.img"
+    local initrd_dst="${boot_path}/EFI/BOOT/initrd.img"
     mkdir -p "${boot_path}/EFI/BOOT"
 
     cp "${src}/prebuilt/boot/EFI/BOOT/bzImage" "${boot_path}/EFI/BOOT/"
-    cp "${out}/disks/boot/EFI/BOOT/initrd.img" "${boot_path}/EFI/BOOT/"
+    if [ "${initrd_src}" != "${initrd_dst}" ]; then
+        cp "${initrd_src}" "${initrd_dst}"
+    fi
 }
 
 # Copy public UEFI keys that users enroll into PK/KEK/DB.
@@ -324,6 +297,25 @@ LIMINECFG
 
     _copy_uefi_public_keys "${boot_path}"
     _build_fat_image "${boot_path}" "boot-limine-signed.img"
+}
+
+# --- Variant 3: InitOS EFI unsigned (post-build signing input) ---
+build_boot_initos_unsigned() {
+    local boot_path="${out}/disks/boot"
+    local esp_dir="${boot_path}"
+    echo "=== Building initos unsigned boot ==="
+
+    _boot_common "${boot_path}"
+
+    # InitOS EFI as the default loader. sign.sh signs this later with site keys.
+    cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+    cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/initos.EFI"
+
+    cat > "${esp_dir}/EFI/BOOT/config" <<EOF
+INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
+EOF
+
+    _copy_uefi_public_keys "${boot_path}"
 }
 
 # --- Variant 3: InitOS EFI signed (Secure Boot) ---
@@ -463,103 +455,19 @@ sign_qemu_efi() {
 }
 
 
-### Kernel and debian rootfs 
-# Slow - only needed periodically. Kernel is saved to prebuilt.
-# Modules/firmware are in the container output.
-# 
-# Using 'cctl' tool.
-# First 2 parameters are always COMMAND and CONTAINER_NAME
-# For 'run' command, CONTAINER_IMAGE is next followed 
-# by shell command.
-#
-# It creates a ~/.cache/CONTAINER_NAME directory for out
-# and mounts current dir as src.
-# 
-
-
-# Prepares the kernel dev container:
-# - start with trixie
-# - add deb packages required for building kernel
-# Result is ~1.8G base image.
-kernel_dev() {
-    local POD=${1:-initos-dev}   
-    # Kernel 6.12 by default - but not including it.
-    # bookworm is 6.6 by default
-    POD=${POD} cctl start debian:trixie-slim
-    
-    POD=${POD} cctl ${src}/sidecar/bin/setup-deb kernel_build_tools 
-    podman commit ${POD} ${POD}
-}
-
-# Build the kernel in initos-kernel-dev container
-# Container must be running - 'podman ps -a' and 'podman start' if already
-# created, otherwise it must be built. 
+### Kernel and firmware targets.
+# These run in the current environment. Use scripts/container_build.sh for
+# container orchestration.
 kernel() {
-    POD=initos-kernel-dev cctl start initos-dev
-    POD=initos-kernel-dev cctl ${src}/sidecar/bin/setup-kernel kernel 
-
-    # out: ~/.cache/initos-kernel-dev/img
-    # 399M modules, 99M firmware
+    "${src}/sidecar/bin/setup-kernel" kernel
 }
 
 firmware() {
-    POD=initos-kernel-dev cctl start initos-dev
-    POD=initos-kernel-dev cctl ${src}/sidecar/bin/setup-kernel add_firmware 
-
-    # out: ~/.cache/initos-kernel-dev/img
-    # 399M modules, 99M firmware
+    "${src}/sidecar/bin/setup-kernel" add_firmware
 }
 
 kernel_cloud() {
-    POD=initos-kernel-cloud cctl start initos-dev
-    POD=initos-kernel-cloud cctl ${src}/sidecar/bin/setup-kernel kernel_cloud
-    # out: ~/.cache/initos-kernel-cloud/img
-}
-
-# Build a clean Debian image using the 'setup-deb' script
-# (instead of Dockerfile having RUN commands - it starts
-# a base container with sleep, runs various commands).
-#
-# After that it also creates an erofs. Currently about 1.7G from 3.6G raw,
-# including dev, UI, chrome, code and most tools I use (restic, rclone,...)
-# The script has separate functions for different sets of packages and
-# it can build smaller images - using the full set for testing.
-_img() {
-    local s=${1}
-
-    POD=${s} cctl start debian:trixie-slim
-    POD=${s} cctl ${src}/sidecar/bin/setup-deb ${s}
-
-    # podman build -t ${REPO}/${s} --build-arg SCRIPT=${s} .
-    #podman commit ${s} ${REPO}/${s} 
-    #d=$(podman unshare podman image mount ${REPO}/${s})
-    
-    d=$(podman unshare podman mount ${s})
-    # This is the rootfs for the sleeping container. Bind-mounts are not
-    # visible - they are in the private mount space of the container, not
-    # on the host.
-
-    rm -rf ${out}/${s}
-    ln -s ${d} ${out}/${s}
-    ROOTFS_IMG="${out}/test/img/${s}.erofs"
-
-    podman unshare mkfs.erofs -zlz4hc "${ROOTFS_IMG}" $d
-}
-
-hostui() {
-    _img hostui
-}
-
-initos_dev() {
-    _img initos_dev
-    # Save it as a container image - will be used for 
-    # kernel and other containers. Other images are just saved
-    # as erofs, to be used as flat images.
-    podman commit initos_dev initos_dev
-}
-
-initos_devui() {
-    _img initos_devui
+    "${src}/sidecar/bin/setup-kernel" kernel_cloud
 }
 
 

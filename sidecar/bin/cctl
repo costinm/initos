@@ -74,7 +74,7 @@ DOCKER=podman
 # the script shouldn't allow arbitrary mounts.
 _mounts() {
   # Ephemeral, can be recreated - mounted as /build
-  OUT_DIR="${OUT_DIR:-${HOME}/.cache/${NAME}}"
+  OUT_DIR="${OUT_DIR:-$(pwd)/target/c/${NAME}}"
   mkdir -p "${OUT_DIR}" 
 
   if [ -n "${DATA}" ]; then
@@ -97,16 +97,12 @@ _mounts() {
 # Use exec to run commands.
 start() {
     local IMG=${1:-debian:trixie-slim}
-    
-    if ! podman container exists "$NAME"; then
-      _mounts
-      ${DOCKER} run -d \
-        ${CARGS} ${VOLS} \
-        --name $NAME \
-            ${IMG} sleep infinity
-    elif [ "$(podman inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
-      podman start "$NAME"
-    fi
+
+    _mounts
+    ${DOCKER} run -d \
+      ${CARGS} ${VOLS} \
+      --name $NAME \
+      ${IMG} sleep infinity || ${DOCKER} start "$NAME"
 }
 
 _start_bwrap() {
@@ -318,4 +314,3 @@ cmd) shift; "$@" ;;
     sh "${CMD}" "$@"
   fi ;;
 esac
-

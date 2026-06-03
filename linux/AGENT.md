@@ -2,9 +2,10 @@
 
 ## Context
 
-The kernel build is driven by `scripts/build.sh`, `sidecar/bin/cctl`,
-`sidecar/bin/setup-deb`, and `sidecar/bin/setup-kernel`. Kernel base configs and
-fragments live under `linux/`.
+The kernel build is driven by `scripts/build.sh` in the current build
+environment. `scripts/container_build.sh` wraps `sidecar/bin/cctl` for creating
+or entering build containers. Kernel base configs and fragments live under
+`linux/`.
 
 ## Environment
 
@@ -45,13 +46,13 @@ fragments live under `linux/`.
 Create or update the build container and install dependencies:
 
 ```bash
-bash scripts/build.sh kernel_dev
+bash scripts/container_build.sh kernel_dev
 ```
 
 Clone/update, configure, build, install modules, and package artifacts:
 
 ```bash
-bash scripts/build.sh kernel
+bash scripts/container_build.sh kernel
 ```
 
 Run individual steps inside the container:

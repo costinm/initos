@@ -387,6 +387,24 @@ mod tests {
         Ok(buf)
     }
 
+    fn initos_binary() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        if let Ok(path) = std::env::var("INITOS_BINARY") {
+            return Ok(path.into());
+        }
+
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_initos") {
+            return Ok(path.into());
+        }
+
+        let mut path = std::env::current_exe()?;
+        path.pop();
+        if path.file_name().is_some_and(|name| name == "deps") {
+            path.pop();
+        }
+        path.push("initos");
+        Ok(path)
+    }
+
     fn decrypt_for_test(
         identity: &str,
         cipher: &[u8],
@@ -542,7 +560,7 @@ mod tests {
         let encrypted = encrypt_for_test(&recipient, plaintext)?;
 
         // Test with ID environment variable (no env_clear, just add ID)
-        let mut status = Command::new("initos")
+        let mut status = Command::new(initos_binary()?)
             .env("ID", &identity_str)
             .args(["decrypt"])
             .stdin(std::process::Stdio::piped())
@@ -583,7 +601,7 @@ mod tests {
         encrypted_bytes.extend_from_slice(identity_str.as_bytes());
         encrypted_bytes.push(b'\n');
 
-        let mut status = Command::new("initos")
+        let mut status = Command::new(initos_binary()?)
             .args(["decrypt"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -627,7 +645,7 @@ mod tests {
         let cipher_path = cipher_file.path().to_owned();
 
         // Test with KEY_FILE environment variable (no env_clear)
-        let mut status = Command::new("initos")
+        let status = Command::new(initos_binary()?)
             .env("KEY_FILE", key_path.to_string_lossy().as_ref())
             .args(["decrypt"])
             .stdin(std::process::Stdio::from(std::fs::File::open(
