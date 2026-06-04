@@ -267,6 +267,7 @@ run_virtiofsd() {
   # bind-mounted development filesystems used by these tests.
   virtiofsd_opts="--socket-path=${WORK}/virtiofs.sock"
   virtiofsd_opts="${virtiofsd_opts} --shared-dir=${dir}"
+  virtiofsd_opts="${virtiofsd_opts} --tag=${virtiofs_tag:-src}"
   virtiofsd_opts="${virtiofsd_opts} --cache=${virtiofsd_cache:-auto}"
   virtiofsd_opts="${virtiofsd_opts} --thread-pool-size=${virtiofsd_thread_pool_size:-0}"
   virtiofsd_opts="${virtiofsd_opts} --sandbox ${virtiofsd_sandbox:-none}"
@@ -380,6 +381,8 @@ start() {
     run_virtiofsd ${WORK}  
 
     OPTS="$OPTS --pvpanic"
+    OPTS="$OPTS --watchdog"
+    OPTS="$OPTS --seccomp true"
     OPTS="$OPTS --api-socket=${WORK}/ch.sock"
     OPTS="$OPTS --memory size=${vm_mem:-512M},shared=on"
     OPTS="$OPTS --cpus boot=${vm_cpu:-1}"
@@ -388,7 +391,7 @@ start() {
     fi
 
     # Only 2 supported ?
-    OPTS="$OPTS --disk path=${VIRT_ROOTFS},readonly=on"
+    OPTS="$OPTS --disk direct=off,image_type=raw,path=${VIRT_ROOTFS},readonly=on"
     OPTS="$OPTS --fs tag=src,socket=${WORK}/virtiofs.sock,num_queues=1,queue_size=1024"
     OPTS="$OPTS --kernel ${VIRT_KERNEL}"
     if [ -n "${USE_INITRD:-}" ] && [ -n "${VIRT_INITRD}" ]; then
@@ -552,19 +555,33 @@ qemuvirt() {
   qemu_mem="${vm_mem:-512M}"
   qemu_cpu="${vm_cpu:-1}"
 
+  if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    qemu_accel="-enable-kvm -cpu host,+x2apic,-sgx"
+    qemu_machine="q35,accel=kvm:tcg,acpi=on,mem-merge=on"
+  else
+    qemu_accel="-cpu max"
+    qemu_machine="q35,accel=tcg,acpi=on,mem-merge=on"
+  fi
+
   ${VIRT_QEMU} \
+  -name "${POD}" \
   -nodefaults \
+  -no-user-config \
   -m "${qemu_mem}" \
   -object "memory-backend-memfd,id=mem,size=${qemu_mem},share=on" \
-  -machine "memory-backend=mem" \
+  -M "${qemu_machine}" \
   -no-reboot \
   -smp "${qemu_cpu}" \
-  $ACCEL \
+  ${qemu_accel} \
   -nographic \
+  -sandbox on \
   -kernel "${KERNEL}" \
   ${initrd_arg} \
-  -drive "if=none,id=rootfs,format=raw,readonly=on,file=${ROOTFS}" \
-  -device virtio-blk-pci,drive=rootfs \
+  -drive "id=vda,format=raw,file=${ROOTFS},if=none,aio=io_uring,discard=unmap,cache=none,read-only=on" \
+  -device virtio-blk-pci,drive=vda \
+  -device virtio-rng-pci \
+  -device i8042 \
+  -numa node,memdev=mem \
   -chardev "socket,id=virtfs0,path=${WORK}/virtiofs.sock" \
   -device "vhost-user-fs-pci,chardev=virtfs0,tag=src" \
   -device virtio-serial-pci \
@@ -591,6 +608,8 @@ crosvmvirt() {
     exit 1
   }
 
+  run_virtiofsd ${WORK}
+
   cmd="console=ttyS0 reboot=k panic=1"
   cmd="${cmd} root=/dev/vda rootfstype=erofs rootwait"
   cmd="${cmd} init=/opt/initos/bin/initos-init-vm"
@@ -614,10 +633,10 @@ crosvmvirt() {
     --no-balloon \
     -s "${WORK}/crosvm.sock" \
     --block "${ROOTFS},o_direct=false,ro=true" \
-    --shared-dir "${WORK}/share:src:type=fs" \
+    --vhost-user "type=fs,socket=${WORK}/virtiofs.sock" \
     ${initrd_arg} \
-    "${KERNEL}" \
-    --disable-sandbox
+    --disable-sandbox \
+    "${KERNEL}"
 }
 
 layout() {

@@ -15,6 +15,17 @@ VM_STATE="${VM_STATE:-${PROJECT_ROOT}/target/vm/${POD}}"
 SRC="${SRC:-${VM_STATE}/src}"
 PROFILE="${PROFILE:-${PROJECT_ROOT}/target/vm/vm-cloud-profile}"
 SERIAL_LOG="${VM_STATE}/run/serial.log"
+PHASES="${VM_STATE}/run/phases.tsv"
+
+now_ns() {
+  date +%s%N
+}
+
+elapsed_ms() {
+  local start_ns="$1"
+  local end_ns="$2"
+  echo $(((end_ns - start_ns) / 1000000))
+}
 
 rm -rf "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
 mkdir -p "${VM_STATE}/run" "${VM_STATE}/images" "${SRC}"
@@ -38,15 +49,18 @@ chmod 755 "${SRC}/initos-pod"
 
 nix build "path:${PROJECT_ROOT}#vm-cloud-profile" -o "${PROFILE}"
 
+start_ns="$(now_ns)"
 env POD="${POD}" SRC="${SRC}" WORK="${VM_STATE}/run" IMGDIR="${VM_STATE}/images" \
   vm_mem="${vm_mem:-512M}" vm_cpu="${vm_cpu:-1}" vm_balloon="${vm_balloon:-0}" NO_NET=1 SERIAL_LOG="${SERIAL_LOG}" \
   "${PROFILE}/bin/initos-vrun" start
+launched_ns="$(now_ns)"
 
 deadline=$((SECONDS + ${TIMEOUT:-90}))
 printed=0
 while [[ $SECONDS -lt $deadline ]]; do
   if [[ -f "${SERIAL_LOG}" ]] && tr -d '\r' < "${SERIAL_LOG}" | grep -qx "hi"; then
     printed=1
+    hi_ns="$(now_ns)"
     break
   fi
   sleep 0.1
@@ -63,9 +77,10 @@ if [[ "${printed}" != 1 ]]; then
 fi
 
 pid_file="${VM_STATE}/run/vm.pid"
+exit_ns=""
 if [[ -f "${pid_file}" ]]; then
   vm_pid="$(cat "${pid_file}")"
-  exit_deadline=$((SECONDS + 10))
+  exit_deadline=$((SECONDS + ${CH_EXIT_WAIT:-30}))
   while [[ $SECONDS -lt $exit_deadline ]] && kill -0 "${vm_pid}" 2>/dev/null; do
     sleep 0.1
   done
@@ -75,6 +90,18 @@ if [[ -f "${pid_file}" ]]; then
       "${PROFILE}/bin/initos-vrun" vmkill 2>/dev/null || true
     exit 1
   fi
+  exit_ns="$(now_ns)"
+fi
+
+if [[ -n "${exit_ns}" ]]; then
+  {
+    printf 'phase\tms\n'
+    printf 'launch_return\t%s\n' "$(elapsed_ms "${start_ns}" "${launched_ns}")"
+    printf 'hi_observed\t%s\n' "$(elapsed_ms "${start_ns}" "${hi_ns}")"
+    printf 'exit_observed\t%s\n' "$(elapsed_ms "${start_ns}" "${exit_ns}")"
+    printf 'hi_to_exit\t%s\n' "$(elapsed_ms "${hi_ns}" "${exit_ns}")"
+  } > "${PHASES}"
+  cat "${PHASES}"
 fi
 
 rm -f "${VM_STATE}/run/vm.pid" "${VM_STATE}/run/virtiofsd.pid" "${VM_STATE}/run/virtiofs.sock.pid"
