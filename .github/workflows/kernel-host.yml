@@ -1,0 +1,40 @@
+name: Cloud Kernel
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - linux/**
+      - .github/workflows/kernel-host.yml
+  workflow_dispatch:
+
+jobs:
+  kernel-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build host kernel
+        run: nix build .#kernel-host -o result-kernel-host
+
+      - name: Check kernel output
+        run: |
+          test -f result-kernel-host/img/bzImage
+          test -f result-kernel-host/img/config
+          find -L result-kernel-host/img -maxdepth 1 -type f -name 'modules-*.erofs' | grep -q .
+
+      - name: Package host kernel
+        run: tar -C result-kernel-host -czf initos-kernel-host.tar.gz .
+
+      - name: Upload host kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: initos-kernel-host
+          path: initos-kernel-host.tar.gz

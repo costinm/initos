@@ -21,6 +21,7 @@ let
     "tpm2.fragment"
     "display.fragment"
     "y-remove.fragment"
+    "host-rust.fragment"
   ];
 
   mergeFragmentCommands = lib.concatMapStringsSep "\n" (fragment: ''
@@ -35,9 +36,12 @@ let
       gnumake
       openssl
       perl
+      rust-bindgen-unwrapped
+      rustc-unwrapped
       stdenv.cc
       xz
     ];
+    RUST_LIB_SRC = pkgs.rustPlatform.rustLibSrc;
   } ''
     tar -xf ${baseKernel.src}
     kernelSrc="$PWD/linux-${baseKernel.version}"

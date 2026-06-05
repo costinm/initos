@@ -238,7 +238,7 @@
             cp ${kernel-host}/img/bzImage "$out"/img/vmlinuz-host
           fi
           for m in ${kernel-host}/img/modules-*.erofs; do
-            [ -f "$m" ] && cp "$m" "$out"/img/modules-host.erofs
+            [ -f "$m" ] && cp "$m" "$out"/img
           done
 
           # Firmware

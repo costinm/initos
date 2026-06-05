@@ -432,7 +432,14 @@ kernel_cloud() {
 }
 
 nix_all() {
-    nix build path://`pwd`.#initos-artifacts-with-kernels
+    # initos, efi, kernel-cloud, kernel-host, firmware-erofs
+    # 
+    # initos-artifacts / -with-kernels
+    # vm-cloud-profile - pulls initos, kernel-cloud, crosvm, etc.
+    # docker-image / oci-cache-image
+    nix build .#initos-artifacts-with-kernels
+
+    # --no-link --print-out-paths
 }
 
 if [[ $# -gt 0 ]]; then
