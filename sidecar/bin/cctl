@@ -3,12 +3,7 @@
 # Container control: Script to run a container with opinionated volumes and layout.
 #
 # This may execute podman, docker - or bubblewrap, unshare (and eventually VMs with
-# qemu, cloud-hypervisor, etc). 
-# 
-# Regardless of implementation tools, it expects:
-#
-# - a command as first param (start, run, sh, etc) - $CMD
-# - a container name as second param (example-deb) - $NAME - not needed if RC_SVCNAME is set.
+# qemu, cloud-hypervisor, etc).  
 #
 # Environment on host:
 # - ${HOME}/.cache/c/${NAME} - base dir, 
@@ -20,7 +15,7 @@
 # Environment in container/VM/pod:
 # - /z - shared with the host - may be virtio, bind mount for container, 9p for remote
 #    - data - shared with the host, read write
-#    - home/build - the main user.
+#    - home/system - the main user (1000 in container/VM).
 # 
 # Why: 
 # - too hard to remember the CLI of each tool, all are different for some reason.
@@ -34,12 +29,6 @@
 # 
 TAG=${TAG:-latest}
 REPO=${REPO:-ghcr.io/costinm/initos}
-
-
-# TODO: add ujail, chroot, lxc options
-
-# Can be started with:
-# RC_SVCNAME=NAME supervise-daemon NAME --start /x/opt/virt/vrun -- start
 
 # If not specified - default to the dev container. No UI.
 NAME=${POD:-initos_dev}

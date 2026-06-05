@@ -2,10 +2,10 @@
 
 set -e
 
-# Start a VM using cloud-hypervisor.
+# Start a VM using a virtio 'src' disk and minimal startup similar to Pods.
 #
-# Using virtiofs to access shared files with the host filesystem. A local disk is required as 
-# cache and to keep Java and other apps using fancy filesystem calls happy, virtiofs is not perfect.
+# A local disk image is sometimes required as cache and to keep Java
+# and other apps using fancy filesystem calls happy, virtiofs is not perfect.
 # 
 
 # Can be started with:
@@ -23,8 +23,6 @@ if [ -z "${POD:-}" ]; then
   fi
 fi
 
-# POD is required
-
 if [ -z "${POD:-}" ]; then 
   echo "POD must be set to the target container or VM name"
   echo FG=1 will start in foreground
@@ -35,21 +33,25 @@ if [ -z "${POD:-}" ]; then
 fi
 
 # Directory layout on host:
-#    WORK - tmpfs temp dir for sockets, etc - share will have bind mounts that can be changed at runtime (/run/virt/${POD}
+#    WORK - tmpfs temp dir for sockets, etc 
+#      - share will have bind mounts that can be changed at runtime
+#      (default: for root /run/virt/${POD}, user ${HOME/.cache/c/${POD}} )
 #    SRC - $HOME/apps/${POD} - source directory, configs
 #
-#    VIRT - kernel, initrd, modules - read only
+#    VIRT - kernel, initrd, modules - read only (/opt/initos)
 #    IMGDIR - RW disks for the pod, rootfs and data dirs.
 # 
 # Layout inside container/VM:
 # 
-# /z - virtiofs shared dir, any mounts from the host
+# /z - virtiofs shared dir
 # /x - main btrfs volume, can be used for data, etc.
-# /x/@cache - optional separate volume for cache, swap etc. Not backed up.
-# /home/USER - link to /x/home/USER
+#      If a SRC image is not provided, /z/x is mounted. 
+# /x/cache - optional separate volume for cache, swap etc. Not backed up.
+# /z/home or /x/home mounted as /home 
+# /z/nix mounted as /nix with overlayfs (it is read-only host's nix)
 # 
 # Inside the home dir:
-# - .cache link to /x/@cache/home/USER/.cache
+# - .cache link to /x/cache/home/USER/.cache
 # 
 
 # Directory with hypervisor binaries, kernel, initrd, recovery

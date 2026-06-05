@@ -3,15 +3,6 @@ on:
   push:
     branches: [ main ]
     paths:
-      - flake.nix
-      - flake.lock
-      - linux/**
-      - .github/workflows/kernel-cloud.yml
-  pull_request:
-    branches: [ main ]
-    paths:
-      - flake.nix
-      - flake.lock
       - linux/**
       - .github/workflows/kernel-cloud.yml
   workflow_dispatch:
