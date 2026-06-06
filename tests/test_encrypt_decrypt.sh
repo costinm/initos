@@ -4,11 +4,11 @@
 
 set -e
 
-export PATH="$PATH:$(pwd)/target/x86_64-unknown-linux-musl/release"
+export PATH="$(pwd)/target/x86_64-unknown-linux-musl/release:$PATH"
 
 
 # Clean up any existing test files
-rm -f /tmp/initos_test.*
+rm -f /tmp/initos_test.* /tmp/initos_test_*
 
 # Step 1: Generate age key pair
 echo ""
@@ -74,7 +74,7 @@ echo ""
 
 # Method 1: Using age-keygen to create a recipients file
 echo "6.1 Using age-keygen to create recipients file:"
-age-keygen -r "$PUBLIC_KEY" -o "/tmp/initos_test_recipients.txt"
+age-keygen -y "$IDENTITY_FILE" > "/tmp/initos_test_recipients.txt"
 echo "Recipients file created: /tmp/initos_test_recipients.txt"
 echo "Contents:"
 cat "/tmp/initos_test_recipients.txt"

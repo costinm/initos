@@ -56,11 +56,6 @@ firmware() {
     POD=initos-kernel-dev cctl "${src}/scripts/build.sh" firmware
 }
 
-kernel_cloud() {
-    POD=initos-kernel-cloud cctl start initos-dev
-    POD=initos-kernel-cloud cctl "${src}/scripts/build.sh" kernel_cloud
-}
-
 # Build a clean Debian image using the setup-deb script, then package the
 # running container rootfs as an erofs image.
 _img() {

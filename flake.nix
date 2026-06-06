@@ -35,7 +35,6 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
         src = craneLib.cleanCargoSource ./.;
-        kernelConfigSrc = pkgs.lib.cleanSource ./linux;
 
         muslLinkerName = if system == "x86_64-linux" then "x86_64-unknown-linux-musl-gcc"
                          else if system == "aarch64-linux" then "aarch64-unknown-linux-musl-gcc"
@@ -95,37 +94,6 @@
           '';
         });
 
-        # ── Kernel artifacts ───────────────────────────────────────────────
-
-        kernel-host = import ./linux/kernel-host.nix {
-          inherit pkgs;
-          src = kernelConfigSrc;
-        };
-
-        # Firmware: pack pkgs.linux-firmware into a single erofs image.
-        # Pure derivation — always reproducible from the nixpkgs linux-firmware.
-        firmware-erofs = pkgs.runCommand "firmware-erofs" {
-          nativeBuildInputs = [ pkgs.erofs-utils ];
-        } ''
-          mkdir -p $out/img
-
-          if [ -d "${pkgs.linux-firmware}/lib/firmware" ]; then
-            FW_SRC="${pkgs.linux-firmware}/lib/firmware"
-          elif [ -d "${pkgs.linux-firmware}" ]; then
-            FW_SRC="${pkgs.linux-firmware}"
-          else
-            echo "ERROR: linux-firmware not found at expected path" >&2
-            exit 1
-          fi
-
-          FW_SIZE=$(du -sh "$FW_SRC" | cut -f1)
-          echo "Packing firmware ($FW_SIZE) into erofs..."
-          mkfs.erofs -zlz4 "$out/img/firmware.erofs" "$FW_SRC"
-
-          echo "firmware-erofs:"
-          ls -lh $out/img/
-        '';
-
         signRuntimePath = pkgs.lib.makeBinPath (with pkgs; [
           coreutils
           efitools
@@ -145,103 +113,26 @@
         # ── Assemble all artifacts: initos.erofs, initrd, boot images ─────
         # Use runCommand (single phase) to avoid $out shadowing issues.
 
-        mkInitosArtifacts = { withKernels ? false }:
-        pkgs.runCommand (if withKernels then "initos-artifacts-with-kernels" else "initos-artifacts") {
+        initos-artifacts = pkgs.runCommand "initos-artifacts" {
           nativeBuildInputs = with pkgs; [
             cpio gzip erofs-utils mtools openssl sbsigntool
-          ] ++ [ initos efi ]
-            ++ pkgs.lib.optionals withKernels [ kernel-host firmware-erofs ];
+          ] ++ [ initos efi ];
         } ''
-          USE_BUSYBOX=${pkgs.pkgsStatic.busybox}/bin/busybox
+          export OUT="$out"
+          export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
+          export CARGO_TOML="${./Cargo.toml}"
+          export SIDECAR_BIN="${./sidecar/bin}"
+          export SCRIPTS_DIR="${./scripts}"
+          export PREBUILT_DIR="${./prebuilt}"
+          export INITOS_BIN="${initos}/bin/initos"
+          export EFI_BIN="${efi}/bin/efi.efi"
+          export WITH_KERNELS="0"
+          export SIGN_SH_LIB="${./sidecar/bin/sign.sh}"
+          export SIGN_RUNTIME_PATH="${signRuntimePath}"
+          export RUNTIME_SHELL="${pkgs.runtimeShell}"
 
-          # Repo source (read-only nix store path)
-          CARGO_TOML=${./Cargo.toml}
-          SIDECAR_BIN=${./sidecar/bin}
-          SCRIPTS_DIR=${./scripts}
-          PREBUILT_DIR=${./prebuilt}
-
-          # Build in temp dir
-          WRITABLE="$TMPDIR/build"
-          mkdir -p "$WRITABLE"/{prebuilt/boot/EFI/BOOT,prebuilt/testdata,prebuilt/bin,sidecar/bin}
-
-          cp -R "$PREBUILT_DIR/testdata/." "$WRITABLE/prebuilt/testdata/"
-          ln -sf "$SCRIPTS_DIR" "$WRITABLE/scripts"
-
-          cp -R "$SIDECAR_BIN/." "$WRITABLE/sidecar/bin/"
-          chmod 755 "$WRITABLE/sidecar/bin/"*
-          cp "$CARGO_TOML" "$WRITABLE/Cargo.toml"
-
-          BUILD_SRC="$WRITABLE"
-          BUILD_OUT="$WRITABLE/target"
-          mkdir -p "$BUILD_OUT"/{disks/state/img,disks/boot/EFI/BOOT,test/img}
-
-          mkdir -p "$BUILD_OUT"/x86_64-unknown-linux-musl/release
-          cp ${initos}/bin/initos "$BUILD_OUT/x86_64-unknown-linux-musl/release/initos"
-          mkdir -p "$BUILD_OUT"/x86_64-unknown-uefi/release
-          cp ${efi}/bin/efi.efi "$BUILD_OUT/x86_64-unknown-uefi/release/efi.efi"
-          cp $USE_BUSYBOX "$WRITABLE/prebuilt/bin/busybox"
-
-          # Run build.sh functions — must call individually ( "$@" dispatches only the first)
-          export IMG_DIR="$BUILD_OUT/disks/state/img"
-          for fn in build_initos build_initrd build_boot_initos_unsigned; do
-            echo "=== build.sh $fn ==="
-            src="$BUILD_SRC" out="$BUILD_OUT" \
-              bash "$BUILD_SRC/scripts/build.sh" "$fn" 2>&1
-          done
-          echo "=== All build.sh functions complete ==="
-
-          # ── Assemble into $out ──
-          mkdir -p "$out"/img "$out"/bin "$out"/boot
-
-          # initos rootfs
-          if [ -f "$BUILD_OUT/disks/state/img/initos.erofs" ]; then
-            cp "$BUILD_OUT/disks/state/img/initos.erofs" "$out"/img/initos.erofs
-          fi
-
-          # Expanded rootfs tool directories used to inspect or repackage
-          # the unsigned artifact output without unpacking initos.erofs.
-          mkdir -p "$out"/opt
-          cp -R "$BUILD_OUT/disks/initos/opt/busybox" "$out"/opt/
-          cp -R "$BUILD_OUT/disks/initos/opt/initos" "$out"/opt/
-
-          # Expanded unsigned EFI System Partition content. Site-specific
-          # signatures and FAT images are generated later by bin/sign.sh.
-          cp -R "$BUILD_OUT/disks/boot/." "$out"/boot/
-
-          ${pkgs.lib.optionalString withKernels ''
-
-          for m in ${kernel-host}/img/modules-*.erofs; do
-            [ -f "$m" ] && cp "$m" "$out"/img
-          done
-
-          # Firmware
-          if [ -f ${firmware-erofs}/img/firmware.erofs ]; then
-            cp ${firmware-erofs}/img/firmware.erofs "$out"/img/firmware.erofs
-          fi
-          ''}
-
-          # bin/
-          cp ${initos}/bin/initos "$out"/bin/initos
-          cp ${./scripts/sign.sh} "$out"/bin/sign.sh.lib
-          printf '%s\n' \
-            '#!${pkgs.runtimeShell}' \
-            'export PATH="${signRuntimePath}:$PATH"' \
-            "exec \"$out/bin/sign.sh.lib\" \"\$@\"" \
-            > "$out"/bin/sign.sh
-          chmod 755 "$out"/bin/*
-
-          if find "$out" -type f \( -name '*.sig' -o -name '*signed*.img' \) | grep -q .; then
-            echo "ERROR: unsigned artifact output contains signed artifacts" >&2
-            find "$out" -type f \( -name '*.sig' -o -name '*signed*.img' \) >&2
-            exit 1
-          fi
-
-          echo "initos-artifacts:"
-          find "$out" -type f | sort | sed "s|$out/|  |"
+          bash ${./scripts/assemble_artifacts.sh}
         '';
-
-        initos-artifacts = mkInitosArtifacts { };
-        initos-artifacts-with-kernels = mkInitosArtifacts { withKernels = true; };
 
         # ── Docker image ───────────────────────────────────────────────────
 
@@ -272,9 +163,7 @@
       in
       {
         packages = {
-          inherit initos efi kernel-host firmware-erofs
-                  initos-artifacts initos-artifacts-with-kernels
-                  docker-image oci-cache-image;
+          inherit initos efi initos-artifacts docker-image oci-cache-image;
           default = initos-artifacts;
         };
 

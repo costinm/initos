@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 ################# Kernel building #######################################
 # This script runs inside a container (userspace podmain) with host directories
@@ -23,8 +23,17 @@ APTINSTALL='apt install -o Dpkg::Options::=--force-confold --assume-yes --no-ins
 
 BRANCH=${BRANCH:-6.18}
 
-out=${out:-/build}
-src=${src:-/ws}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+src=${src:-${PROJECT_ROOT}}
+if [[ ! "$src" =~ ^/ ]]; then
+    src="$(pwd)/$src"
+fi
+out=${out:-${src}/target}
+if [[ ! "$out" =~ ^/ ]]; then
+    out="$(pwd)/$out"
+fi
 
 ensure_firmware_apt_sources() {
   local changed=0
@@ -97,18 +106,6 @@ kernel() {
   kernel_pack
 }
 
-kernel_cloud() {
-  if [ ! -e ${out}/linux ] ; then
-    get_kernel
-  else 
-    cd ${out}/linux
-    git pull 
-  fi
-
-  kernel_build_cloud
-  
-  kernel_pack
-}
 
 CONF="./scripts/config"
 BUILTIN="./scripts/config --enable "
@@ -240,8 +237,8 @@ nvidia() {
     git clone https://github.com/NVIDIA/open-gpu-kernel-modules.git
   fi
   cd open-gpu-kernel-modules
-  export SYSSRC=/build/linux
-  make SYSSRC=/build/linux SYSOUT=/build/linux
+  export SYSSRC=${out}/linux
+  make SYSSRC=${out}/linux SYSOUT=${out}/linux
   make modules_install
 
  # $APTINSTALL dkms nvidia-kernel-source nvidia-cuda-toolkit

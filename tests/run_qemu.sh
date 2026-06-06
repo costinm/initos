@@ -73,7 +73,7 @@ stage_nix_artifacts() {
 rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5
 EOF
 
-    "${src}/scripts/sign.sh" efi "${src}/prebuilt/testdata/uefi-keys" "${ESP_DIR}/"
+    "${src}/sidecar/bin/sign.sh" efi "${src}/prebuilt/testdata/uefi-keys" "${ESP_DIR}/"
     build_qemu_state
 }
 
@@ -237,14 +237,14 @@ analyze() {
         exit 1
     fi
 
-    if grep -q "✅ RSA Signature VERIFIED for config" "$log_file"; then
+    if grep -q "✅ RSA Signature VERIFIED for config" "$log_file" || grep -q "✅ CONFIG VERIFIED OK" "$log_file"; then
         echo "✅ SUCCESS: Config RSA Signature verified!"
     else
         echo "❌ FAILURE: Config RSA Signature verification failed or did not run."
         exit 1
     fi
 
-    if grep -q "✅ RSA Signature VERIFIED for kernel" "$log_file"; then
+    if grep -q "✅ RSA Signature VERIFIED for kernel" "$log_file" || grep -q "✅ KERNEL VERIFIED OK" "$log_file"; then
         echo "✅ SUCCESS: Kernel RSA Signature verified!"
     else
         echo "❌ FAILURE: Kernel RSA Signature verification failed or did not run."
