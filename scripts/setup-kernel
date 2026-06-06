@@ -1,20 +1,26 @@
 #!/bin/bash
 
 ################# Kernel building #######################################
-# This script runs inside a container (userspace podmain) with host directories
-# mounted:
+# This script runs inside a container (userspace podmain) or on a VM/host 
+# with all dependencies available - either debian or nix:
 # 
-# /build (used as ${out}) is the work directory. On host it is mounted as 
-#   $HOME/.cache/initos-kernel-dev
-# ${src} contains the initos repo - default is /ws but typically is the same dir as on the host
+# ${src} contains the initos repo - in container should be same dir as on the host
+# ${out} defaults to ${src}/target
 #
 # The script has functions to install deps, firmware and clone the source and
 # build - using a debian base config plus fragments adding extra buildt-in modules
 # to avoid initrd.
 #
-# /build/linux will have the linux source tree
-# /build/open-gpu-kernel-modules will have the nvidia driver source tree
-# /build/img will have the output files, including erofs with modules, bzImage.
+# ${out}/linux will have the linux source tree
+# ${out}/open-gpu-kernel-modules will have the nvidia driver source tree
+# ${out}/img/ will have the output files, including erofs with modules, bzImage.
+#
+# An alternative is to use the nix flake under linux - which is using the sources
+# from Nix instead of getting from upstream git.
+# 
+# Both produce similar output - and need to verify both work, Nix may be
+# 'verifiable' at build level - not on the content of the source files and any
+# patches or scripts used.
 
 set -x
 set -e
