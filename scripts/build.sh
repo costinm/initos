@@ -18,6 +18,7 @@ PROFILE="release"
 MUSL_TARGET="x86_64-unknown-linux-musl"
 
 cd "${src}"
+export src out
 
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
@@ -425,10 +426,6 @@ kernel() {
 
 firmware() {
     "${src}/sidecar/bin/setup-kernel" add_firmware
-}
-
-kernel_cloud() {
-    "${src}/sidecar/bin/setup-kernel" kernel_cloud
 }
 
 nix_all() {

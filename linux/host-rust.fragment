@@ -1,0 +1,6 @@
+# Rust drivers require gendwarfksyms when module versioning is enabled.
+CONFIG_GENDWARFKSYMS=y
+CONFIG_RUST=y
+CONFIG_RUST_PHYLIB_ABSTRACTIONS=y
+CONFIG_AX88796B_PHY=m
+CONFIG_AX88796B_RUST_PHY=y

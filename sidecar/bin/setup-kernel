@@ -78,8 +78,10 @@ kernel_pack() {
   (cd /lib/modules/${VER} && mkfs.erofs -zlz4 ${out}/img/modules-${VER}.erofs .)
 }
 
+# Get the kernel and nvidia from git, apply patches, build
+# Requires a host that is setup with setup-deb kernel_build_tools
+# or a nix env with equivalent configs.
 kernel() {
-  ${src}/sidecar/bin/setup-deb kernel_build_tools
 
   #rm -rf /lib/modules/*
   if [ ! -e ${out}/linux ] ; then

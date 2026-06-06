@@ -97,11 +97,6 @@
 
         # ── Kernel artifacts ───────────────────────────────────────────────
 
-        kernel-cloud = import ./linux/kernel-cloud.nix {
-          inherit pkgs;
-          src = kernelConfigSrc;
-        };
-
         kernel-host = import ./linux/kernel-host.nix {
           inherit pkgs;
           src = kernelConfigSrc;
@@ -155,7 +150,7 @@
           nativeBuildInputs = with pkgs; [
             cpio gzip erofs-utils mtools openssl sbsigntool
           ] ++ [ initos efi ]
-            ++ pkgs.lib.optionals withKernels [ kernel-cloud kernel-host firmware-erofs ];
+            ++ pkgs.lib.optionals withKernels [ kernel-host firmware-erofs ];
         } ''
           USE_BUSYBOX=${pkgs.pkgsStatic.busybox}/bin/busybox
 
@@ -169,9 +164,6 @@
           WRITABLE="$TMPDIR/build"
           mkdir -p "$WRITABLE"/{prebuilt/boot/EFI/BOOT,prebuilt/testdata,prebuilt/bin,sidecar/bin}
 
-          ln -sf "$PREBUILT_DIR/boot/EFI/BOOT/bzImage" "$WRITABLE/prebuilt/boot/EFI/BOOT/bzImage"
-          ln -sf "$PREBUILT_DIR/boot/EFI/BOOT/BOOTX64.EFI" "$WRITABLE/prebuilt/boot/EFI/BOOT/BOOTX64.EFI"
-          ln -sf "$PREBUILT_DIR/boot/EFI/BOOT/limine.conf" "$WRITABLE/prebuilt/boot/EFI/BOOT/limine.conf"
           cp -R "$PREBUILT_DIR/testdata/." "$WRITABLE/prebuilt/testdata/"
           ln -sf "$SCRIPTS_DIR" "$WRITABLE/scripts"
 
@@ -216,27 +208,8 @@
           # signatures and FAT images are generated later by bin/sign.sh.
           cp -R "$BUILD_OUT/disks/boot/." "$out"/boot/
 
-          # Kernel staged in boot/
-          if [ -f "$WRITABLE/prebuilt/boot/EFI/BOOT/bzImage" ]; then
-            cp "$WRITABLE/prebuilt/boot/EFI/BOOT/bzImage" "$out"/img/bzImage-cloud
-          fi
-
           ${pkgs.lib.optionalString withKernels ''
-          # Cloud kernel
-          if [ -f ${kernel-cloud}/img/vmlinux ]; then
-            cp ${kernel-cloud}/img/vmlinux "$out"/img/vmlinux-cloud
-          fi
-          if [ -f ${kernel-cloud}/img/bzImage ]; then
-            cp ${kernel-cloud}/img/bzImage "$out"/img/vmlinuz-cloud
-          fi
-          for m in ${kernel-cloud}/img/modules-*.erofs; do
-            [ -f "$m" ] && cp "$m" "$out"/img/modules-cloud.erofs
-          done
 
-          # Host kernel
-          if [ -f ${kernel-host}/img/bzImage ]; then
-            cp ${kernel-host}/img/bzImage "$out"/img/vmlinuz-host
-          fi
           for m in ${kernel-host}/img/modules-*.erofs; do
             [ -f "$m" ] && cp "$m" "$out"/img
           done
@@ -249,8 +222,6 @@
 
           # bin/
           cp ${initos}/bin/initos "$out"/bin/initos
-          cp ${efi}/bin/efi.efi "$out"/bin/efi.efi
-          cp ${efi}/bin/BOOTX64.EFI "$out"/bin/BOOTX64.EFI 2>/dev/null || true
           cp ${./scripts/sign.sh} "$out"/bin/sign.sh.lib
           printf '%s\n' \
             '#!${pkgs.runtimeShell}' \
@@ -271,51 +242,6 @@
 
         initos-artifacts = mkInitosArtifacts { };
         initos-artifacts-with-kernels = mkInitosArtifacts { withKernels = true; };
-
-        vm-cloud-profile = pkgs.runCommand "initos-vm-cloud-profile" { } ''
-          mkdir -p "$out"/{bin,boot,img}
-
-          ln -s ${initos-artifacts}/img/initos.erofs "$out/img/initos.erofs"
-          ln -s ${initos-artifacts}/boot/EFI/BOOT/initrd.img "$out/boot/initrd.img"
-          ln -s ${kernel-cloud}/img/vmlinux "$out/img/vmlinux-cloud"
-          ln -s ${initos-artifacts}/opt "$out/opt"
-
-          for m in ${kernel-cloud}/img/modules-*.erofs; do
-            if [ -f "$m" ]; then
-              ln -s "$m" "$out/img/modules-cloud.erofs"
-            fi
-          done
-
-          ln -s ${pkgs.cloud-hypervisor}/bin/cloud-hypervisor "$out/bin/cloud-hypervisor"
-          ln -s ${pkgs.cloud-hypervisor}/bin/ch-remote "$out/bin/ch-remote"
-          ln -s ${pkgs.virtiofsd}/bin/virtiofsd "$out/bin/virtiofsd"
-          ln -s ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "$out/bin/qemu-system-x86_64"
-          ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm"
-          ln -s ${pkgs.socat}/bin/socat "$out/bin/socat"
-          ln -s ${./sidecar/bin/vrun} "$out/bin/vrun"
-
-          cat > "$out/bin/initos-vrun" <<EOF
-#!${pkgs.runtimeShell}
-export VIRT="\''${VIRT:-$out}"
-export PATH="$out/bin:\$PATH"
-exec "$out/bin/vrun" "\$@"
-EOF
-          chmod 755 "$out/bin/initos-vrun"
-
-          cat > "$out/README" <<EOF
-          initos VM cloud profile
-
-          Important paths:
-            $out/img/initos.erofs
-            $out/img/vmlinux-cloud
-            $out/img/modules-cloud.erofs
-            $out/boot/initrd.img
-            $out/opt
-
-          sidecar/bin/vrun-compatible entrypoint:
-            $out/bin/initos-vrun
-          EOF
-        '';
 
         # ── Docker image ───────────────────────────────────────────────────
 
@@ -346,19 +272,12 @@ EOF
       in
       {
         packages = {
-          inherit initos efi kernel-cloud kernel-host firmware-erofs
+          inherit initos efi kernel-host firmware-erofs
                   initos-artifacts initos-artifacts-with-kernels
-                  vm-cloud-profile
                   docker-image oci-cache-image;
           default = initos-artifacts;
         };
 
-        apps = {
-          vm-cloud = {
-            type = "app";
-            program = "${vm-cloud-profile}/bin/initos-vrun";
-          };
-        };
       }
     );
 }
