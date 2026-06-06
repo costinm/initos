@@ -249,7 +249,10 @@ artifacts() {
     export SECRETS
     sign_init
 
-    rm -rf "${output_dir}"
+    if [ -d "${output_dir}" ]; then
+        # Clean contents without deleting the directory itself (which could be a mount point)
+        find "${output_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    fi
     mkdir -p "${output_dir}/img" "${output_dir}/boot"
 
     cp -R "${artifact_dir}/boot/." "${output_dir}/boot/"
@@ -260,6 +263,49 @@ artifacts() {
        ! grep -q 'INITOS_PUB_KEY=' "${output_dir}/boot/EFI/BOOT/config"; then
         printf ' INITOS_PUB_KEY=%s\n' "$(cat "${sec_dir}/image_key.pub.b64")" \
           >> "${output_dir}/boot/EFI/BOOT/config"
+    fi
+
+    # Resolve and copy kernel bzImage if specified
+    local bzimage_src=""
+    if [ -n "${KERNEL_BZIMAGE:-}" ] && [ -f "${KERNEL_BZIMAGE}" ]; then
+        bzimage_src="${KERNEL_BZIMAGE}"
+    elif [ -n "${KERNEL_DIR:-}" ]; then
+        if [ -f "${KERNEL_DIR}/boot/EFI/BOOT/bzImage" ]; then
+            bzimage_src="${KERNEL_DIR}/boot/EFI/BOOT/bzImage"
+        elif [ -f "${KERNEL_DIR}/EFI/BOOT/bzImage" ]; then
+            bzimage_src="${KERNEL_DIR}/EFI/BOOT/bzImage"
+        fi
+    elif [ ! -f "${output_dir}/boot/EFI/BOOT/bzImage" ]; then
+        # Check if we can find it in a prebuilt directory relative to this script
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [ -f "${script_dir}/../../prebuilt/boot/EFI/BOOT/bzImage" ]; then
+            bzimage_src="${script_dir}/../../prebuilt/boot/EFI/BOOT/bzImage"
+        fi
+    fi
+
+    if [ -n "${bzimage_src}" ]; then
+        echo "Copying bzImage from ${bzimage_src}..."
+        mkdir -p "${output_dir}/boot/EFI/BOOT"
+        cp "${bzimage_src}" "${output_dir}/boot/EFI/BOOT/bzImage"
+    fi
+
+    # Check if bzImage exists (either copied or already present)
+    if [ ! -f "${output_dir}/boot/EFI/BOOT/bzImage" ]; then
+        echo "ERROR: bzImage not found in boot directory and no KERNEL_DIR, KERNEL_BZIMAGE, or fallback bzImage available." >&2
+        exit 1
+    fi
+
+    # Copy modules and firmware if KERNEL_DIR is specified
+    if [ -n "${KERNEL_DIR:-}" ]; then
+        if [ -d "${KERNEL_DIR}/img" ]; then
+            for m in "${KERNEL_DIR}"/img/modules-*.erofs; do
+                [ -f "$m" ] && cp "$m" "${output_dir}/img/"
+            done
+            if [ -f "${KERNEL_DIR}/img/firmware.erofs" ]; then
+                cp "${KERNEL_DIR}/img/firmware.erofs" "${output_dir}/img/"
+            fi
+        fi
     fi
 
     image "${output_dir}/img" "initos.erofs"

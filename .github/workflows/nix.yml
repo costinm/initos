@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
       
@@ -65,15 +66,26 @@ jobs:
           test -f "$RUNNER_TEMP/initos-signed/img/boot-initos-signed.img"
           find "$RUNNER_TEMP/initos-signed/boot/EFI/BOOT" -maxdepth 1 -type f -name '*.sig' | grep -q .
 
+      - name: Build initos signer
+        run: nix build .#initos-signer -o result-signer
+
       - name: Build OCI cache image
         run: nix build .#oci-cache-image -o result-oci-cache-image
+
+      - name: Build Docker Image
+        run: nix build .#docker-image -o result-docker-image
 
       - name: Package artifacts
         run: |
           STORE_PATH=$(readlink -f result-artifacts)
           nix-store --export "$STORE_PATH" > initos-artifacts.nar
           tar -C result-artifacts -czf initos-artifacts.tar.gz .
+
+          SIGNER_STORE_PATH=$(readlink -f result-signer)
+          nix-store --export "$SIGNER_STORE_PATH" > initos-signer.nar
+
           cp --remove-destination "$(readlink -f result-oci-cache-image)" oci-cache-image.tar.gz
+          cp --remove-destination "$(readlink -f result-docker-image)" initos-signer.tar.gz
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
@@ -82,7 +94,35 @@ jobs:
           path: |
             initos-artifacts.nar
             initos-artifacts.tar.gz
+            initos-signer.nar
+            initos-signer.tar.gz
             oci-cache-image.tar.gz
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load and Push Docker/OCI images to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+
+          # Load and push initos-signer
+          docker load -i initos-signer.tar.gz
+          docker tag localhost/initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
+          docker push ghcr.io/${owner_lc}/initos-signer:latest
+
+          # Load and push nix-artifact-cache (oci-cache-image)
+          docker load -i oci-cache-image.tar.gz
+          loaded_cache=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep nix-artifact-cache | head -n 1)
+          if [ -n "$loaded_cache" ]; then
+            docker tag "$loaded_cache" ghcr.io/${owner_lc}/initos-artifacts-cache:latest
+            docker push ghcr.io/${owner_lc}/initos-artifacts-cache:latest
+          fi
 
       - name: Create Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -96,7 +136,9 @@ jobs:
           files: |
             initos-artifacts.nar
             initos-artifacts.tar.gz
+            initos-signer.nar
+            initos-signer.tar.gz
             oci-cache-image.tar.gz
-          body: "Unsigned Nix artifacts, expanded artifact tarball, and OCI cache image."
+          body: "Unsigned Nix artifacts, signer tool NAR, and Docker/OCI container images."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
