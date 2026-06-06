@@ -88,7 +88,7 @@ jobs:
 
           # Load and push initos-signer
           docker load -i initos-signer.tar.gz
-          docker tag localhost/initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
+          docker tag initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
           docker push ghcr.io/${owner_lc}/initos-signer:latest
 
           # Load and push nix-artifact-cache (oci-cache-image)
