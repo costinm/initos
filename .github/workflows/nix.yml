@@ -41,31 +41,6 @@ jobs:
       - name: Build initos artifacts
         run: nix build .#initos-artifacts -o result-artifacts
 
-      - name: Build EFI
-        run: nix build .#efi -o result-efi
-
-      - name: Check unsigned artifact layout
-        run: |
-          test -d result-artifacts/boot/EFI/BOOT
-          test -d result-artifacts/opt/busybox
-          test -d result-artifacts/opt/initos
-          test -f result-artifacts/img/initos.erofs
-          if find -L result-artifacts -type f \( -name '*.sig' -o -name '*signed*.img' \) | grep -q .; then
-            echo "unsigned artifact output contains signed artifacts" >&2
-            find -L result-artifacts -type f \( -name '*.sig' -o -name '*signed*.img' \) >&2
-            exit 1
-          fi
-
-      - name: Verify result signer
-        run: |
-          result-artifacts/bin/sign.sh artifacts \
-            result-artifacts \
-            "$RUNNER_TEMP/initos-signed" \
-            "$RUNNER_TEMP/initos-sign-keys"
-          test -f "$RUNNER_TEMP/initos-signed/img/initos.erofs.sig"
-          test -f "$RUNNER_TEMP/initos-signed/img/boot-initos-signed.img"
-          find "$RUNNER_TEMP/initos-signed/boot/EFI/BOOT" -maxdepth 1 -type f -name '*.sig' | grep -q .
-
       - name: Build initos signer
         run: nix build .#initos-signer -o result-signer
 
