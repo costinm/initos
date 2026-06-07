@@ -8,9 +8,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    linux.url = "path:./linux";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane }:
+  outputs = { self, nixpkgs, rust-overlay, crane, linux }:
     let
       system = "x86_64-linux";
       muslTarget = "x86_64-unknown-linux-musl";
@@ -101,20 +102,18 @@
           cpio gzip erofs-utils mtools makeWrapper
         ] ++ [ initos efi ];
       } ''
-        export OUT="$out"
+        export out="$out"
         export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
-        export CARGO_TOML="${./Cargo.toml}"
-        export SIDECAR_BIN="${./sidecar/bin}"
-        export SCRIPTS_DIR="${./scripts}"
-        export PREBUILT_DIR="${./prebuilt}"
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
-        export WITH_KERNELS="0"
 
-        bash ${./scripts/assemble_artifacts.sh}
+        bash ${./scripts/build.sh} build_initos
+        bash ${./scripts/build.sh} build_boot
+        bash ${./scripts/build.sh} build_bin
 
-        wrapProgram $out/bin/sign.sh \
-          --prefix PATH : "${signRuntimePath}"
+        # Move artifacts to the root of $out
+        mv $out/artifacts/* $out/
+        rmdir $out/artifacts
       '';
 
       # ── OCI cache image (used in GitHub Actions) ────────────────────────
@@ -148,7 +147,7 @@
       docker-image = pkgs.dockerTools.buildImage {
         name = "initos-signer";
         tag = "latest";
-        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir ];
+        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linux.packages.${system}.kernel-host ];
         config = {
           Entrypoint = [ "/bin/sign.sh" ];
           Env = [ "PATH=/bin" ];

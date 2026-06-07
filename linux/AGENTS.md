@@ -38,7 +38,5 @@ The kernel build is driven by the nix flake or `scripts/setup_kernel.sh` in the 
 
 Expected outputs after `kernel_pack`:
 
-- `target/img/bzImage`
-- `target/img/.config`
-- `target/img/modules-$(cat /build/linux/include/config/kernel.release).erofs`
+- `target/opt/kernel-image/': `bzImage` `.config` `modules-$(cat /build/linux/include/config/kernel.release).erofs`
 

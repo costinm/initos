@@ -5,6 +5,16 @@
 # - initrd.img - containing the binary
 # - initos.erofs - containing the scripts, binary and busybox
 # - kernel/modules for host and cloud
+#
+# Output layout (under $out/artifacts/):
+#   boot/EFI/BOOT/  — initrd.img, BOOTX64.EFI, initos.EFI, limine.conf
+#   img/            — initos.erofs
+#   bin/            — initos binary, sidecar scripts
+#
+# Environment variables for Nix integration:
+#   INITOS_BIN    — path to pre-built initos binary
+#   EFI_BIN       — path to pre-built efi.efi binary
+#   USE_BUSYBOX   — path to static busybox binary
 
 set -euo pipefail
 
@@ -26,16 +36,50 @@ PREBUILT_BIN="${PROJECT_ROOT}/prebuilt/bin"
 PREBUILT_BOOT="${PROJECT_ROOT}/prebuilt/boot"
 TMPDIR="${TMPDIR:-/tmp}"
 
-
 cd "${src}"
 export src out
 
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
-IMG_DIR=${IMG_DIR:-${out}/test/img}
-mkdir -p "${out}/test" ${IMG_DIR}
+ARTIFACTS="${out}/artifacts"
 
-BINARY="target/${MUSL_TARGET}/${PROFILE}/initos"
+# Resolve initos binary: env var > cargo target
+_resolve_initos_bin() {
+    if [ -n "${INITOS_BIN:-}" ] && [ -f "${INITOS_BIN}" ]; then
+        echo "${INITOS_BIN}"
+    elif [ -f "${src}/target/${MUSL_TARGET}/${PROFILE}/initos" ]; then
+        echo "${src}/target/${MUSL_TARGET}/${PROFILE}/initos"
+    else
+        echo "ERROR: initos binary not found. Set INITOS_BIN or run build_rust first." >&2
+        return 1
+    fi
+}
+
+# Resolve EFI binary: env var > cargo target
+_resolve_efi_bin() {
+    if [ -n "${EFI_BIN:-}" ] && [ -f "${EFI_BIN}" ]; then
+        echo "${EFI_BIN}"
+    elif [ -f "${src}/target/x86_64-unknown-uefi/${PROFILE}/efi.efi" ]; then
+        echo "${src}/target/x86_64-unknown-uefi/${PROFILE}/efi.efi"
+    else
+        echo "ERROR: efi.efi binary not found. Set EFI_BIN or run build_rust first." >&2
+        return 1
+    fi
+}
+
+# Resolve busybox: env var > prebuilt > system
+_resolve_busybox() {
+    if [ -n "${USE_BUSYBOX:-}" ] && [ -f "${USE_BUSYBOX}" ]; then
+        echo "${USE_BUSYBOX}"
+    elif [ -f "${PREBUILT_BIN}/busybox" ]; then
+        echo "${PREBUILT_BIN}/busybox"
+    elif command -v busybox >/dev/null 2>&1; then
+        command -v busybox
+    else
+        echo "ERROR: busybox not found. Set USE_BUSYBOX." >&2
+        return 1
+    fi
+}
 
 # 1. Rust binaries: EFI loader and the helper binary.
 # May run directly in a dev container.
@@ -45,33 +89,23 @@ build_rust() {
 }
 
 
-# 2. Build ${out}/disks/initos - containing the disk layout for the 
-# basic read-only rootfs. Other variations based on containers are possible,
-# just add the 2 /opt/{busybox,initos} directories and the skaffold dirs.
-# 
-# It includes: 
-# - /opt/initos - the initos rust binary and scripts
-# - /opt/busybox - a static busybox
-# - other directories as empty mount points
-# 
-# It will than generate the erofs image, dm-verity and a file containing
-# kernel command line options to load the image.
-# Outputs:
-# - disks/initos - expanded dir
-# - ${IMG_DIR}/img/initos.erofs
+# 2. Build the read-only rootfs erofs image.
+# Outputs: artifacts/img/initos.erofs
 build_initos() {
-	STAGING=${out}/disks/initos
-	IMG_DIR="${out}/disks/state/img"
-    ROOTFS_IMG="${IMG_DIR}/initos.erofs"
-    
+    local initos_bin
+    initos_bin=$(_resolve_initos_bin)
+    local busybox
+    busybox=$(_resolve_busybox)
+
+    STAGING=${out}/staging/initos
+    mkdir -p "${ARTIFACTS}/img"
+
     # Base rootfs and busybox in /opt/busybox
-    # Only changes when busybox is updated, stable.
     if [ ! -f ${STAGING}/opt/busybox/bin/busybox ]; then
 		mkdir -p "${STAGING}"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,opt/initos/bin,opt/busybox/bin,usr/bin,usr/sbin,usr/lib,usr/lib64}
 		mkdir -p "${STAGING}"/usr/lib/modules "${STAGING}"/usr/lib/firmware
 
-		BUSYBOX="${BUSYBOX:-${src}/prebuilt/bin/busybox}"
-		cp "${BUSYBOX}" "${STAGING}/opt/busybox/bin/busybox"
+		cp "${busybox}" "${STAGING}/opt/busybox/bin/busybox"
 		chmod 755 "${STAGING}/opt/busybox/bin/busybox"
 		
 		(
@@ -94,41 +128,40 @@ build_initos() {
 	cp "${src}"/sidecar/bin/* "${STAGING}"/opt/initos/bin/
     chmod 755 "${STAGING}"/opt/initos/bin/*
 
-	# Include unified initos binary (handles boot, TPM2, fscrypt, verify, mount)
-	INITOS_BIN="${src}/target/x86_64-unknown-linux-musl/release/initos"
-	cp "${INITOS_BIN}" "${STAGING}/opt/initos/bin/initos"
+	# Include unified initos binary
+	cp "${initos_bin}" "${STAGING}/opt/initos/bin/initos"
 	chmod 755 "${STAGING}/opt/initos/bin/initos"
 
-	mkdir -p "${IMG_DIR}"
+    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "${ARTIFACTS}/img/initos.erofs" "${STAGING}"
 
-    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "${ROOTFS_IMG}" "${STAGING}"
-
-    echo "  Created: ${ROOTFS_IMG} ($(du -h "${ROOTFS_IMG}" | cut -f1))"
+    echo "  Created: ${ARTIFACTS}/img/initos.erofs ($(du -h "${ARTIFACTS}/img/initos.erofs" | cut -f1))"
 }
 
 # 3. initrd.img - using initos binary and cpio
-# Artifact in ${out}/disks/boot
+# Output: artifacts/boot/EFI/BOOT/initrd.img
 build_initrd() {
-	STAGING=${out}/disks/initrd
-    BOOT_PATH="${out}/disks/boot"
-    mkdir -p ${BOOT_PATH}/EFI/BOOT
-    
+    local initos_bin
+    initos_bin=$(_resolve_initos_bin)
+
+    local boot_path="${ARTIFACTS}/boot"
+    mkdir -p "${boot_path}/EFI/BOOT"
+
+    STAGING=${out}/staging/initrd
     mkdir -p $STAGING
-	# Include unified initos binary (handles boot, TPM2, fscrypt, verify, mount)
-	INITOS_BIN="${src}/target/x86_64-unknown-linux-musl/release/initos"
-	cp "${INITOS_BIN}" "${STAGING}/init"
+
+	cp "${initos_bin}" "${STAGING}/init"
 	chmod 755 "${STAGING}/init"
 
     (cd "${STAGING}" && find . | \
       sort | cpio --quiet --renumber-inodes -o -H newc | gzip \
-        > ${out}/disks/boot/EFI/BOOT/initrd.img )
+        > "${boot_path}/EFI/BOOT/initrd.img" )
 }
 
-# 3.1 Build standard boot directory layout under disks/boot
+# 3.1 Build standard boot directory layout under artifacts/boot
 build_boot() {
     build_initrd
 
-    local boot_path="${out}/disks/boot"
+    local boot_path="${ARTIFACTS}/boot"
     mkdir -p "${boot_path}/EFI/BOOT"
 
     # Copy Limine BOOTX64.EFI
@@ -138,17 +171,20 @@ build_boot() {
     cp "${src}/prebuilt/boot/EFI/BOOT/limine.conf" "${boot_path}/EFI/BOOT/"
 
     # Copy custom loader as initos.EFI
-    local initos_efi_src="${out}/x86_64-unknown-uefi/release/efi.efi"
-    if [ -f "${initos_efi_src}" ]; then
-        cp "${initos_efi_src}" "${boot_path}/EFI/BOOT/initos.EFI"
-    elif [ -f "${src}/target/x86_64-unknown-uefi/release/efi.efi" ]; then
-        cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/initos.EFI"
-    fi
+    local efi_bin
+    efi_bin=$(_resolve_efi_bin)
+    cp "${efi_bin}" "${boot_path}/EFI/BOOT/initos.EFI"
+}
 
-    # Write default config file for initos.EFI
-    cat > "${boot_path}/EFI/BOOT/config" <<EOF
-INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
-EOF
+# 3.2 Copy sidecar scripts and initos binary to artifacts/bin
+build_bin() {
+    local initos_bin
+    initos_bin=$(_resolve_initos_bin)
+
+    mkdir -p "${ARTIFACTS}/bin"
+    cp "${src}"/sidecar/bin/* "${ARTIFACTS}/bin/"
+    cp "${initos_bin}" "${ARTIFACTS}/bin/initos"
+    chmod 755 "${ARTIFACTS}/bin/"*
 }
 
 # Copy public UEFI keys that users enroll into PK/KEK/DB.
@@ -167,9 +203,8 @@ _copy_uefi_public_keys() {
 # Build a FAT32 filesystem image from a boot directory.
 # Uses mtools if available (no root needed), falls back to mkfs.vfat+loop mount.
 _build_fat_image() {
-    local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_name>}"
-    local img_name="${2:?Usage: _build_fat_image <boot_path> <img_name>}"
-    local img_file="${IMG_DIR}/${img_name}"
+    local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_file>}"
+    local img_file="${2:?Usage: _build_fat_image <boot_path> <img_file>}"
 
     # Calculate size: dir contents + 20% overhead, min 34MB (FAT32 needs ≥65525 clusters)
     local dir_size_kb img_size_mb
@@ -179,6 +214,7 @@ _build_fat_image() {
 
     echo "  Building FAT image: ${img_file} (${img_size_mb}MB)"
 
+    mkdir -p "$(dirname "${img_file}")"
     if command -v mformat >/dev/null 2>&1; then
         dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
         mformat -i "${img_file}" -F -v "INITOSBOOT" ::
@@ -203,51 +239,59 @@ _build_fat_image() {
 # --- Boot functions are now in sidecar/bin/sign.sh ---
 
 # 4. Build a test env for qemu validation.
-# This calls step 3 to rebuild the initrd.
 build_qemu_test() {
-    local genimage_dir="${out}/test"
-    local rootfs_img="${out}/disks/state/img/initos.erofs"
     local keys="${src}/prebuilt/testdata/uefi-keys"
 
-    [ -f "${rootfs_img}" ] || {
-        echo "Missing ${rootfs_img}; run build_initos first" >&2
+    [ -f "${ARTIFACTS}/img/initos.erofs" ] || {
+        echo "Missing ${ARTIFACTS}/img/initos.erofs; run build_initos first" >&2
         return 1
     }
 
-    # Build the three boot variants under disks/
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${out}/disks" "${out}/disks"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/disks/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/disks/boot" "${out}/disks" "${keys}"
+    # Build the three boot variants — sign.sh reads from artifacts/
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
 
     build_qemu_state
 }
 
-# 4.1 Pack a STATE rootfs - using img/ dir.
-# Used to verify initrd can find the STATE (even as a separate disk),
-# and to build a GPT disk for PARTLABEL verification.
+# 4.1 Pack a STATE rootfs containing all image artifacts.
+# Creates target/qemu/state.ext4 with an img/ subdir.
 build_qemu_state() {
-    local rootfs_img="${out}/disks/state/img/initos.erofs"
-    local genimage_dir="${out}/test"
+    local rootfs_img="${ARTIFACTS}/img/initos.erofs"
+    local qemu_dir="${out}/qemu"
+    local state_staging="${out}/staging/state"
     local data_img="state.ext4"
     local img_size_bytes img_size_mb state_size_mb
 
-    img_size_bytes=$(stat -c%s "${rootfs_img}")
+    # Stage img/ contents for the STATE partition
+    rm -rf "${state_staging}"
+    mkdir -p "${state_staging}/img"
+    cp "${rootfs_img}" "${state_staging}/img/initos.erofs"
+
+    # Also copy signed artifacts if they exist (modules, firmware, sigs)
+    for f in "${ARTIFACTS}"/img/modules-*.erofs "${ARTIFACTS}"/img/firmware.erofs \
+             "${ARTIFACTS}"/img/*.sig; do
+        [ -f "$f" ] && cp "$f" "${state_staging}/img/"
+    done
+
+    img_size_bytes=$(du -sb "${state_staging}" | cut -f1)
     img_size_mb=$(( (img_size_bytes + 1048575) / 1048576 ))
     state_size_mb=$(( img_size_mb + 32 + 64 ))
-    echo "STATE_SIZE_MB: ${state_size_mb} (IMG: ${rootfs_img})"
+    echo "STATE_SIZE_MB: ${state_size_mb} (staging: ${state_staging})"
 
-    mkdir -p "${genimage_dir}"
-    dd if=/dev/zero of="${genimage_dir}/${data_img}" bs=1M count="${state_size_mb}" status=none
+    mkdir -p "${qemu_dir}"
+    dd if=/dev/zero of="${qemu_dir}/${data_img}" bs=1M count="${state_size_mb}" status=none
 
     mkfs.ext4 -q -F -b 4096 \
         -O inline_data,extents,uninit_bg,dir_index,has_journal,verity,encrypt \
-        -L "STATE" -d "${out}/disks/state" \
-        "${genimage_dir}/${data_img}"
+        -L "STATE" -d "${state_staging}" \
+        "${qemu_dir}/${data_img}"
 }
 
 # 4.2 (optional) Build the GPT disk.
 build_qemu_gpt() {
-    local genimage_dir="${out}/test"
+    local genimage_dir="${out}/qemu"
 
     PATH="/usr/sbin:/sbin:${PATH}"
     mkdir -p "${genimage_dir}/tmp"
@@ -256,7 +300,7 @@ build_qemu_gpt() {
 image disk.img {
     hdimage { partition-table-type = "gpt" }
     partition INITOS {
-        image = "${out}/disks/state/img/initos.erofs"
+        image = "${ARTIFACTS}/img/initos.erofs"
     }
 }
 EOF
@@ -265,18 +309,17 @@ EOF
     (
         cd "${genimage_dir}"
         genimage --config config.ini \
-            --rootpath "${out}/disks" --tmppath tmp \
-            --outputpath "${out}/test" \
+            --rootpath "${out}" --tmppath tmp \
+            --outputpath "${genimage_dir}" \
             --inputpath "${genimage_dir}"
     )
 
-    echo "  Disk image:       ${out}/test/disk.img"
+    echo "  Disk image:       ${genimage_dir}/disk.img"
 }
 
 sign_qemu_efi() {
     local esp_dir="${out}/test_efi"
     local keys="${src}/prebuilt/testdata/uefi-keys"
-    local boot="${esp_dir}/EFI/BOOT"
 
     "${src}/sidecar/bin/sign.sh" efi "${keys}" "${esp_dir}/"
 }
@@ -368,8 +411,12 @@ nix_all() {
     # initos-artifacts / -with-kernels
     # vm-cloud-profile - pulls initos, kernel-cloud, crosvm, etc.
     # docker-image / oci-cache-image
+    
     nix build ./linux -o target/result-kernel-host
     nix build  -o target/result
+
+
+    nix build .#docker-image
 
     # nix build .#initos -o target/result-initos
     # nix build .#efi -o target/result-efi
@@ -383,10 +430,11 @@ test() {
     build_rust
     build_initos
     build_boot
+    build_bin
     build_qemu_test
 
     echo "=== Running Cargo Tests ==="
-    INITOS_BINARY="${out}/${MUSL_TARGET}/${PROFILE}/initos" cargo test --workspace -- --include-ignored
+    INITOS_BINARY="$(_resolve_initos_bin)" cargo test --workspace -- --include-ignored
 
     echo "=== Running Age Encrypt/Decrypt Script Test ==="
     "${src}/tests/test_encrypt_decrypt.sh"
@@ -404,8 +452,9 @@ else
     build_rust
     build_initos
     build_boot
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${out}/disks" "${out}/disks"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/disks/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/disks/boot" "${out}/disks" "${keys}"
+    build_bin
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
     build_qemu_test
 fi
