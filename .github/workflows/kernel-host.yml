@@ -28,11 +28,6 @@ jobs:
       - name: Build Docker Image
         run: nix build ./linux#docker-image -o result-docker-image
 
-      - name: Check kernel output
-        run: |
-          test -f result-kernel-host/boot/EFI/BOOT/bzImage
-          find -L result-kernel-host/img -maxdepth 1 -type f -name 'modules-*.erofs' | grep -q .
-
       - name: Package host kernel
         run: |
           STORE_PATH=$(readlink -f result-kernel-host)

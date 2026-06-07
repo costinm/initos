@@ -266,14 +266,26 @@ artifacts() {
 
     # Auto-detect kernel_dir
     if [ -z "${kernel_dir}" ]; then
+        local SCRIPT_DIR
+        SCRIPT_DIR=$(dirname "$0")
+        if [ "$SCRIPT_DIR" = "." ] && command -v "$0" >/dev/null 2>&1; then
+            SCRIPT_DIR=$(dirname "$(command -v "$0")")
+        fi
+        
+        local PROFILE_DIR
+        PROFILE_DIR=$(dirname "$SCRIPT_DIR")
+        
         if [ -f "/opt/kernel-image/bzImage" ]; then
             # Nix
             kernel_dir="/opt/kernel-image"
-        elif [ -f "/mnt/kernel-image/opt/kernel-image" ]; then
+        elif [ -f "${PROFILE_DIR}/opt/kernel-image/bzImage" ]; then
+            # Nix profile (e.g., .../result/opt/kernel-image/)
+            kernel_dir="$(cd "${PROFILE_DIR}/opt/kernel-image" && pwd)"
+        elif [ -f "/mnt/kernel-image/opt/kernel-image/bzImage" ]; then
             # Mounted from a docker image
-            kernel_dir="/mnt/kerne-image/opt/kernel-image"
+            kernel_dir="/mnt/kernel-image/opt/kernel-image"
         elif [ -f "${PWD}/target/opt/kernel-image/bzImage" ]; then
-            # In source tree.
+            # In source tree
             kernel_dir="${PWD}/target/opt/kernel-image"
         fi
     fi
