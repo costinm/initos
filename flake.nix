@@ -8,10 +8,9 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
-    linux.url = "path:./linux";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane, linux }:
+  outputs = { self, nixpkgs, rust-overlay, crane }:
     let
       system = "x86_64-linux";
       muslTarget = "x86_64-unknown-linux-musl";
@@ -96,6 +95,10 @@
       ];
 
       signRuntimePath = pkgs.lib.makeBinPath signRuntimeDeps;
+      linuxFlake = (import ./linux/flake.nix).outputs {
+        self = ./linux;
+        inherit nixpkgs;
+      };
 
       initos-signer = pkgs.runCommand "initos-signer" {
         src = ./.;
@@ -148,7 +151,7 @@
       docker-image = pkgs.dockerTools.buildImage {
         name = "initos-signer";
         tag = "latest";
-        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linux.packages.${system}.kernel-host ];
+        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ];
         config = {
           Entrypoint = [ "/bin/sign.sh" ];
           Env = [ "PATH=/bin" ];
