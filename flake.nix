@@ -98,6 +98,7 @@
       signRuntimePath = pkgs.lib.makeBinPath signRuntimeDeps;
 
       initos-signer = pkgs.runCommand "initos-signer" {
+        src = ./.;
         nativeBuildInputs = with pkgs; [
           cpio gzip erofs-utils mtools makeWrapper
         ] ++ [ initos efi ];
@@ -107,9 +108,9 @@
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
 
-        bash ${./scripts/build.sh} build_initos
-        bash ${./scripts/build.sh} build_boot
-        bash ${./scripts/build.sh} build_bin
+        bash $src/scripts/build.sh build_initos
+        bash $src/scripts/build.sh build_boot
+        bash $src/scripts/build.sh build_bin
 
         # Move artifacts to the root of $out
         mv $out/artifacts/* $out/
