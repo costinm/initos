@@ -196,6 +196,15 @@ efi() {
            "${boot}/EFI/BOOT/BOOTX64.EFI"
     mv "${signed}" "${boot}/EFI/BOOT/BOOTX64.EFI"
 
+    if [ -f "${boot}/EFI/BOOT/initos.EFI" ]; then
+        echo "Signing initos.EFI..."
+        sbsign --key "${sec_dir}/db.key" \
+               --cert "${sec_dir}/db.crt" \
+               --output "${boot}/EFI/BOOT/initos.EFI.signed" \
+               "${boot}/EFI/BOOT/initos.EFI"
+        mv "${boot}/EFI/BOOT/initos.EFI.signed" "${boot}/EFI/BOOT/initos.EFI"
+    fi
+
     ESP_DIR=${boot}
 
     KEY_ID=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout | openssl rsa -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | sed 's/.*= //' | cut -c 1-16)
@@ -225,6 +234,12 @@ _build_fat_image() {
     local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_file>}"
     local img_file="${2:?Usage: _build_fat_image <boot_path> <img_file>}"
 
+    # Ensure absolute paths for operations since we perform 'cd'
+    mkdir -p "${boot_path}"
+    boot_path=$(cd "${boot_path}" && pwd)
+    mkdir -p "$(dirname "${img_file}")"
+    img_file=$(cd "$(dirname "${img_file}")" && pwd)/$(basename "${img_file}")
+
     local dir_size_kb img_size_mb
     dir_size_kb=$(du -sk "${boot_path}" | cut -f1)
     img_size_mb=$(( (dir_size_kb * 12 / 10 / 1024) + 1 ))
@@ -238,63 +253,98 @@ _build_fat_image() {
     echo "  Created: ${img_file} ($(du -h "${img_file}" | cut -f1))"
 }
 
-# Sign a Nix artifact tree produced by .#initos-artifacts.
-# Usage: artifacts <artifact_dir> <output_dir> [secrets_dir]
+# Sign a Nix artifact tree produced by .#initos-signer.
+# Usage: artifacts [artifact_dir] <output_dir> [secrets_dir]
+# If artifact_dir is omitted, it is auto-detected from the script's location.
 artifacts() {
-    local artifact_dir="${1:?Usage: artifacts <artifact_dir> <output_dir> [secrets_dir]}"
-    local output_dir="${2:?Usage: artifacts <artifact_dir> <output_dir> [secrets_dir]}"
-    local sec_dir="${3:-${SECRETS}}"
+    local output_dir="${1:?Usage: artifacts <output_dir> [artifact_dir]}"
+    mkdir -p "${output_dir}"
+    output_dir=$(cd "${output_dir}" && pwd)
 
-    SECRETS="${sec_dir}"
-    export SECRETS
+    local artifact_dir="${2:-}"
+    local sec_dir="${SECRETS}"
+
+    # Resolve local repository root containing flake.nix
+    # Check parent directories of the script ($0) first, then PWD
+    local repo_root=""
+    for start_dir in "$(dirname "$(readlink -f "$0")")" "${PWD}"; do
+        local search_dir="${start_dir}"
+        while [ "${search_dir}" != "/" ] && [ -n "${search_dir}" ]; do
+            if [ -f "${search_dir}/flake.nix" ]; then
+                repo_root=$(readlink -f "${search_dir}")
+                break 2
+            fi
+            search_dir=$(dirname "${search_dir}")
+        done
+    done
+
+    if [ -z "${artifact_dir}" ]; then
+        local self_artifact_dir
+        self_artifact_dir=$(dirname "$(dirname "$(readlink -f "$0")")")
+        if [ -f "${self_artifact_dir}/img/initos.erofs" ]; then
+            artifact_dir="${self_artifact_dir}"
+        elif command -v nix >/dev/null 2>&1; then
+            echo "artifact_dir not provided or detected. Resolving initos-signer package via Nix..."
+            local flake_ref="github:costinm/initos/main#initos-signer"
+            if [ -n "${repo_root}" ]; then
+                flake_ref="git+file:${repo_root}#initos-signer"
+            fi
+            local detected_artifacts
+            detected_artifacts=$(nix build "${flake_ref}" --no-link --print-out-paths 2>/dev/null || true)
+            if [ -n "${detected_artifacts}" ] && [ -d "${detected_artifacts}" ]; then
+                artifact_dir="${detected_artifacts}"
+                echo "  Using artifact_dir resolved from Nix: ${artifact_dir}"
+            else
+                detected_artifacts=$(nix build "github:costinm/initos/main#initos-signer" --no-link --print-out-paths 2>/dev/null || true)
+                if [ -n "${detected_artifacts}" ] && [ -d "${detected_artifacts}" ]; then
+                    artifact_dir="${detected_artifacts}"
+                    echo "  Using artifact_dir resolved from remote Nix: ${artifact_dir}"
+                fi
+            fi
+        fi
+
+        if [ -z "${artifact_dir}" ]; then
+            echo "ERROR: artifact_dir was not provided and could not be resolved from script location or Nix." >&2
+            exit 1
+        fi
+    fi
+
+    # Auto-detect KERNEL_DIR via Nix if not explicitly provided
+    if [ -z "${KERNEL_BZIMAGE:-}" ] && [ -z "${KERNEL_DIR:-}" ]; then
+        if command -v nix >/dev/null 2>&1; then
+            echo "KERNEL_DIR not set. Detecting kernel package path via Nix..."
+            local flake_ref="github:costinm/initos/main?dir=linux#kernel-host"
+            if [ -n "${repo_root}" ]; then
+                if [ -d "${repo_root}/linux" ]; then
+                    flake_ref="git+file:${repo_root}?dir=linux#kernel-host"
+                fi
+            fi
+            local detected_kernel
+            detected_kernel=$(nix build "${flake_ref}" --no-link --print-out-paths 2>/dev/null || true)
+            if [ -n "${detected_kernel}" ] && [ -d "${detected_kernel}" ]; then
+                export KERNEL_DIR="${detected_kernel}"
+                echo "  Using KERNEL_DIR resolved from Nix: ${KERNEL_DIR}"
+            else
+                detected_kernel=$(nix build "github:costinm/initos/main?dir=linux#kernel-host" --no-link --print-out-paths 2>/dev/null || true)
+                if [ -n "${detected_kernel}" ] && [ -d "${detected_kernel}" ]; then
+                    export KERNEL_DIR="${detected_kernel}"
+                    echo "  Using KERNEL_DIR resolved from remote Nix: ${KERNEL_DIR}"
+                fi
+            fi
+        fi
+    fi
+
     sign_init
 
     if [ -d "${output_dir}" ]; then
         # Clean contents without deleting the directory itself (which could be a mount point)
         find "${output_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     fi
-    mkdir -p "${output_dir}/img" "${output_dir}/boot"
+    mkdir -p "${output_dir}/img"
 
-    cp -R "${artifact_dir}/boot/." "${output_dir}/boot/"
+    # Copy Nix images to output
     cp -R "${artifact_dir}/img/." "${output_dir}/img/"
-    chmod -R u+w "${output_dir}/boot" "${output_dir}/img"
-
-    if [ -f "${sec_dir}/image_key.pub.b64" ] &&
-       ! grep -q 'INITOS_PUB_KEY=' "${output_dir}/boot/EFI/BOOT/config"; then
-        printf ' INITOS_PUB_KEY=%s\n' "$(cat "${sec_dir}/image_key.pub.b64")" \
-          >> "${output_dir}/boot/EFI/BOOT/config"
-    fi
-
-    # Resolve and copy kernel bzImage if specified
-    local bzimage_src=""
-    if [ -n "${KERNEL_BZIMAGE:-}" ] && [ -f "${KERNEL_BZIMAGE}" ]; then
-        bzimage_src="${KERNEL_BZIMAGE}"
-    elif [ -n "${KERNEL_DIR:-}" ]; then
-        if [ -f "${KERNEL_DIR}/boot/EFI/BOOT/bzImage" ]; then
-            bzimage_src="${KERNEL_DIR}/boot/EFI/BOOT/bzImage"
-        elif [ -f "${KERNEL_DIR}/EFI/BOOT/bzImage" ]; then
-            bzimage_src="${KERNEL_DIR}/EFI/BOOT/bzImage"
-        fi
-    elif [ ! -f "${output_dir}/boot/EFI/BOOT/bzImage" ]; then
-        # Check if we can find it in a prebuilt directory relative to this script
-        local script_dir
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        if [ -f "${script_dir}/../../prebuilt/boot/EFI/BOOT/bzImage" ]; then
-            bzimage_src="${script_dir}/../../prebuilt/boot/EFI/BOOT/bzImage"
-        fi
-    fi
-
-    if [ -n "${bzimage_src}" ]; then
-        echo "Copying bzImage from ${bzimage_src}..."
-        mkdir -p "${output_dir}/boot/EFI/BOOT"
-        cp "${bzimage_src}" "${output_dir}/boot/EFI/BOOT/bzImage"
-    fi
-
-    # Check if bzImage exists (either copied or already present)
-    if [ ! -f "${output_dir}/boot/EFI/BOOT/bzImage" ]; then
-        echo "ERROR: bzImage not found in boot directory and no KERNEL_DIR, KERNEL_BZIMAGE, or fallback bzImage available." >&2
-        exit 1
-    fi
+    chmod -R u+w "${output_dir}/img"
 
     # Copy modules and firmware if KERNEL_DIR is specified
     if [ -n "${KERNEL_DIR:-}" ]; then
@@ -308,9 +358,85 @@ artifacts() {
         fi
     fi
 
+    # Sign the erofs rootfs image
     image "${output_dir}/img" "initos.erofs"
-    efi "${sec_dir}" "${output_dir}/boot"
-    _build_fat_image "${output_dir}/boot" "${output_dir}/img/boot-initos-signed.img"
+
+    # Sign modules and firmware images if they exist
+    for m in "${output_dir}"/img/modules-*.erofs; do
+        if [ -f "$m" ]; then
+            image "${output_dir}/img" "$(basename "$m")"
+        fi
+    done
+    if [ -f "${output_dir}/img/firmware.erofs" ]; then
+        image "${output_dir}/img" "firmware.erofs"
+    fi
+
+    # Create a temporary staging area for the boot files to resolve KERNEL_BZIMAGE or KERNEL_DIR
+    local boot_stage
+    boot_stage=$(mktemp -d)
+    mkdir -p "${boot_stage}/EFI/BOOT"
+
+    # Copy from artifact_dir
+    if [ -d "${artifact_dir}/boot" ]; then
+        cp -R "${artifact_dir}/boot/." "${boot_stage}/"
+    else
+        cp -R "${artifact_dir}/." "${boot_stage}/"
+    fi
+    chmod -R u+w "${boot_stage}"
+
+    # Resolve and copy kernel bzImage if specified
+    local bzimage_src=""
+    if [ -n "${KERNEL_BZIMAGE:-}" ] && [ -f "${KERNEL_BZIMAGE}" ]; then
+        bzimage_src="${KERNEL_BZIMAGE}"
+    elif [ -n "${KERNEL_DIR:-}" ]; then
+        if [ -f "${KERNEL_DIR}/boot/EFI/BOOT/bzImage" ]; then
+            bzimage_src="${KERNEL_DIR}/boot/EFI/BOOT/bzImage"
+        elif [ -f "${KERNEL_DIR}/EFI/BOOT/bzImage" ]; then
+            bzimage_src="${KERNEL_DIR}/EFI/BOOT/bzImage"
+        fi
+    fi
+
+    if [ -n "${bzimage_src}" ]; then
+        echo "Overwriting stage bzImage from ${bzimage_src}..."
+        cp "${bzimage_src}" "${boot_stage}/EFI/BOOT/bzImage"
+    fi
+
+    # Ensure bzImage is present
+    if [ ! -f "${boot_stage}/EFI/BOOT/bzImage" ]; then
+        # Check prebuilt fallback
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [ -f "${script_dir}/../../prebuilt/boot/EFI/BOOT/bzImage" ]; then
+            cp "${script_dir}/../../prebuilt/boot/EFI/BOOT/bzImage" "${boot_stage}/EFI/BOOT/bzImage"
+        else
+            echo "ERROR: bzImage not found in boot directory and no KERNEL_DIR, KERNEL_BZIMAGE, or fallback bzImage available." >&2
+            rm -rf "${boot_stage}"
+            exit 1
+        fi
+    fi
+
+    # Inject public key into config if present
+    if [ -f "${sec_dir}/image_key.pub.b64" ] &&
+       ! grep -q 'INITOS_PUB_KEY=' "${boot_stage}/EFI/BOOT/config"; then
+        printf ' INITOS_PUB_KEY=%s\n' "$(cat "${sec_dir}/image_key.pub.b64")" \
+          >> "${boot_stage}/EFI/BOOT/config"
+    fi
+
+    # Build the three boot variants from the staging area
+    build_boot_limine_unsigned "${boot_stage}" "${output_dir}"
+    build_boot_initos_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
+    build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
+
+    rm -rf "${boot_stage}"
+
+    # Move the FAT image results into the output_dir/img/ folder
+    mv "${output_dir}/boot-limine-unsigned.img" "${output_dir}/img/"
+    mv "${output_dir}/boot-initos-signed.img" "${output_dir}/img/"
+    mv "${output_dir}/boot-limine-signed.img" "${output_dir}/img/"
+
+    # Replicate boot-initos-signed as the default boot/ directory for backward compatibility
+    mkdir -p "${output_dir}/boot"
+    cp -R "${output_dir}/boot-initos-signed/." "${output_dir}/boot/"
 }
 
 # Similar - but using limine as main loader.
@@ -393,6 +519,12 @@ _resolve_path() {
         base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         if [ -f "${base_dir}/${rel_path}" ]; then
             echo "${base_dir}/${rel_path}"
+        elif [ "$(basename "${rel_path}")" = "bzImage" ] && [ -f "${base_dir}/target/linux/arch/x86/boot/bzImage" ]; then
+            echo "${base_dir}/target/linux/arch/x86/boot/bzImage"
+        elif [ "$(basename "${rel_path}")" = "bzImage" ] && [ -f "${base_dir}/target/linux/arch/x86_64/boot/bzImage" ]; then
+            echo "${base_dir}/target/linux/arch/x86_64/boot/bzImage"
+        elif [ "$(basename "${rel_path}")" = "bzImage" ] && [ -f "${base_dir}/target/img/bzImage" ]; then
+            echo "${base_dir}/target/img/bzImage"
         elif [ -f "${base_dir}/prebuilt/${rel_path}" ]; then
             echo "${base_dir}/prebuilt/${rel_path}"
         else
@@ -415,6 +547,25 @@ _safe_cp() {
     fi
 }
 
+_copy_uefi_public_keys() {
+    local src_dir="${1}"
+    local dst_dir="${2}"
+
+    if [ -n "${NIX_BUILD_TOP:-}" ]; then
+        echo "Nix build environment detected — skipping public keys installation for unsigned package."
+        return 0
+    fi
+
+    echo "Installing UEFI public keys into ${dst_dir}..."
+    mkdir -p "${dst_dir}"
+    for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth authorized_keys image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
+        if [ -f "${src_dir}/${f}" ]; then
+            cp "${src_dir}/${f}" "${dst_dir}/"
+        fi
+    done
+}
+
+
 build_boot_limine_unsigned() {
     local artifact_dir="${1:?Usage: build_boot_limine_unsigned <artifact_dir> <output_dir>}"
     local output_dir="${2:?Usage: build_boot_limine_unsigned <artifact_dir> <output_dir>}"
@@ -423,7 +574,7 @@ build_boot_limine_unsigned() {
 
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    local bzimage_src initrd_src bootx64_src limine_conf_src initos_efi_src
+    local bzimage_src initrd_src bootx64_src limine_conf_src initos_efi_src config_src
     bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
     initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
     bootx64_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/BOOTX64.EFI")
@@ -432,23 +583,24 @@ build_boot_limine_unsigned() {
     [ -z "$limine_conf_src" ] && limine_conf_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/limine.conf")
     initos_efi_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initos.EFI")
     [ -z "$initos_efi_src" ] && initos_efi_src=$(_resolve_path "$artifact_dir" "target/x86_64-unknown-uefi/release/efi.efi")
+    config_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/config")
+    [ -z "$config_src" ] && config_src=$(_resolve_path "$artifact_dir" "config")
 
     _safe_cp "$bzimage_src" "${boot_path}/EFI/BOOT/bzImage"
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
     _safe_cp "$bootx64_src" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
     _safe_cp "$limine_conf_src" "${boot_path}/EFI/BOOT/limine.conf"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
+    _safe_cp "$config_src" "${boot_path}/EFI/BOOT/config"
 
-    mkdir -p "${boot_path}/keys"
-    local keys_src
     keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
     if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        cp -a "$(dirname "$keys_src")/." "${boot_path}/keys/"
+        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
     else
         local base_dir
         base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            cp -a "${base_dir}/prebuilt/testdata/uefi-keys/." "${boot_path}/keys/"
+            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
         fi
     fi
 
@@ -464,19 +616,23 @@ build_boot_limine_signed() {
 
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    local bzimage_src initrd_src bootx64_src
+    local bzimage_src initrd_src bootx64_src config_src
     bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
     initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
     bootx64_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/BOOTX64.EFI")
     [ -z "$bootx64_src" ] && bootx64_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/BOOTX64.EFI")
+    config_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/config")
+    [ -z "$config_src" ] && config_src=$(_resolve_path "$artifact_dir" "config")
 
     _safe_cp "$bzimage_src" "${boot_path}/EFI/BOOT/bzImage"
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
+    _safe_cp "$config_src" "${boot_path}/EFI/BOOT/config"
 
     local sha_kernel sha_initrd
     sha_kernel=$(b2sum "${boot_path}/EFI/BOOT/bzImage" | awk '{print $1}')
     sha_initrd=$(b2sum "${boot_path}/EFI/BOOT/initrd.img" | awk '{print $1}')
 
+    local cmdline="${INITOS_CMDLINE:-INITOS_INIT=/opt/initos/bin/initos-init-dev console=ttyS0,115200 console=tty1 net.ifnames=0 panic=5 loglevel=6}"
     cat > "${boot_path}/EFI/BOOT/limine.conf" <<LIMINECFG
 timeout: 2
 serial: yes
@@ -487,7 +643,7 @@ editor_enabled: no
 /Boot
   protocol: linux
   path: boot():/EFI/BOOT/bzImage#${sha_kernel}
-  cmdline: INITOS_INIT=/opt/initos/bin/initos-init-dev console=ttyS0,115200 console=tty1 net.ifnames=0 panic=5 loglevel=6
+  cmdline: ${cmdline}
   module_path: boot():/EFI/BOOT/initrd.img#${sha_initrd}
 LIMINECFG
 
@@ -513,16 +669,15 @@ LIMINECFG
         mv "${signed_efi}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
     fi
 
-    mkdir -p "${boot_path}/keys"
     local keys_src
     keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
     if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        cp -a "$(dirname "$keys_src")/." "${boot_path}/keys/"
+        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
     else
         local base_dir
         base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            cp -a "${base_dir}/prebuilt/testdata/uefi-keys/." "${boot_path}/keys/"
+            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
         fi
     fi
 
@@ -538,31 +693,35 @@ build_boot_initos_unsigned() {
 
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    local bzimage_src initrd_src initos_efi_src
+    local bzimage_src initrd_src initos_efi_src bootx64_limine_src limine_conf_src
     bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
     initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
     initos_efi_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initos.EFI")
     [ -z "$initos_efi_src" ] && initos_efi_src=$(_resolve_path "$artifact_dir" "target/x86_64-unknown-uefi/release/efi.efi")
 
+    bootx64_limine_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/BOOTX64.EFI")
+    [ -z "$bootx64_limine_src" ] && bootx64_limine_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/BOOTX64.EFI")
+    limine_conf_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/limine.conf")
+    [ -z "$limine_conf_src" ] && limine_conf_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/limine.conf")
+
     _safe_cp "$bzimage_src" "${boot_path}/EFI/BOOT/bzImage"
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
-    _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+    _safe_cp "$bootx64_limine_src" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
 
     cat > "${esp_dir}/EFI/BOOT/config" <<EOF
 INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
 EOF
 
-    mkdir -p "${boot_path}/keys"
     local keys_src
     keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
     if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        cp -a "$(dirname "$keys_src")/." "${boot_path}/keys/"
+        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
     else
         local base_dir
         base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            cp -a "${base_dir}/prebuilt/testdata/uefi-keys/." "${boot_path}/keys/"
+            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
         fi
     fi
 }
@@ -577,7 +736,7 @@ build_boot_initos_signed() {
 
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    local bzimage_src initrd_src initos_efi_src
+    local bzimage_src initrd_src initos_efi_src bootx64_limine_src limine_conf_src
     bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
     initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
     initos_efi_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initos.EFI")
@@ -618,16 +777,15 @@ EOF
         -out "${esp_dir}/EFI/BOOT/${key_id}.initrd.sig" \
         "${esp_dir}/EFI/BOOT/initrd.img"
 
-    mkdir -p "${boot_path}/keys"
     local keys_src
     keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
     if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        cp -a "$(dirname "$keys_src")/." "${boot_path}/keys/"
+        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
     else
         local base_dir
         base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            cp -a "${base_dir}/prebuilt/testdata/uefi-keys/." "${boot_path}/keys/"
+            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
         fi
     fi
 
@@ -648,7 +806,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "  sign_hex_digest <hex> <key> <out> Sign a hex digest string"
         echo "  image <dir> <file>                Sign an fsverity digest for an image"
         echo "  efi <sec_dir> <boot_dir>          Sign BOOTX64.EFI in a boot directory"
-        echo "  artifacts <result> <out> [keys]   Sign a Nix artifact tree"
+        echo "  artifacts <out_dir> [artifact_dir] Sign a Nix artifact tree"
         echo "  build_dmverity_boot               Build dm-verity boot config"
         echo "  build_boot_limine_unsigned <artifact_dir> <output_dir>"
         echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys]"

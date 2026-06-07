@@ -7,12 +7,11 @@
 #
 # Usage:
 #   nix build .#initos-signer -o result-signer
-#   nix build .#initos-artifacts -o result-artifacts
-#   bash scripts/test_sign_bwrap.sh [signer-path] [artifacts-path]
+#   bash scripts/test_sign_bwrap.sh [signer-path] [kernel-path]
 #
 # Or with kernel:
 #   nix build ./linux -o result-kernel
-#   bash scripts/test_sign_bwrap.sh result-signer result-artifacts result-kernel
+#   bash scripts/test_sign_bwrap.sh result-signer result-kernel
 
 set -euo pipefail
 
@@ -20,17 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 SIGNER="${1:-${PROJECT_ROOT}/result-signer}"
-ARTIFACTS="${2:-${PROJECT_ROOT}/result-artifacts}"
-KERNEL_HOST="${3:-}"
+KERNEL_HOST="${2:-}"
 
 if [[ ! -d "${SIGNER}" ]]; then
     echo "ERROR: signer path not found: ${SIGNER}" >&2
     echo "Build it first: nix build .#initos-signer -o result-signer" >&2
-    exit 1
-fi
-if [[ ! -d "${ARTIFACTS}" ]]; then
-    echo "ERROR: artifacts path not found: ${ARTIFACTS}" >&2
-    echo "Build it first: nix build .#initos-artifacts -o result-artifacts" >&2
     exit 1
 fi
 
@@ -51,17 +44,15 @@ echo "build:x:$(id -g):" >> "${WORK}/group"
 
 echo "=== Testing initos-signer in bubblewrap sandbox ==="
 echo "  Signer:    ${SIGNER}"
-echo "  Artifacts: ${ARTIFACTS}"
 echo "  Kernel:    ${KERNEL_HOST:-<none>}"
 echo "  Work dir:  ${WORK}"
 echo ""
 
 # Resolve the real signer path (may be a nix store symlink)
 SIGNER_REAL="$(readlink -f "${SIGNER}")"
-ARTIFACTS_REAL="$(readlink -f "${ARTIFACTS}")"
 
 # Dynamically resolve bash and env from the signer script to be fully hermetic
-BASH_PATH=$(head -n 1 "${SIGNER_REAL}/bin/sign.sh" | sed 's/^#!//')
+BASH_PATH=$(head -n 1 "${SIGNER_REAL}/bin/sign.sh" | sed 's/^#!//' | awk '{print $1}')
 COREUTILS_BIN=$(grep -o '/nix/store/[^:]*-coreutils-[^:]*/bin' "${SIGNER_REAL}/bin/sign.sh" | head -n 1)
 ENV_PATH="${COREUTILS_BIN}/env"
 
@@ -98,9 +89,6 @@ BWRAP_ARGS=(
     # The signer package
     --ro-bind "${SIGNER_REAL}" "${SIGNER_REAL}"
 
-    # The artifacts package
-    --ro-bind "${ARTIFACTS_REAL}" "${ARTIFACTS_REAL}"
-
     # Writable output dir
     --bind "${WORK}" /out
 
@@ -127,13 +115,29 @@ if [[ -n "${KERNEL_HOST}" ]]; then
         BWRAP_ARGS+=(--ro-bind "${KERNEL_REAL}" /out/kernel/bzImage)
     fi
 else
-    # Fallback to local prebuilt
-    PREBUILT_BZ="${PROJECT_ROOT}/prebuilt/boot/EFI/BOOT/bzImage"
-    if [[ -f "${PREBUILT_BZ}" ]]; then
-        KERNEL_REAL="$(readlink -f "${PREBUILT_BZ}")"
+    # Fallback to typical build/output paths in the workspace
+    if [[ -d "${PROJECT_ROOT}/result-kernel" ]]; then
+        KERNEL_REAL="${PROJECT_ROOT}/result-kernel"
+        KERNEL_TYPE="dir"
+        BWRAP_ARGS+=(--ro-bind "${KERNEL_REAL}" /out/kernel)
+        echo "  Using result-kernel fallback: ${KERNEL_REAL}"
+    elif [[ -f "${PROJECT_ROOT}/target/img/bzImage" ]]; then
+        KERNEL_REAL="${PROJECT_ROOT}/target/img/bzImage"
         KERNEL_TYPE="file"
         BWRAP_ARGS+=(--ro-bind "${KERNEL_REAL}" /out/kernel/bzImage)
-        echo "  Using prebuilt bzImage fallback: ${PREBUILT_BZ}"
+        echo "  Using target/img/bzImage fallback: ${KERNEL_REAL}"
+    elif [[ -f "${PROJECT_ROOT}/target/linux/arch/x86/boot/bzImage" ]]; then
+        KERNEL_REAL="${PROJECT_ROOT}/target/linux/arch/x86/boot/bzImage"
+        KERNEL_TYPE="file"
+        BWRAP_ARGS+=(--ro-bind "${KERNEL_REAL}" /out/kernel/bzImage)
+        echo "  Using target/linux/arch/x86/boot/bzImage fallback: ${KERNEL_REAL}"
+    elif [[ -f "${PROJECT_ROOT}/target/linux/arch/x86_64/boot/bzImage" ]]; then
+        KERNEL_REAL="${PROJECT_ROOT}/target/linux/arch/x86_64/boot/bzImage"
+        KERNEL_TYPE="file"
+        BWRAP_ARGS+=(--ro-bind "${KERNEL_REAL}" /out/kernel/bzImage)
+        echo "  Using target/linux/arch/x86_64/boot/bzImage fallback: ${KERNEL_REAL}"
+    else
+        echo "WARNING: No kernel found in standard locations. Sandbox execution may fail." >&2
     fi
 fi
 
@@ -143,7 +147,7 @@ echo ""
 
 bwrap "${BWRAP_ARGS[@]}" \
     --ro-bind "${PROJECT_ROOT}/scripts/test_sign_sandbox_inner.sh" /out/test.sh \
-    /bin/sh /out/test.sh "${SIGNER_REAL}" "${ARTIFACTS_REAL}" "${KERNEL_TYPE}" "${COREUTILS_BIN}"
+    /bin/sh /out/test.sh "${SIGNER_REAL}" "${KERNEL_TYPE}" "${COREUTILS_BIN}"
 
 echo ""
 echo "--- Sandbox exited ---"

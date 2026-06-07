@@ -74,27 +74,18 @@ cp "$USE_BUSYBOX" "$WRITABLE/prebuilt/bin/busybox"
 
 # Run build.sh functions — must call individually
 export IMG_DIR="$BUILD_OUT/disks/state/img"
-for fn in build_initos build_initrd; do
+for fn in build_initos build_boot; do
   echo "=== build.sh $fn ==="
   src="$BUILD_SRC" out="$BUILD_OUT" \
     bash "$BUILD_SRC/scripts/build.sh" "$fn" 2>&1
 done
-echo "=== sign.sh build_boot_initos_unsigned ==="
-bash "$BUILD_SRC/sidecar/bin/sign.sh" build_boot_initos_unsigned "$BUILD_OUT/disks" "$BUILD_OUT/disks"
-echo "=== All build.sh functions complete ==="
-
 # ── Assemble into OUT ──
-mkdir -p "$OUT"/img "$OUT"/bin "$OUT"/boot
+mkdir -p "$OUT"/img "$OUT"/bin "$OUT"/boot/EFI/BOOT
 
 # initos rootfs
 if [ -f "$BUILD_OUT/disks/state/img/initos.erofs" ]; then
   cp "$BUILD_OUT/disks/state/img/initos.erofs" "$OUT"/img/initos.erofs
 fi
-
-# Expanded rootfs tool directories
-mkdir -p "$OUT"/opt
-cp -R "$BUILD_OUT/disks/initos/opt/busybox" "$OUT"/opt/
-cp -R "$BUILD_OUT/disks/initos/opt/initos" "$OUT"/opt/
 
 # Expanded unsigned EFI System Partition content
 cp -R "$BUILD_OUT/disks/boot/." "$OUT"/boot/
@@ -113,18 +104,10 @@ if [ "$WITH_KERNELS" = "1" ] || [ "$WITH_KERNELS" = "true" ]; then
 fi
 
 # bin/
+# Copy all sidecar scripts/binaries to bin/
+cp -R "$BUILD_SRC"/sidecar/bin/. "$OUT"/bin/
+# Copy initos binary
 cp "$INITOS_BIN" "$OUT"/bin/initos
-cp "$SIGN_SH_LIB" "$OUT"/bin/sign.sh.lib
-
-# Generate sign.sh wrapper
-RUNTIME_SHELL="${RUNTIME_SHELL:-/bin/sh}"
-SIGN_RUNTIME_PATH="${SIGN_RUNTIME_PATH:-/usr/bin:/bin}"
-
-printf '%s\n' \
-  "#!$RUNTIME_SHELL" \
-  "export PATH=\"$SIGN_RUNTIME_PATH:\$PATH\"" \
-  "exec \"$OUT/bin/sign.sh.lib\" \"\$@\"" \
-  > "$OUT"/bin/sign.sh
 chmod 755 "$OUT"/bin/*
 
 if find "$OUT" -type f \( -name '*.sig' -o -name '*signed*.img' \) | grep -q .; then
@@ -133,5 +116,5 @@ if find "$OUT" -type f \( -name '*.sig' -o -name '*signed*.img' \) | grep -q .; 
   exit 1
 fi
 
-echo "initos-artifacts:"
+echo "initos-signer:"
 find "$OUT" -type f | sort | sed "s|$OUT/|  |"

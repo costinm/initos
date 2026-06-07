@@ -124,24 +124,31 @@ build_initrd() {
         > ${out}/disks/boot/EFI/BOOT/initrd.img )
 }
 
-# 3.1 Build boot directories — 3 variants:
-#   - Limine unsigned: multiple boot options, no signing
-#   - Limine signed: Secure Boot with embedded SHAs
-#   - InitOS signed: minimal EFI loader, Secure Boot
-# Each includes public UEFI keys (PK/KEK/DB) for firmware enrollment.
-# Each is also built as a FAT filesystem image and copied to img/.
+# 3.1 Build standard boot directory layout under disks/boot
+build_boot() {
+    build_initrd
 
-# Common files for all boot variants.
-_boot_common() {
-    local boot_path="${1:?Usage: _boot_common <boot_path>}"
-    local initrd_src="${out}/disks/boot/EFI/BOOT/initrd.img"
-    local initrd_dst="${boot_path}/EFI/BOOT/initrd.img"
+    local boot_path="${out}/disks/boot"
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    cp "${src}/prebuilt/boot/EFI/BOOT/bzImage" "${boot_path}/EFI/BOOT/"
-    if [ "${initrd_src}" != "${initrd_dst}" ]; then
-        cp "${initrd_src}" "${initrd_dst}"
+    # Copy Limine BOOTX64.EFI
+    cp "${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI" "${boot_path}/EFI/BOOT/"
+
+    # Copy limine.conf
+    cp "${src}/prebuilt/boot/EFI/BOOT/limine.conf" "${boot_path}/EFI/BOOT/"
+
+    # Copy custom loader as initos.EFI
+    local initos_efi_src="${out}/x86_64-unknown-uefi/release/efi.efi"
+    if [ -f "${initos_efi_src}" ]; then
+        cp "${initos_efi_src}" "${boot_path}/EFI/BOOT/initos.EFI"
+    elif [ -f "${src}/target/x86_64-unknown-uefi/release/efi.efi" ]; then
+        cp "${src}/target/x86_64-unknown-uefi/release/efi.efi" "${boot_path}/EFI/BOOT/initos.EFI"
     fi
+
+    # Write default config file for initos.EFI
+    cat > "${boot_path}/EFI/BOOT/config" <<EOF
+INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
+EOF
 }
 
 # Copy public UEFI keys that users enroll into PK/KEK/DB.
@@ -198,10 +205,8 @@ _build_fat_image() {
 # 4. Build a test env for qemu validation.
 # This calls step 3 to rebuild the initrd.
 build_qemu_test() {
-    local esp_dir="${out}/test_efi"
     local genimage_dir="${out}/test"
     local rootfs_img="${out}/disks/state/img/initos.erofs"
-    local initos_init="${INITOS_INIT:-/opt/initos/bin/initos-init-qemu}"
     local keys="${src}/prebuilt/testdata/uefi-keys"
 
     [ -f "${rootfs_img}" ] || {
@@ -209,21 +214,12 @@ build_qemu_test() {
         return 1
     }
 
-    # Build the unsigned and signed boot directories via sign.sh
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_unsigned "${out}/disks" "${out}/disks"
+    # Build the three boot variants under disks/
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${out}/disks" "${out}/disks"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/disks/boot" "${out}/disks" "${keys}"
     "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/disks/boot" "${out}/disks" "${keys}"
 
-    mkdir -p "${esp_dir}/EFI"
-    cp -R "${out}/disks/boot-initos-signed/EFI/BOOT" "${esp_dir}/EFI/"
-
-    cat > "${esp_dir}/EFI/BOOT/config" <<EOF
-rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${initos_init} rw iommu=relaxed net.ifnames=0 panic=5
-EOF
-
-    sign_qemu_efi
-
     build_qemu_state
-    #build_qemu_gpt
 }
 
 # 4.1 Pack a STATE rootfs - using img/ dir.
@@ -386,11 +382,7 @@ test() {
     echo "=== Building artifacts ==="
     build_rust
     build_initos
-    build_initrd
-    local keys="${src}/prebuilt/testdata/uefi-keys"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${out}/disks" "${out}/disks"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/disks/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/disks/boot" "${out}/disks" "${keys}"
+    build_boot
     build_qemu_test
 
     echo "=== Running Cargo Tests ==="
@@ -411,7 +403,7 @@ else
     keys="${src}/prebuilt/testdata/uefi-keys"
     build_rust
     build_initos
-    build_initrd
+    build_boot
     "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${out}/disks" "${out}/disks"
     "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/disks/boot" "${out}/disks" "${keys}"
     "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/disks/boot" "${out}/disks" "${keys}"

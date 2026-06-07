@@ -7,9 +7,9 @@
 set -eu
 
 SIGNER_PATH="$1"
-ARTIFACTS_PATH="$2"
-KERNEL_TYPE="$3"
-COREUTILS_BIN="$4"
+KERNEL_TYPE="$2"
+COREUTILS_BIN="$3"
+ARTIFACTS_PATH="${SIGNER_PATH}"
 OUT=/out/result
 
 export PATH="${SIGNER_PATH}/bin:${COREUTILS_BIN}:$PATH"
@@ -26,7 +26,7 @@ sign.sh sign_init
 echo ""
 
 echo "=== Step 2: Sign artifacts ==="
-sign.sh artifacts "${ARTIFACTS_PATH}" "${OUT}" "${SECRETS}"
+sign.sh artifacts "${OUT}" "${ARTIFACTS_PATH}"
 echo ""
 
 # Verify outputs
@@ -47,11 +47,26 @@ check_file() {
 echo "  --- Signed artifacts ---"
 check_file "${OUT}/img/initos.erofs"
 check_file "${OUT}/img/initos.erofs.sig"
+if [ "${KERNEL_TYPE}" = "dir" ]; then
+    check_file "${OUT}/img/firmware.erofs"
+    check_file "${OUT}/img/firmware.erofs.sig"
+    for m in "${OUT}"/img/modules-*.erofs; do
+        if [ -f "$m" ]; then
+            check_file "$m"
+            check_file "${m}.sig"
+        fi
+    done
+fi
+check_file "${OUT}/img/boot-limine-unsigned.img"
 check_file "${OUT}/img/boot-initos-signed.img"
+check_file "${OUT}/img/boot-limine-signed.img"
 check_file "${OUT}/boot/EFI/BOOT/BOOTX64.EFI"
 check_file "${OUT}/boot/EFI/BOOT/config"
 check_file "${OUT}/boot/EFI/BOOT/bzImage"
 check_file "${OUT}/boot/EFI/BOOT/initrd.img"
+check_file "${OUT}/boot-limine-unsigned/EFI/BOOT/BOOTX64.EFI"
+check_file "${OUT}/boot-initos-signed/EFI/BOOT/BOOTX64.EFI"
+check_file "${OUT}/boot-limine-signed/EFI/BOOT/BOOTX64.EFI"
 
 echo ""
 echo "  --- Generated keys ---"

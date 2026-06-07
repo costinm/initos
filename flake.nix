@@ -96,13 +96,9 @@
 
       signRuntimePath = pkgs.lib.makeBinPath signRuntimeDeps;
 
-      # ── Assemble unsigned artifacts: initos.erofs, initrd, boot layout ──
-      # No signing happens here. The output contains everything needed
-      # for sign.sh to create signed boot images later.
-
-      initos-artifacts = pkgs.runCommand "initos-artifacts" {
+      initos-signer = pkgs.runCommand "initos-signer" {
         nativeBuildInputs = with pkgs; [
-          cpio gzip erofs-utils mtools
+          cpio gzip erofs-utils mtools makeWrapper
         ] ++ [ initos efi ];
       } ''
         export OUT="$out"
@@ -114,26 +110,11 @@
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
         export WITH_KERNELS="0"
-        export SIGN_SH_LIB="${./sidecar/bin/sign.sh}"
-        export SIGN_RUNTIME_PATH="${signRuntimePath}"
-        export RUNTIME_SHELL="${pkgs.runtimeShell}"
 
         bash ${./scripts/assemble_artifacts.sh}
-      '';
 
-      # ── initos-signer: sign.sh wrapper with all signing deps ────────────
-      # This package provides sign.sh with all required signing tools
-      # available at runtime. Use it to sign artifacts produced by
-      # initos-artifacts (and optionally kernel-host from linux/flake.nix).
-      #
-      # Usage:
-      #   nix build .#initos-signer
-      #   ./result/bin/sign.sh artifacts <initos-artifacts-path> <output-dir> [keys-dir]
-      #   ./result/bin/sign.sh sign_init  # generate fresh signing keys
-
-      initos-signer = pkgs.writeShellScriptBin "sign.sh" ''
-        export PATH="${signRuntimePath}:${initos-artifacts}/bin:$PATH"
-        exec "${initos-artifacts}/bin/sign.sh.lib" "$@"
+        wrapProgram $out/bin/sign.sh \
+          --prefix PATH : "${signRuntimePath}"
       '';
 
       # ── OCI cache image (used in GitHub Actions) ────────────────────────
@@ -141,7 +122,7 @@
       oci-cache-image = pkgs.dockerTools.buildLayeredImage {
         name = "ghcr.io/costinm/initos/nix-artifact-cache";
         tag = self.shortRev or "dirty";
-        contents = [ initos-artifacts ];
+        contents = [ initos-signer ];
         config = {
           Env = [ "PATH=/bin" ];
           WorkingDir = "/";
@@ -167,7 +148,7 @@
       docker-image = pkgs.dockerTools.buildImage {
         name = "initos-signer";
         tag = "latest";
-        copyToRoot = [ initos-signer initos-artifacts pkgs.coreutils usrBinEnv pkgs.bash tmpDir ];
+        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir ];
         config = {
           Entrypoint = [ "/bin/sign.sh" ];
           Env = [ "PATH=/bin" ];
@@ -178,8 +159,8 @@
     in
     {
       packages.${system} = {
-        inherit initos efi initos-artifacts initos-signer oci-cache-image docker-image;
-        default = initos-artifacts;
+        inherit initos efi initos-signer oci-cache-image docker-image;
+        default = initos-signer;
       };
     };
 }

@@ -44,13 +44,8 @@ set_out() {
 
 stage_nix_artifacts() {
     local nix_result="${1:-${NIX_RESULT:-result}}"
-    local boot_img="${nix_result}/img/boot-initos-signed.img"
     local rootfs_img="${nix_result}/img/initos.erofs"
 
-    if [[ ! -f "${boot_img}" ]]; then
-        echo "Missing Nix boot image: ${boot_img}" >&2
-        exit 1
-    fi
     if [[ ! -f "${rootfs_img}" ]]; then
         echo "Missing Nix rootfs image: ${rootfs_img}" >&2
         exit 1
@@ -62,18 +57,23 @@ stage_nix_artifacts() {
 
     set_out "${NIX_QEMU_OUT:-${src}/target/nix-qemu}"
 
-    rm -rf "${ESP_DIR}" "${out}/disks/state" "${out}/test/state.ext4"
+    rm -rf "${ESP_DIR}" "${out}/disks" "${out}/test/state.ext4"
     mkdir -p "${ESP_DIR}" "${out}/disks/state/img" "${out}/test"
 
-    echo "=== Staging Nix artifacts from ${nix_result} into ${out} ==="
-    mcopy -i "${boot_img}" -s ::EFI "${ESP_DIR}/"
     cp "${rootfs_img}" "${out}/disks/state/img/initos.erofs"
 
-    cat > "${ESP_DIR}/EFI/BOOT/config" <<EOF
-rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5
-EOF
+    echo "=== Staging Nix boot images ==="
+    for variant in boot-limine-unsigned boot-initos-signed boot-limine-signed; do
+        local img_path="${nix_result}/img/${variant}.img"
+        if [[ -f "${img_path}" ]]; then
+            mkdir -p "${out}/disks/${variant}"
+            mcopy -i "${img_path}" -s ::EFI "${out}/disks/${variant}/" || true
+            mcopy -i "${img_path}" -s ::keys "${out}/disks/${variant}/" || true
+        else
+            echo "Warning: Nix boot image not found: ${img_path}" >&2
+        fi
+    done
 
-    "${src}/sidecar/bin/sign.sh" efi "${src}/prebuilt/testdata/uefi-keys" "${ESP_DIR}/"
     build_qemu_state
 }
 
@@ -116,17 +116,32 @@ require_artifacts() {
         echo "Did not find db.crt at ${sec_dir}/db.crt. PWD is $(pwd), src is ${src}"
     fi
 
-    for f in \
-        "${ESP_DIR}/EFI/BOOT/BOOTX64.EFI" \
-        "${ESP_DIR}/EFI/BOOT/bzImage" \
-        "${ESP_DIR}/EFI/BOOT/config" \
-        "${ESP_DIR}/EFI/BOOT/initrd.img" \
-        "${ESP_DIR}/EFI/BOOT/${KEY_ID}.sig" \
-        "${ESP_DIR}/EFI/BOOT/${KEY_ID}.kernel.sig" \
-        "${ESP_DIR}/EFI/BOOT/${KEY_ID}.initrd.sig" \
-        "${out}/test/state.ext4"; do
-        if [[ ! -f "$f" ]]; then
-            echo "Missing QEMU artifact: $f" >&2
+    # Check state disk
+    if [[ ! -f "${out}/test/state.ext4" ]]; then
+        echo "Missing state.ext4 disk" >&2
+        missing=1
+    fi
+
+    # Check unsigned boot layout
+    for f in BOOTX64.EFI bzImage limine.conf initos.EFI initrd.img; do
+        if [[ ! -f "${out}/disks/boot-limine-unsigned/EFI/BOOT/$f" ]]; then
+            echo "Missing unsigned boot artifact: disks/boot-limine-unsigned/EFI/BOOT/$f" >&2
+            missing=1
+        fi
+    done
+
+    # Check signed initos layout
+    for f in BOOTX64.EFI bzImage initos.EFI initrd.img config "${KEY_ID}.sig" "${KEY_ID}.kernel.sig" "${KEY_ID}.initrd.sig"; do
+        if [[ ! -f "${out}/disks/boot-initos-signed/EFI/BOOT/$f" ]]; then
+            echo "Missing signed initos artifact: disks/boot-initos-signed/EFI/BOOT/$f" >&2
+            missing=1
+        fi
+    done
+
+    # Check signed limine layout
+    for f in BOOTX64.EFI bzImage initrd.img limine.conf; do
+        if [[ ! -f "${out}/disks/boot-limine-signed/EFI/BOOT/$f" ]]; then
+            echo "Missing signed limine artifact: disks/boot-limine-signed/EFI/BOOT/$f" >&2
             missing=1
         fi
     done
@@ -138,6 +153,7 @@ require_artifacts() {
 }
 
 run() {
+    local timeout_s="${1:-${TIMEOUT:-30}}"
     # 4. Run QEMU
     OVMF="prebuilt/OVMF.fd"
     local log_file="${LOG_FILE:-${out}/qemu_efi.log}"
@@ -196,7 +212,6 @@ run() {
         )
         qemu-system-x86_64 "${QEMU_ARGS[@]}" | tee "$log_file"
     else
-        local timeout_s=${TIMEOUT:-30}
         echo "=== Starting QEMU (timeout ${timeout_s}s) ==="
         set +e
         timeout --foreground "${timeout_s}s" qemu-system-x86_64 "${QEMU_ARGS[@]}" \
@@ -208,7 +223,7 @@ run() {
         set -e
 		if [[ $rc -eq 124 ]]; then
 			echo ""
-			echo "=== QEMU timed out after ${timeout_s}s; analyzing captured log ==="
+			echo "=== QEMU timed out after ${timeout_s}s ==="
 		elif [[ $rc -ne 0 ]]; then
 			echo ""
 			echo "=== QEMU exited with status ${rc} ==="
@@ -218,60 +233,90 @@ run() {
     fi
 }
 
-test() {
-    require_artifacts
-    run
-    analyze
+test_unsigned_negative() {
+    echo "=== Running Negative Test (Unsigned bootloader) ==="
+    rm -rf "${ESP_DIR}"
+    mkdir -p "${ESP_DIR}"
+    cp -R "${out}/disks/boot-limine-unsigned/." "${ESP_DIR}/"
+
+    # Write QEMU command line config
+    cat > "${ESP_DIR}/EFI/BOOT/config" <<EOF
+rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5
+EOF
+
+    local log_file="${out}/qemu_efi_unsigned.log"
+    LOG_FILE="${log_file}" run 6
+
+    echo "=== Analyzing Unsigned Boot (Expected to Fail) ==="
+    if grep -q "Linux version" "${log_file}" || grep -q "InitOS EFI Loader" "${log_file}"; then
+        echo "❌ FAILURE: Unsigned bootloader or kernel booted successfully under Secure Boot!"
+        exit 1
+    else
+        echo "✅ SUCCESS: Unsigned bootloader was blocked by Secure Boot!"
+    fi
 }
 
-analyze() {
-    local log_file="${LOG_FILE:-${out}/qemu_efi.log}"
-    echo ""
-    echo "=== Analyzing Results ==="
-    cat "$log_file"
+test_limine_signed() {
+    echo "=== Running Signed Limine Direct Boot Test ==="
+    rm -rf "${ESP_DIR}"
+    mkdir -p "${ESP_DIR}"
+    
+    # We want to re-run sign.sh build_boot_limine_signed with the correct INITOS_CMDLINE for testing console=hvc0
+    local keys="${src}/prebuilt/testdata/uefi-keys"
+    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5" \
+        "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/disks/boot" "${out}/disks" "${keys}"
 
-    if grep -q "Command line:.*console=hvc0.*" "$log_file"; then
-        echo "✅ SUCCESS: Config file read correctly!"
+    cp -R "${out}/disks/boot-limine-signed/." "${ESP_DIR}/"
+
+    local log_file="${out}/qemu_efi_limine_signed.log"
+    LOG_FILE="${log_file}" run 30
+
+    echo "=== Analyzing Signed Limine Boot ==="
+    
+    if grep -q "Run .* as init process" "${log_file}" && grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+        echo "✅ SUCCESS: Signed Limine booted and completed all tests!"
     else
-        echo "❌ FAILURE: Config file was not read correctly or command line mismatch."
+        echo "❌ FAILURE: Signed Limine boot failed or did not complete tests."
         exit 1
     fi
+}
 
-    if grep -q "✅ RSA Signature VERIFIED for config" "$log_file" || grep -q "✅ CONFIG VERIFIED OK" "$log_file"; then
-        echo "✅ SUCCESS: Config RSA Signature verified!"
+test_initos_signed() {
+    echo "=== Running Signed InitOS Custom Loader Boot Test ==="
+    rm -rf "${ESP_DIR}"
+    mkdir -p "${ESP_DIR}"
+    cp -R "${out}/disks/boot-initos-signed/." "${ESP_DIR}/"
+
+    # Write config
+    cat > "${ESP_DIR}/EFI/BOOT/config" <<EOF
+rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5
+EOF
+
+    # Re-sign config since we modified it
+    local keys="${src}/prebuilt/testdata/uefi-keys"
+    "${src}/sidecar/bin/sign.sh" efi "${keys}" "${ESP_DIR}/"
+
+    local log_file="${out}/qemu_efi_initos_signed.log"
+    LOG_FILE="${log_file}" run 30
+
+    echo "=== Analyzing Signed InitOS Boot ==="
+
+    if grep -q "Command line:.*console=hvc0.*" "${log_file}" && \
+       (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") && \
+       (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") && \
+       grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+        echo "✅ SUCCESS: Signed InitOS booted, verified signatures, and completed all tests!"
     else
-        echo "❌ FAILURE: Config RSA Signature verification failed or did not run."
+        echo "❌ FAILURE: Signed InitOS boot verification failed."
         exit 1
     fi
+}
 
-    if grep -q "✅ RSA Signature VERIFIED for kernel" "$log_file" || grep -q "✅ KERNEL VERIFIED OK" "$log_file"; then
-        echo "✅ SUCCESS: Kernel RSA Signature verified!"
-    else
-        echo "❌ FAILURE: Kernel RSA Signature verification failed or did not run."
-        exit 1
-    fi
-
-    if grep -q "✅ CONFIG VERIFIED OK" "$log_file" ; then
-        echo "✅ SUCCESS: Full verification passed!"
-    else
-        echo "❌ FAILURE: Full verification failed."
-        exit 1
-    fi
-
-    echo "=== Checking Kernel Activity ==="
-    if grep -i -q "Linux version" "$log_file" || grep -q "Run .* as init process" "$log_file"; then
-        echo "✅ SUCCESS: Kernel started!"
-    elif grep -q "Jumping to handover" "$log_file"; then
-        echo "⚠️  Handover executed but no kernel output. (Check serial console settings)"
-    else
-        echo "❌ FAILURE: Kernel did not start or no output captured."
-    fi
-
-    if grep -q "INITOS:" "$log_file"; then
-        echo "✅ SUCCESS: initos script is running!"
-    elif grep -i -q "Unable to mount root fs" "$log_file"; then
-        echo "⚠️  Kernel started but panicked finding init. (Progress!)"
-    fi
+test() {
+    require_artifacts
+    test_unsigned_negative
+    test_limine_signed
+    test_initos_signed
 }
 
 if [[ "${1:-}" == "--nix-result" ]]; then

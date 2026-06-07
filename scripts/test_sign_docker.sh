@@ -12,7 +12,19 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DOCKER_TAR="${PROJECT_ROOT}/result-docker"
 KEYS_DIR="${PROJECT_ROOT}/prebuilt/testdata/uefi-keys"
-BZIMAGE_FILE="${PROJECT_ROOT}/prebuilt/boot/EFI/BOOT/bzImage"
+BZIMAGE_FILE=""
+for p in \
+    "${PROJECT_ROOT}/target/img/bzImage" \
+    "${PROJECT_ROOT}/target/linux/arch/x86/boot/bzImage" \
+    "${PROJECT_ROOT}/target/linux/arch/x86_64/boot/bzImage" \
+    "${PROJECT_ROOT}/result-kernel/boot/EFI/BOOT/bzImage" \
+    "${PROJECT_ROOT}/result-kernel/img/bzImage" \
+    "${PROJECT_ROOT}/prebuilt/boot/EFI/BOOT/bzImage"; do
+    if [[ -f "$p" ]]; then
+        BZIMAGE_FILE="$p"
+        break
+    fi
+done
 HOST_OUT_DIR="${PROJECT_ROOT}/target"
 DOCKER_OUT_DIR="${PROJECT_ROOT}/target/test-docker-out"
 
@@ -27,8 +39,8 @@ if [[ ! -d "${KEYS_DIR}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "${BZIMAGE_FILE}" ]]; then
-    echo "ERROR: bzImage fallback file not found: ${BZIMAGE_FILE}" >&2
+if [[ -z "${BZIMAGE_FILE}" ]]; then
+    echo "ERROR: bzImage file not found in any standard locations" >&2
     exit 1
 fi
 
@@ -60,7 +72,7 @@ podman run --rm \
   -v "${DOCKER_OUT_DIR}:/out" \
   -e KERNEL_BZIMAGE=/bzImage \
   localhost/initos-signer:latest \
-  artifacts / /out
+  artifacts /out /
 
 # 6. Verification and Comparison
 echo "=== Comparing outputs between Host and Container ==="
