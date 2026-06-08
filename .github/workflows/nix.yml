@@ -44,7 +44,25 @@ jobs:
       - name: Build OCI cache image
         run: nix build .#oci-cache-image -o result-oci-cache-image
 
-      - name: Build Docker Image
+      - name: Restore kernel rolling release NAR cache
+        continue-on-error: true
+        run: |
+          curl -fL --retry 3 \
+            -o "$RUNNER_TEMP/initos-kernel-host.nar" \
+            https://github.com/costinm/initos/releases/download/rolling-release/initos-kernel-host.nar
+          nix-store --import < "$RUNNER_TEMP/initos-kernel-host.nar"
+
+      - name: Build host kernel
+        run: nix build ./linux#kernel-host -o result-kernel-host
+
+      - name: Package host kernel
+        run: |
+          STORE_PATH=$(readlink -f result-kernel-host)
+          nix-store --export "$STORE_PATH" > initos-kernel-host.nar
+          tar -C result-kernel-host -czf initos-kernel-host.tar.gz .
+          ##cp --remove-destination "$(readlink -f result-docker-image)" initos-kernel-host-image.tar.gz
+
+      - name: Build Docker Image - with current kernel
         run: nix build .#docker-image -o result-docker-image
 
       - name: Package artifacts
@@ -63,8 +81,8 @@ jobs:
           path: |
             initos-signer.nar
             initos-signer.tar.gz
-            initos-signer-image.tar.gz
-            oci-cache-image.tar.gz
+            initos-kernel-host.nar
+            initos-kernel-host.tar.gz
 
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -104,6 +122,8 @@ jobs:
           files: |
             initos-signer.nar
             initos-signer.tar.gz
+            initos-kernel-host.nar
+            initos-kernel-host.tar.gz
             initos-signer-image.tar.gz
             oci-cache-image.tar.gz
           body: "Rolling Release containing initos-signer NAR, tarball, and container images."

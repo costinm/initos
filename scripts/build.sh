@@ -405,6 +405,10 @@ firmware() {
     "${src}/scripts/setup-kernel" add_firmware
 }
 
+align_flake_locks() {
+    nix flake lock ./linux --reference-lock-file flake.lock
+}
+
 nix_all() {
     # initos, efi, kernel-cloud, kernel-host, firmware-erofs
     # 
