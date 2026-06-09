@@ -172,63 +172,6 @@ image() {
     rm -f "${digest_bin}"
 }
 
-# Sign the boot EFI - original limine required embedding the SHA
-# of the config, and the initrd/kernel into config.
-# 
-# EFI loader verifies config/initrd signatures using certs from the db variable.
-# The EFI binary itself is signed with db.key for Secure Boot verification.
-efi() {
-    # HOME/.ssh/
-    local sec_dir=${1:?Usage: efi <sec_dir>}
-    local boot=${2:?Usage: efi <sec_dir> <boot_dir>}
-    local signed="${boot}/EFI/BOOT/BOOTX64.EFI.signed"
-
-    mkdir -p "${boot}/EFI/BOOT"
-    
-    PUB_KEY_B64=$(cat "${sec_dir}/image_key.pub.b64")
-
-    echo "Signing BOOTX64.EFI..."
-
-    sbsign --key "${sec_dir}/db.key" \
-           --cert "${sec_dir}/db.crt" \
-           --output  "${signed}" \
-           "${boot}/EFI/BOOT/BOOTX64.EFI"
-    mv "${signed}" "${boot}/EFI/BOOT/BOOTX64.EFI"
-
-    if [ -f "${boot}/EFI/BOOT/initos.EFI" ]; then
-        echo "Signing initos.EFI..."
-        sbsign --key "${sec_dir}/db.key" \
-               --cert "${sec_dir}/db.crt" \
-               --output "${boot}/EFI/BOOT/initos.EFI.signed" \
-               "${boot}/EFI/BOOT/initos.EFI"
-        mv "${boot}/EFI/BOOT/initos.EFI.signed" "${boot}/EFI/BOOT/initos.EFI"
-    fi
-
-    ESP_DIR=${boot}
-
-    KEY_ID=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout | openssl rsa -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | sed 's/.*= //' | cut -c 1-16)
-
-    SIG_FILE="$ESP_DIR/EFI/BOOT/${KEY_ID}.sig"
-    echo "Signing config with db.key... (KEY_ID: ${KEY_ID})"
-    
-    openssl dgst -sha256 \
-       -sign ${sec_dir}/db.key \
-       -out "$SIG_FILE" \
-       "$ESP_DIR/EFI/BOOT/config"
-
-    # Create a signature for the kernel file using db.key (RSA)
-    KERNEL_SIG_FILE="$ESP_DIR/EFI/BOOT/${KEY_ID}.kernel.sig"
-    echo "Signing kernel with db.key..."
-    openssl dgst -sha256 -sign ${sec_dir}/db.key \
-       -out "$KERNEL_SIG_FILE" "$ESP_DIR/EFI/BOOT/bzImage"
-
-    # # Create a signature for the initrd file using db.key (RSA)
-    INITRD_SIG_FILE="$ESP_DIR/EFI/BOOT/${KEY_ID}.initrd.sig"
-    echo "Signing initrd with db.key..."
-    openssl dgst -sha256 -sign ${sec_dir}/db.key \
-       -out "$INITRD_SIG_FILE" "$ESP_DIR/EFI/BOOT/initrd.img"
-}
-
 _build_fat_image() {
     local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_file>}"
     local img_file="${2:?Usage: _build_fat_image <boot_path> <img_file>}"
@@ -353,85 +296,15 @@ artifacts() {
         cp "${kernel_dir}/bzImage" "${boot_stage}/EFI/BOOT/bzImage"
     fi
 
-    # Inject public key into config if present
-    if [ -f "${sec_dir}/image_key.pub.b64" ] &&
-       [ -f "${boot_stage}/EFI/BOOT/config" ] &&
-       ! grep -q 'INITOS_PUB_KEY=' "${boot_stage}/EFI/BOOT/config"; then
-        printf ' INITOS_PUB_KEY=%s\n' "$(cat "${sec_dir}/image_key.pub.b64")"           >> "${boot_stage}/EFI/BOOT/config"
-    fi
+    local pub_key
+    pub_key=$(_require_image_pub_key "${sec_dir}")
 
     # Build the three boot variants from the staging area
-    build_boot_limine_unsigned "${boot_stage}" "${output_dir}"
-    build_boot_initos_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
-    build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
+    build_boot_limine_unsigned "${boot_stage}" "${output_dir}" "${sec_dir}"
+    build_boot_initos_signed "${boot_stage}" "${output_dir}" "${sec_dir}" "${pub_key}"
+    build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}" "${pub_key}"
 
     rm -rf "${boot_stage}"
-}
-
-# Similar - but using limine as main loader.
-sign_limine() {
-    SHA_KERNEL=$(cat ${boot}/EFI/BOOT/bzImage | b2sum)
-    SHA_INITRD=$(cat ${boot}/EFI/BOOT/initrd.img | b2sum)
-   echo <<EOF > ${boot}/EFI/BOOT/limine.conf
-timeout: 0
-serial: yes
-graphics: no
-verbose: yes
-editor_enabled: no
-
-/BootA
-  protocol: linux
-  path: boot():/EFI/LINUX/bzImage#${SHA_KERNEL}
-  cmdline: rdinit=/sbin/initos-initrd net.ifnames=0 panic=5 
-  module_path: boot():/EFI/LINUX/initrd.img#${SHA_INITRD}  
-EOF
-
-  CFGSHA=$(cat ${boot}/EFI/BOOT/limine.conf |b2sum)
-
-  cp ${boot}/EFI/BOOT/BOOTX64.EFI /tmp/limine.EFI
-  limine enroll-config /tmp/limine.EFI $CFGSHA
-  
-  sbsign --cert /etc/uefi-keys/db.crt \
-      --key /etc/uefi-keys/db.key \
-      --output ${boot}/EFI/BOOT/limine.EFI \
-       /tmp/limine.EFI 
-
-  rm /tmp/limine.EFI
-}
-
-build_dmverity_boot() {
-    ROOTFS_IMG="${out}/disks/state/img/initos.erofs"
-    INITOS_IMG="${out}/test/initos.dmverity"
-
-    echo "Generating ${INITOS_IMG} with appended dm-verity..."
-    cp "${ROOTFS_IMG}" "${INITOS_IMG}"
-    
-    HASH_OFFSET=$(stat -c %s "${INITOS_IMG}")
-    
-    VERITY_OUT=$(veritysetup format --hash-offset=$HASH_OFFSET "${INITOS_IMG}" "${INITOS_IMG}")
-    
-    ROOT_HASH=$(echo "$VERITY_OUT" | awk '/Root hash:/ {print $3}')
-    SALT=$(echo "$VERITY_OUT" | awk '/Salt:/ {print $2}')
-    DATA_BLOCKS=$(echo "$VERITY_OUT" | awk '/Data blocks:/ {print $3}')
-    
-    echo "ROOT_HASH=$ROOT_HASH" > "${out}/initos.verity.txt"
-    echo "SALT=$SALT" >> "${out}/initos.verity.txt"
-    echo "HASH_OFFSET=$HASH_OFFSET" >> "${out}/initos.verity.txt"
-    echo "DATA_BLOCKS=$DATA_BLOCKS" >> "${out}/initos.verity.txt"
-
-    BOOT_DISK_DIR="${out}/disks/boot"
-    mkdir -p "${BOOT_DISK_DIR}/EFI/BOOT"
-    
-    # KERNEL_SHA=$(sha256sum "${BOOT_DISK_DIR}/EFI/BOOT/bzImage" | awk '{print $1}')
-    
-    LENGTH=$((DATA_BLOCKS * 8))
-    HASH_START_BLOCK=$(( (HASH_OFFSET / 4096) + 1 ))
-    
-    DM_STR="vroot,,,ro,0 ${LENGTH} verity 1 /dev/vdb /dev/vdb 4096 4096 ${DATA_BLOCKS} ${HASH_START_BLOCK} sha256 ${ROOT_HASH} ${SALT}"
-    
-    cat > "${BOOT_DISK_DIR}/EFI/BOOT/config.verity" <<EOF
-root=/dev/dm-0 rootwait rootfstype=erofs dm-mod.create="${DM_STR}" dm-mod.waitfor=/dev/vdb
-EOF
 }
 
 _resolve_path() {
@@ -476,9 +349,22 @@ _safe_cp() {
     fi
 }
 
+_require_image_pub_key() {
+    local sec_dir="${1:?Usage: _require_image_pub_key <secrets_dir>}"
+    local pub_key_file="${sec_dir}/image_key.pub.b64"
+
+    if [ ! -s "${pub_key_file}" ]; then
+        echo "ERROR: ${pub_key_file} is not present or empty (required for INITOS_PUB_KEY)" >&2
+        exit 1
+    fi
+
+    tr -d '\r\n' < "${pub_key_file}"
+}
+
 _copy_uefi_public_keys() {
-    local src_dir="${1}"
-    local dst_dir="${2}"
+    local dst_dir="${1:?Usage: _copy_uefi_public_keys <dst_dir> [secrets_dir]}"
+    local sec_dir="${2:-${SECRETS:-/var/run/secrets/uefi-keys}}"
+    local SECRETS="${sec_dir}"
 
     if [ -n "${NIX_BUILD_TOP:-}" ]; then
         echo "Nix build environment detected — skipping public keys installation for unsigned package."
@@ -488,16 +374,18 @@ _copy_uefi_public_keys() {
     echo "Installing UEFI public keys into ${dst_dir}..."
     mkdir -p "${dst_dir}"
     for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
-        if [ -f "${src_dir}/${f}" ]; then
-            cp "${src_dir}/${f}" "${dst_dir}/"
+        if [ -f "${SECRETS}/${f}" ]; then
+            cp "${SECRETS}/${f}" "${dst_dir}/"
         fi
     done
 }
 
 
 build_boot_limine_unsigned() {
-    local artifact_dir="${1:?Usage: build_boot_limine_unsigned <artifact_dir> <output_dir>}"
-    local output_dir="${2:?Usage: build_boot_limine_unsigned <artifact_dir> <output_dir>}"
+    local artifact_dir="${1:?Usage: build_boot_limine_unsigned <artifact_dir> <output_dir> [secrets_dir]}"
+    local output_dir="${2:?Usage: build_boot_limine_unsigned <artifact_dir> <output_dir> [secrets_dir]}"
+    local sec_dir="${3:-${SECRETS:-/var/run/secrets/uefi-keys}}"
+    local SECRETS="${sec_dir}"
     local boot_path=$(mktemp -d)
     echo "=== Building limine-unsigned boot ==="
 
@@ -522,15 +410,7 @@ build_boot_limine_unsigned() {
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
     _safe_cp "$config_src" "${boot_path}/EFI/BOOT/config"
 
-    local keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
-    if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
-    else
-        local base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-        if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
-        fi
-    fi
+    _copy_uefi_public_keys "${boot_path}/keys" "${sec_dir}"
 
     mkdir -p "${output_dir}/img"
     _build_fat_image "${boot_path}" "${output_dir}/img/boot-limine-unsigned.vfat"
@@ -538,38 +418,36 @@ build_boot_limine_unsigned() {
 }
 
 build_boot_limine_signed() {
-    local artifact_dir="${1:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir]}"
-    local output_dir="${2:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir]}"
+    local artifact_dir="${1:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
+    local output_dir="${2:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
     local sec_dir="${3:-${SECRETS:-/var/run/secrets/uefi-keys}}"
+    local pub_key="${4:-}"
+    local SECRETS="${sec_dir}"
+
+    if [ -z "${pub_key}" ]; then
+        echo "ERROR: INITOS_PUB_KEY is not present (required for build_boot_limine_signed)" >&2
+        exit 1
+    fi
+
     local boot_path=$(mktemp -d)
     echo "=== Building limine-signed boot ==="
 
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    local bzimage_src initrd_src bootx64_src config_src
+    local bzimage_src initrd_src bootx64_src
     bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
     initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
     bootx64_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/BOOTX64.EFI")
     [ -z "$bootx64_src" ] && bootx64_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/BOOTX64.EFI")
-    config_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/config")
-    [ -z "$config_src" ] && config_src=$(_resolve_path "$artifact_dir" "config")
 
     _safe_cp "$bzimage_src" "${boot_path}/EFI/BOOT/bzImage"
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
     
-    if [ -n "$config_src" ] && [ -f "$config_src" ]; then
-        _safe_cp "$config_src" "${boot_path}/EFI/BOOT/config"
-    else
-        cat > "${boot_path}/EFI/BOOT/config" <<EOF
-INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
-EOF
-    fi
-
     local sha_kernel sha_initrd
     sha_kernel=$(b2sum "${boot_path}/EFI/BOOT/bzImage" | awk '{print $1}')
     sha_initrd=$(b2sum "${boot_path}/EFI/BOOT/initrd.img" | awk '{print $1}')
 
-    local cmdline="${INITOS_CMDLINE:-INITOS_INIT=/opt/initos/bin/initos-init-dev console=ttyS0,115200 console=tty1 net.ifnames=0 panic=5 loglevel=6}"
+    local cmdline="${INITOS_CMDLINE:-console=ttyS0,115200 console=tty1 net.ifnames=0 panic=5 loglevel=6} INITOS_PUB_KEY=${pub_key}"
     cat > "${boot_path}/EFI/BOOT/limine.conf" <<LIMINECFG
 timeout: 2
 serial: yes
@@ -588,137 +466,88 @@ LIMINECFG
     cfg_sha=$(b2sum "${boot_path}/EFI/BOOT/limine.conf" | awk '{print $1}')
     if command -v limine >/dev/null 2>&1; then
         _safe_cp "$bootx64_src" /tmp/limine-tmp.EFI
+        
         limine enroll-config /tmp/limine-tmp.EFI "${cfg_sha}"
-        sbsign --key "${sec_dir}/db.key"                --cert "${sec_dir}/db.crt"                --output "${boot_path}/EFI/BOOT/BOOTX64.EFI"                /tmp/limine-tmp.EFI
+
+        sbsign --key "${sec_dir}/db.key" \
+               --cert "${sec_dir}/db.crt" \
+               --output "${boot_path}/EFI/BOOT/BOOTX64.EFI" \
+               /tmp/limine-tmp.EFI
         rm -f /tmp/limine-tmp.EFI
     else
         echo "  WARNING: limine tool not installed — skipping config hash enrollment"
         echo "  Install limine for full config verification: https://github.com/limine-bootloader/limine"
-        local signed_efi="${boot_path}/EFI/BOOT/BOOTX64.EFI.signed"
-        _safe_cp "$bootx64_src" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
-        sbsign --key "${sec_dir}/db.key"                --cert "${sec_dir}/db.crt"                --output "${signed_efi}"                "${boot_path}/EFI/BOOT/BOOTX64.EFI"
-        mv "${signed_efi}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
+        return
     fi
 
-    local keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
-    if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
-    else
-        local base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-        if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
-        fi
-    fi
+    _copy_uefi_public_keys "${boot_path}/keys" "${sec_dir}"
 
     mkdir -p "${output_dir}/img"
     _build_fat_image "${boot_path}" "${output_dir}/img/boot-limine-signed.vfat"
     rm -rf "${boot_path}"
 }
 
-build_boot_initos_unsigned() {
-    local artifact_dir="${1:?Usage: build_boot_initos_unsigned <artifact_dir> <output_dir>}"
-    local output_dir="${2:?Usage: build_boot_initos_unsigned <artifact_dir> <output_dir>}"
-    local boot_path=$(mktemp -d)
-    local esp_dir="${boot_path}"
-    echo "=== Building initos unsigned boot ==="
-
-    mkdir -p "${boot_path}/EFI/BOOT"
-
-    local bzimage_src initrd_src initos_efi_src bootx64_limine_src limine_conf_src config_src
-    bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
-    initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
-    initos_efi_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initos.EFI")
-    [ -z "$initos_efi_src" ] && initos_efi_src=$(_resolve_path "$artifact_dir" "target/x86_64-unknown-uefi/release/efi.efi")
-
-    bootx64_limine_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/BOOTX64.EFI")
-    [ -z "$bootx64_limine_src" ] && bootx64_limine_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/BOOTX64.EFI")
-    limine_conf_src=$(_resolve_path "$artifact_dir" "boot/EFI/BOOT/limine.conf")
-    [ -z "$limine_conf_src" ] && limine_conf_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/limine.conf")
-    config_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/config")
-    [ -z "$config_src" ] && config_src=$(_resolve_path "$artifact_dir" "config")
-
-    _safe_cp "$bzimage_src" "${boot_path}/EFI/BOOT/bzImage"
-    _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
-    _safe_cp "$bootx64_limine_src" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
-    _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
-
-    if [ -n "$config_src" ] && [ -f "$config_src" ]; then
-        _safe_cp "$config_src" "${esp_dir}/EFI/BOOT/config"
-    else
-        cat > "${esp_dir}/EFI/BOOT/config" <<EOF
-INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
-EOF
-    fi
-
-    local keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
-    if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
-    else
-        local base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-        if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
-        fi
-    fi
-
-    mkdir -p "${output_dir}/img"
-    _build_fat_image "${boot_path}" "${output_dir}/img/boot-initos-unsigned.vfat"
-    rm -rf "${boot_path}"
-}
-
 build_boot_initos_signed() {
-    local artifact_dir="${1:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir]}"
-    local output_dir="${2:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir]}"
+    local artifact_dir="${1:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
+    local output_dir="${2:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
     local sec_dir="${3:-${SECRETS:-/var/run/secrets/uefi-keys}}"
+    local pub_key="${4:-}"
+    
+    local SECRETS="${sec_dir}"
+
+    if [ -z "${pub_key}" ]; then
+        echo "ERROR: INITOS_PUB_KEY is not present (required for build_boot_initos_signed)" >&2
+        exit 1
+    fi
+
     local boot_path=$(mktemp -d)
-    local esp_dir="${boot_path}"
+    
     echo "=== Building initos-signed boot ==="
 
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    local bzimage_src initrd_src initos_efi_src bootx64_limine_src limine_conf_src config_src
+    local bzimage_src initrd_src initos_efi_src
+
     bzimage_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/bzImage")
     initrd_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initrd.img")
     initos_efi_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/initos.EFI")
     [ -z "$initos_efi_src" ] && initos_efi_src=$(_resolve_path "$artifact_dir" "target/x86_64-unknown-uefi/release/efi.efi")
-    config_src=$(_resolve_path "$artifact_dir" "EFI/BOOT/config")
-    [ -z "$config_src" ] && config_src=$(_resolve_path "$artifact_dir" "config")
 
     _safe_cp "$bzimage_src" "${boot_path}/EFI/BOOT/bzImage"
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
-    _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
+    
+    local cmdline="${INITOS_CMDLINE:-console=tty1 loglevel=6 net.ifnames=0 panic=5} INITOS_PUB_KEY=${pub_key}"
+    printf '%s\n' "${cmdline}" > "${boot_path}/EFI/BOOT/config"
 
-    if [ -n "$config_src" ] && [ -f "$config_src" ]; then
-        _safe_cp "$config_src" "${esp_dir}/EFI/BOOT/config"
-    else
-        cat > "${esp_dir}/EFI/BOOT/config" <<EOF
-INITOS_INIT=/opt/initos/bin/initos-init-dev console=tty1 loglevel=6 net.ifnames=0 panic=5
-EOF
-    fi
+    local signed="${boot_path}/EFI/BOOT/BOOTX64.EFI"
 
-    local signed="${boot_path}/EFI/BOOT/BOOTX64.EFI.signed"
-    sbsign --key "${sec_dir}/db.key"            --cert "${sec_dir}/db.crt"            --output "${signed}"            "${boot_path}/EFI/BOOT/BOOTX64.EFI"
-    mv "${signed}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
-
-    local key_id=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout 2>/dev/null |         openssl rsa -pubin -outform DER 2>/dev/null |         openssl dgst -sha256 | sed 's/.*= //' | cut -c 1-16)
+    sbsign --key "${sec_dir}/db.key" \
+           --cert "${sec_dir}/db.crt" \
+           --output "${signed}" \
+           "${boot_path}/EFI/BOOT/initos.EFI"
+    
+    local key_id=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout 2>/dev/null | \
+            openssl rsa -pubin -outform DER 2>/dev/null |  \
+            openssl dgst -sha256 | \
+            sed 's/.*= //' | \
+            cut -c 1-16)
 
     echo "  Signing with db.key (KEY_ID: ${key_id})..."
 
-    openssl dgst -sha256 -sign "${sec_dir}/db.key"         -out "${esp_dir}/EFI/BOOT/${key_id}.sig"         "${esp_dir}/EFI/BOOT/config"
+    openssl dgst -sha256 -sign "${sec_dir}/db.key" \
+            -out "${boot_path}/EFI/BOOT/${key_id}.sig" \
+            "${boot_path}/EFI/BOOT/config"
 
-    openssl dgst -sha256 -sign "${sec_dir}/db.key"         -out "${esp_dir}/EFI/BOOT/${key_id}.kernel.sig"         "${esp_dir}/EFI/BOOT/bzImage"
+    openssl dgst -sha256 -sign "${sec_dir}/db.key" \
+            -out "${boot_path}/EFI/BOOT/${key_id}.kernel.sig"  \
+            "${boot_path}/EFI/BOOT/bzImage"
 
-    openssl dgst -sha256 -sign "${sec_dir}/db.key"         -out "${esp_dir}/EFI/BOOT/${key_id}.initrd.sig"         "${esp_dir}/EFI/BOOT/initrd.img"
+    openssl dgst -sha256 -sign "${sec_dir}/db.key" \
+            -out "${boot_path}/EFI/BOOT/${key_id}.initrd.sig" \
+            "${boot_path}/EFI/BOOT/initrd.img"
 
-    local keys_src=$(_resolve_path "$artifact_dir" "keys/PK.crt")
-    if [ -n "$keys_src" ] && [ "$(dirname "$(realpath "$keys_src" 2>/dev/null || echo "$keys_src")")" != "$(realpath "${boot_path}/keys" 2>/dev/null || echo "${boot_path}/keys")" ]; then
-        _copy_uefi_public_keys "$(dirname "$keys_src")" "${boot_path}/keys"
-    else
-        local base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-        if [ -d "${base_dir}/prebuilt/testdata/uefi-keys" ]; then
-            _copy_uefi_public_keys "${base_dir}/prebuilt/testdata/uefi-keys" "${boot_path}/keys"
-        fi
-    fi
+    _copy_uefi_public_keys "${boot_path}/keys" "${sec_dir}"
 
     mkdir -p "${output_dir}/img"
     _build_fat_image "${boot_path}" "${output_dir}/img/boot-initos-signed.vfat"
@@ -741,10 +570,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "  efi <sec_dir> <boot_dir>          Sign BOOTX64.EFI in a boot directory"
         echo "  artifacts <out_dir> [artifact_dir] Sign a Nix artifact tree"
         echo "  build_dmverity_boot               Build dm-verity boot config"
-        echo "  build_boot_limine_unsigned <artifact_dir> <output_dir>"
-        echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys]"
+        echo "  build_boot_limine_unsigned <artifact_dir> <output_dir> [keys]"
+        echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys] [pub_key]"
         echo "  build_boot_initos_unsigned <artifact_dir> <output_dir>"
-        echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys]"
+        echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys] [pub_key]"
         exit 0
     fi
     "$@"

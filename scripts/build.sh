@@ -192,60 +192,25 @@ build_bin() {
     chmod 755 "${ARTIFACTS}/bin/"*
 }
 
-# Copy public UEFI keys that users enroll into PK/KEK/DB.
-_copy_uefi_public_keys() {
-    local boot_path="${1:?Usage: _copy_uefi_public_keys <boot_path>}"
-    local keys_src="${src}/prebuilt/testdata/uefi-keys"
-    local keys_dst="${boot_path}/keys"
+# --- Boot functions are now in sidecar/bin/sign.sh ---
 
-    mkdir -p "${keys_dst}"
-    for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth; do
-        cp "${keys_src}/${f}" "${keys_dst}/"
-    done
-    echo "  UEFI public keys → ${keys_dst}/"
-}
+_read_image_pub_key() {
+    local keys="${1:?Usage: _read_image_pub_key <keys_dir>}"
+    local pub_key_file="${keys}/image_key.pub.b64"
 
-# Build a FAT32 filesystem image from a boot directory.
-# Uses mtools if available (no root needed), falls back to mkfs.vfat+loop mount.
-_build_fat_image() {
-    local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_file>}"
-    local img_file="${2:?Usage: _build_fat_image <boot_path> <img_file>}"
-
-    # Calculate size: dir contents + 20% overhead, min 34MB (FAT32 needs ≥65525 clusters)
-    local dir_size_kb img_size_mb
-    dir_size_kb=$(du -sk "${boot_path}" | cut -f1)
-    img_size_mb=$(( (dir_size_kb * 12 / 10 / 1024) + 1 ))
-    [ "${img_size_mb}" -lt 64 ] && img_size_mb=64
-
-    echo "  Building FAT image: ${img_file} (${img_size_mb}MB)"
-
-    mkdir -p "$(dirname "${img_file}")"
-    if command -v mformat >/dev/null 2>&1; then
-        dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
-        mformat -i "${img_file}" -F -v "INITOSBOOT" ::
-        (cd "${boot_path}" && mcopy -i "${img_file}" -s ./* ::)
-    elif command -v mkfs.vfat >/dev/null 2>&1; then
-        dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
-        mkfs.vfat -F 32 -n INITOSBOOT "${img_file}"
-        local mnt
-        mnt="$(mktemp -d)"
-        su -c "mount -o loop ${img_file} ${mnt}"
-        cp -a "${boot_path}/"* "${mnt}/"
-        su -c "umount ${mnt}"
-        rmdir "${mnt}"
-    else
-        echo "  WARNING: neither mtools nor dosfstools installed — skipping FAT image"
-        return 0
+    if [ ! -s "${pub_key_file}" ]; then
+        echo "ERROR: ${pub_key_file} is not present or empty (required for INITOS_PUB_KEY)" >&2
+        return 1
     fi
 
-    echo "  Created: ${img_file} ($(du -h "${img_file}" | cut -f1))"
+    tr -d '\r\n' < "${pub_key_file}"
 }
-
-# --- Boot functions are now in sidecar/bin/sign.sh ---
 
 # 4. Build a test env for qemu validation.
 build_qemu_test() {
     local keys="${src}/prebuilt/testdata/uefi-keys"
+    local pub_key
+    pub_key=$(_read_image_pub_key "${keys}")
 
     [ -f "${ARTIFACTS}/img/initos.erofs" ] || {
         echo "Missing ${ARTIFACTS}/img/initos.erofs; run build_initos first" >&2
@@ -253,9 +218,9 @@ build_qemu_test() {
     }
 
     # Build the three boot variants — sign.sh reads from artifacts/
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
+    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
 
     build_qemu_state
 }
@@ -458,12 +423,13 @@ if [[ $# -gt 0 ]]; then
     "$@"
 else
     keys="${src}/prebuilt/testdata/uefi-keys"
+    pub_key=$(_read_image_pub_key "${keys}")
     build_rust
     build_initos
     build_boot
     build_bin
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
+    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
     build_qemu_test
 fi

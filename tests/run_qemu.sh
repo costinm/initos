@@ -230,7 +230,12 @@ test_limine_signed() {
     
     # We want to re-run sign.sh build_boot_limine_signed with the correct INITOS_CMDLINE for testing console=hvc0
     local keys="${src}/prebuilt/testdata/uefi-keys"
-    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5"         "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}"
+    local pub_key=""
+    if [ -f "${keys}/image_key.pub.b64" ]; then
+        pub_key=$(cat "${keys}/image_key.pub.b64")
+    fi
+    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5" \
+        "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
 
     mcopy -i "${out}/disks/tmp/img/boot-limine-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
     mcopy -i "${out}/disks/tmp/img/boot-limine-signed.vfat" -s ::keys "${ESP_DIR}/" || true
