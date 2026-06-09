@@ -120,22 +120,6 @@
         rmdir $out/artifacts
       '';
 
-      # ── OCI cache image (used in GitHub Actions) ────────────────────────
-
-      oci-cache-image = pkgs.dockerTools.buildLayeredImage {
-        name = "ghcr.io/costinm/initos/nix-artifact-cache";
-        tag = self.shortRev or "dirty";
-        contents = [ initos-signer ];
-        config = {
-          Env = [ "PATH=/bin" ];
-          WorkingDir = "/";
-          Labels = {
-            "org.opencontainers.image.source" = "https://github.com/costinm/initos";
-            "org.opencontainers.image.description" = "Unsigned initos Nix artifact cache";
-          };
-        };
-      };
-
       usrBinEnv = pkgs.runCommand "usr-bin-env" {} ''
         mkdir -p $out/usr/bin
         ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
@@ -151,7 +135,7 @@
       docker-image = pkgs.dockerTools.buildImage {
         name = "initos-signer";
         tag = "latest";
-        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ];
+        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ] ++ signRuntimeDeps;
         config = {
           Entrypoint = [ "/bin/sign.sh" ];
           Env = [ "PATH=/bin" ];
@@ -162,7 +146,7 @@
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer oci-cache-image docker-image;
+        inherit initos efi initos-signer docker-image;
         default = initos-signer;
       };
     };

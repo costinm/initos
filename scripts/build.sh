@@ -419,7 +419,7 @@ nix_all() {
     # 
     # initos-artifacts / -with-kernels
     # vm-cloud-profile - pulls initos, kernel-cloud, crosvm, etc.
-    # docker-image / oci-cache-image
+    # docker-image
     
     nix build ./linux -o target/result-kernel-host
     nix build  -o target/result

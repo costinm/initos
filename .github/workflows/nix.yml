@@ -41,9 +41,6 @@ jobs:
       - name: Build initos signer
         run: nix build .#initos-signer -o result-signer
 
-      - name: Build OCI cache image
-        run: nix build .#oci-cache-image -o result-oci-cache-image
-
       - name: Restore kernel rolling release NAR cache
         continue-on-error: true
         run: |
@@ -71,7 +68,6 @@ jobs:
           nix-store --export "$STORE_PATH" > initos-signer.nar
           tar -C result-signer -czf initos-signer.tar.gz .
 
-          cp --remove-destination "$(readlink -f result-oci-cache-image)" oci-cache-image.tar.gz
           cp --remove-destination "$(readlink -f result-docker-image)" initos-signer-image.tar.gz
 
       - name: Upload workflow artifacts
@@ -102,13 +98,6 @@ jobs:
           docker tag initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
           docker push ghcr.io/${owner_lc}/initos-signer:latest
 
-          # Load and push nix-artifact-cache (oci-cache-image)
-          docker load -i oci-cache-image.tar.gz
-          loaded_cache=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep nix-artifact-cache | head -n 1)
-          if [ -n "$loaded_cache" ]; then
-            docker tag "$loaded_cache" ghcr.io/${owner_lc}/initos-artifacts-cache:latest
-            docker push ghcr.io/${owner_lc}/initos-artifacts-cache:latest
-          fi
 
       - name: Create Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -125,7 +114,6 @@ jobs:
             initos-kernel-host.nar
             initos-kernel-host.tar.gz
             initos-signer-image.tar.gz
-            oci-cache-image.tar.gz
           body: "Rolling Release containing initos-signer NAR, tarball, and container images."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
