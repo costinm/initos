@@ -12,17 +12,19 @@ set -x
 
 initos-init mount_sys
 initos-init init_ext4_data_dir # STATE mounted to /z
-initos-init mount_modules
+#initos-init mount_modules
 
 
 if [ -f ${TPM_DIR}/tpm_handle ]; then
-  initos-init load_drivers
+  #initos-init load_drivers
   initos-init unlock_c_tpm
 else
   # For machines without TPM, password required at boot.
   initos-init unlock_home
 fi
 # /z/c unlocked - encrypted dir.
+
+initos-init mount_modules
 
 # the rootfs is either an erofs image, with overlay under /z/c 
 # or a RW directory under /z/c - it is roughtly equivalent.

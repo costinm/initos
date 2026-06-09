@@ -3,6 +3,8 @@
 ## P0
 
 - [] cleanup 
+- [] mount modules/firmware from rust, verify
+    - P2: auto-mount
 - [] install script 
     - generate build system keys
     - sign

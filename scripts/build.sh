@@ -217,6 +217,8 @@ build_qemu_test() {
         return 1
     }
 
+    SECRETS="${keys}" "${src}/sidecar/bin/sign.sh" image "${ARTIFACTS}/img" "initos.erofs"
+
     # Build the three boot variants — sign.sh reads from artifacts/
     "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
     "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"

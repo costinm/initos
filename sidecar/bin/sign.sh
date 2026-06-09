@@ -53,6 +53,7 @@ sign_init() {
             -subj "/CN=pk.efi/" \
             -keyout PK.key -out PK.crt 
 
+        openssl x509 -in PK.crt -outform DER -out PK.cer
         ${cert_to_siglist} PK.crt PK.esl 
         sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth
         
@@ -60,12 +61,15 @@ sign_init() {
             -subj "/CN=kek.efi/" \
             -keyout KEK.key -out KEK.crt
 
+        openssl x509 -in KEK.crt -outform DER -out KEK.cer
         ${cert_to_siglist} KEK.crt KEK.esl
         sign-efi-sig-list -k PK.key -c PK.crt KEK KEK.esl KEK.auth
 
         openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
             -subj "/CN=db.efi/" \
             -keyout db.key -out db.crt    
+
+        openssl x509 -in db.crt -outform DER -out db.cer
         ${cert_to_siglist} db.crt db.esl
         sign-efi-sig-list -k KEK.key -c KEK.crt db db.esl db.auth
     )
@@ -373,9 +377,12 @@ _copy_uefi_public_keys() {
 
     echo "Installing UEFI public keys into ${dst_dir}..."
     mkdir -p "${dst_dir}"
-    for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
+    for f in PK.cer PK.crt PK.esl PK.auth KEK.cer KEK.crt KEK.auth KEK.esl db.cer db.esl db.crt db.auth image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
         if [ -f "${SECRETS}/${f}" ]; then
             cp "${SECRETS}/${f}" "${dst_dir}/"
+        else
+             echo "Missing key ${SECRETS}/${f}"
+             exit 1
         fi
     done
 }
@@ -517,7 +524,7 @@ build_boot_initos_signed() {
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
     
-    local cmdline="${INITOS_CMDLINE:-console=tty1 loglevel=6 net.ifnames=0 panic=5} INITOS_PUB_KEY=${pub_key}"
+    local cmdline="${INITOS_CMDLINE:-console=tty1 INITOS_INIT=/opt/initos/bin/initos-init-dev loglevel=6 net.ifnames=0 panic=5} INITOS_PUB_KEY=${pub_key}"
     printf '%s\n' "${cmdline}" > "${boot_path}/EFI/BOOT/config"
 
     local signed="${boot_path}/EFI/BOOT/BOOTX64.EFI"

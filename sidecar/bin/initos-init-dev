@@ -29,7 +29,7 @@ if [ -n "${INITOS_INITRD}" ]; then
 fi
 
 echo
-echo "Press 'd' to enter debug shell in 3 seconds"
+echo "Press d to enter debug shell in 3 seconds"
 echo
 read -n 1 -t 3 debugkey
 
@@ -39,7 +39,7 @@ initos-init init_ext4_data_dir
 
 echo "- mounting modules/firmware"
 # From STATE, mount firmware and modules
-initos-init mount_modules
+# initos-init mount_modules
 
 if [ ! -d /z/c ] ; then
   echo "Encrypted STATE disk doesn't exist - initializing it"
@@ -73,6 +73,8 @@ else
   # 
   initos-init unlock_home
 fi
+
+initos-init mount_modules
 
 
 if [ "${debugkey}" = "d" ]; then

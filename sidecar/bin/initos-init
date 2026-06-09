@@ -271,7 +271,7 @@ unlock_c_tpm() {
 init_rootfs() {
     local name=${INITOS_ROOT:-ROOTA}
 
-    modprobe squashfs
+    #modprobe squashfs
 
     if [ -e /z/c/roots/${name} ] ; then
       mount -o bind /z/c/roots/${name} /sysroot
@@ -288,6 +288,8 @@ init_rootfs() {
 
     move_mounted_to_sysroot
     mkdir -p mnt/initos
+    
+    
     pivot_root . mnt/initos
     cd /
 
@@ -411,6 +413,7 @@ poweroff() {
     echo o > /proc/sysrq-trigger 2>/dev/null
 }
 
+export TPM_DIR=/z/initos/tpm
 
 #### Entry point
 
@@ -418,9 +421,15 @@ if [ "$$" = "1" ] && [ $# -eq 0 ]; then
   mount_sys
   init_ext4_data_dir
 
-  mount_modules
+  if [ -f ${TPM_DIR}/tpm_handle ]; then
+    #initos-init load_drivers
+    unlock_c_tpm
+  else
+    # For machines without TPM, password required at boot.
+    unlock_home
+  fi
 
-  unlock_home
+  #mount_modules
 
   init_rootfs
 

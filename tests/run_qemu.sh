@@ -61,6 +61,9 @@ stage_nix_artifacts() {
     mkdir -p "${ESP_DIR}" "${out}/disks/state/img" "${out}/test"
 
     cp "${rootfs_img}" "${out}/disks/state/img/initos.erofs"
+    for f in "${nix_result}"/img/*.sig; do
+        [ -f "$f" ] && cp "$f" "${out}/disks/state/img/"
+    done
 
     echo "=== Staging Nix boot images ==="
     for variant in boot-limine-unsigned boot-initos-signed boot-limine-signed; do
@@ -230,10 +233,8 @@ test_limine_signed() {
     
     # We want to re-run sign.sh build_boot_limine_signed with the correct INITOS_CMDLINE for testing console=hvc0
     local keys="${src}/prebuilt/testdata/uefi-keys"
-    local pub_key=""
-    if [ -f "${keys}/image_key.pub.b64" ]; then
-        pub_key=$(cat "${keys}/image_key.pub.b64")
-    fi
+    local pub_key
+    pub_key=$(tr -d '\r\n' < "${keys}/image_key.pub.b64")
     INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5" \
         "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
 
@@ -245,7 +246,9 @@ test_limine_signed() {
 
     echo "=== Analyzing Signed Limine Boot ==="
     
-    if grep -q "Run .* as init process" "${log_file}" && grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+    if grep -q "Run .* as init process" "${log_file}" && \
+        grep -q "initos: image signature verified OK" "${log_file}" && \
+        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
         echo "✅ SUCCESS: Signed Limine booted and completed all tests!"
     else
         echo "❌ FAILURE: Signed Limine boot failed or did not complete tests."
@@ -257,25 +260,28 @@ test_initos_signed() {
     echo "=== Running Signed InitOS Custom Loader Boot Test ==="
     rm -rf "${ESP_DIR}"
     mkdir -p "${ESP_DIR}"
-    
-    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
-    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
-    # Write config
-    cat > "${ESP_DIR}/EFI/BOOT/config" <<EOF
-rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5
-EOF
-
-    # Re-sign config since we modified it
     local keys="${src}/prebuilt/testdata/uefi-keys"
-    "${src}/sidecar/bin/sign.sh" efi "${keys}" "${ESP_DIR}/"
+    local pub_key
+    pub_key=$(tr -d '\r\n' < "${keys}/image_key.pub.b64")
+
+    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5" \
+        "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
+
+    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
     local log_file="${out}/qemu_efi_initos_signed.log"
     LOG_FILE="${log_file}" run 30
 
     echo "=== Analyzing Signed InitOS Boot ==="
 
-    if grep -q "console=hvc0" "${log_file}" &&        (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") &&        (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") &&        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+    if grep -q "console=hvc0" "${log_file}" && \
+        grep -q "INITOS_PUB_KEY=${pub_key}" "${log_file}" && \
+        (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") && \
+        (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") && \
+        grep -q "initos: image signature verified OK" "${log_file}" && \
+        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
         echo "✅ SUCCESS: Signed InitOS booted, verified signatures, and completed all tests!"
     else
         echo "❌ FAILURE: Signed InitOS boot verification failed."
