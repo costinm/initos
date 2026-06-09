@@ -135,7 +135,7 @@
       docker-image = pkgs.dockerTools.buildLayeredImage {
         name = "initos-signer";
         tag = "latest";
-        copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ] ++ signRuntimeDeps;
+        contents = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ] ++ signRuntimeDeps;
         config = {
           Entrypoint = [ "/bin/sign.sh" ];
           Env = [ "PATH=/bin" ];
