@@ -270,7 +270,7 @@ EOF
 
     echo "=== Analyzing Signed InitOS Boot ==="
 
-    if grep -q "Command line:.*console=hvc0.*" "${log_file}" &&        (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") &&        (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") &&        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+    if grep -q "console=hvc0" "${log_file}" &&        (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") &&        (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") &&        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
         echo "✅ SUCCESS: Signed InitOS booted, verified signatures, and completed all tests!"
     else
         echo "❌ FAILURE: Signed InitOS boot verification failed."

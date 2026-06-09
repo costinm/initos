@@ -91,66 +91,71 @@ build_rust() {
 
 # 2. Build the read-only rootfs erofs image.
 # Outputs: artifacts/img/initos.erofs
-build_initos() {
+# Populate a staging directory with the initos layout (busybox, sidecar scripts, initos binary).
+_populate_staging() {
+    local staging_dir="${1:?Usage: _populate_staging <staging_dir>}"
     local initos_bin
     initos_bin=$(_resolve_initos_bin)
     local busybox
     busybox=$(_resolve_busybox)
 
+    # Base rootfs and busybox in /opt/busybox
+    if [ ! -f "${staging_dir}/opt/busybox/bin/busybox" ]; then
+        mkdir -p "${staging_dir}"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,opt/initos/bin,opt/busybox/bin,usr/bin,usr/sbin,usr/lib,usr/lib64}
+        mkdir -p "${staging_dir}"/usr/lib/modules "${staging_dir}"/usr/lib/firmware
+
+        cp "${busybox}" "${staging_dir}/opt/busybox/bin/busybox"
+        chmod 755 "${staging_dir}/opt/busybox/bin/busybox"
+
+        (
+            cd "${staging_dir}"
+            ln -sf /usr/bin bin
+            ln -sf /usr/sbin sbin
+            ln -sf /usr/lib lib
+            ln -sf /usr/lib64 lib64
+        )
+        (
+            cd "${staging_dir}/opt/busybox/bin"
+            for applet in $(./busybox --list); do
+                ln -sf /opt/busybox/bin/busybox "$applet"
+            done
+        )
+    fi
+
+    cp "${src}"/sidecar/bin/* "${staging_dir}"/opt/initos/bin/
+    chmod 755 "${staging_dir}"/opt/initos/bin/*
+
+    # Include unified initos binary
+    cp "${initos_bin}" "${staging_dir}/opt/initos/bin/initos"
+    chmod 755 "${staging_dir}/opt/initos/bin/initos"
+}
+
+# 2. Build the read-only rootfs erofs image.
+# Outputs: artifacts/img/initos.erofs
+build_initos() {
     STAGING=${out}/staging/initos
     mkdir -p "${ARTIFACTS}/img"
 
-    # Base rootfs and busybox in /opt/busybox
-    if [ ! -f ${STAGING}/opt/busybox/bin/busybox ]; then
-		mkdir -p "${STAGING}"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,opt/initos/bin,opt/busybox/bin,usr/bin,usr/sbin,usr/lib,usr/lib64}
-		mkdir -p "${STAGING}"/usr/lib/modules "${STAGING}"/usr/lib/firmware
-
-		cp "${busybox}" "${STAGING}/opt/busybox/bin/busybox"
-		chmod 755 "${STAGING}/opt/busybox/bin/busybox"
-		
-		(
-            cd ${STAGING}
-            ln -s /usr/bin bin
-            ln -s /usr/sbin sbin
-            ln -s /usr/lib lib
-            ln -s /usr/lib64 lib64
-    		cd -
-		)
-		(
-            cd ${STAGING}/opt/busybox/bin 
-            for applet in $(${STAGING}/opt/busybox/bin/busybox --list); do
-                ln -s /opt/busybox/bin/busybox "$applet"
-            done
-    		cd -
-		)
-	fi
-
-	cp "${src}"/sidecar/bin/* "${STAGING}"/opt/initos/bin/
-    chmod 755 "${STAGING}"/opt/initos/bin/*
-
-	# Include unified initos binary
-	cp "${initos_bin}" "${STAGING}/opt/initos/bin/initos"
-	chmod 755 "${STAGING}/opt/initos/bin/initos"
+    _populate_staging "${STAGING}"
 
     mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "${ARTIFACTS}/img/initos.erofs" "${STAGING}"
 
     echo "  Created: ${ARTIFACTS}/img/initos.erofs ($(du -h "${ARTIFACTS}/img/initos.erofs" | cut -f1))"
 }
 
-# 3. initrd.img - using initos binary and cpio
+# 3. initrd.img - using initos layout and cpio
 # Output: artifacts/boot/EFI/BOOT/initrd.img
 build_initrd() {
-    local initos_bin
-    initos_bin=$(_resolve_initos_bin)
-
     local boot_path="${ARTIFACTS}/boot"
     mkdir -p "${boot_path}/EFI/BOOT"
 
     STAGING=${out}/staging/initrd
-    mkdir -p $STAGING
+    # Always clean and rebuild staging for initrd to avoid stale files
+    rm -rf "${STAGING}"
+    _populate_staging "${STAGING}"
 
-	cp "${initos_bin}" "${STAGING}/init"
-	chmod 755 "${STAGING}/init"
+    # Link /opt/initos/bin/initos to /init in initrd
+    ln -sf /opt/initos/bin/initos "${STAGING}/init"
 
     (cd "${STAGING}" && find . | \
       sort | cpio --quiet --renumber-inodes -o -H newc | gzip \

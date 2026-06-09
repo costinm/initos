@@ -253,52 +253,76 @@ fn cmd_seal(secret: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// loop-mount, switch_root.
 fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
     let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    let img = env::var("INITOS_IMG").unwrap_or_else(|_| "/img/initos.erofs".to_string());
-    let data = env::var("INITOS_DATA").unwrap_or_else(|_| "STATE".to_string());
-    let init = env::var("INITOS_INIT")
-        .unwrap_or_else(|_| "/opt/initos/bin/initos-init-ver".to_string());
-    eprintln!(
-        "initos: boot mode (PID {}) img={} data={} init={}",
-        process::id(),
-        img,
-        data,
-        init
-    );
+    let is_dev_mode = pub_key.is_empty();
 
-    // 1. Mount pseudo-filesystems
-    for (fs, mp) in [("proc", "/proc"), ("sysfs", "/sys"), ("devtmpfs", "/dev")] {
-        eprintln!("initos: mounting {}", fs);
-        match initos::mount::mount_pseudo_fs(fs, mp) {
-            Ok(_) => {}
-            // May happen in debug mode if already mounted
-            Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
-        };
+    let boot_run = || -> Result<(), Box<dyn std::error::Error>> {
+        let img = env::var("INITOS_IMG").unwrap_or_else(|_| "/img/initos.erofs".to_string());
+        let data = env::var("INITOS_DATA").unwrap_or_else(|_| "STATE".to_string());
+        let init = env::var("INITOS_INIT")
+            .unwrap_or_else(|_| "/opt/initos/bin/initos-init-ver".to_string());
+        eprintln!(
+            "initos: boot mode (PID {}) img={} data={} init={}",
+            process::id(),
+            img,
+            data,
+            init
+        );
+
+        // 1. Mount pseudo-filesystems
+        for (fs, mp) in [("proc", "/proc"), ("sysfs", "/sys"), ("devtmpfs", "/dev")] {
+            eprintln!("initos: mounting {}", fs);
+            match initos::mount::mount_pseudo_fs(fs, mp) {
+                Ok(_) => {}
+                // May happen in debug mode if already mounted
+                Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
+            };
+        }
+
+        // 2. Find and mount STATE device
+        eprintln!("initos: looking for data device '{}'", data);
+        let dev = initos::mount::find_partition_by_label(&data)?;
+        eprintln!("initos: found data device: {:?}", dev);
+
+        let mount_point = "/mnt/data";
+        initos::mount::mount_filesystem(dev.to_str().unwrap(), mount_point, "ext4", false)?;
+
+        // 3. Verify image
+        let img_path = format!("{}/{}", mount_point, img.trim_start_matches('/'));
+        verify_image_if_key(&img_path, &pub_key)?;
+
+        // 4. Loop-mount
+        let root_mount = "/mnt/root";
+        eprintln!("initos: mounting image at {}", root_mount);
+        initos::mount::mount_loop(&img_path, root_mount)?;
+
+        let state_mount = format!("{}/z", root_mount);
+        eprintln!("initos: binding {} to {}", mount_point, state_mount);
+        initos::mount::bind_mount(mount_point, &state_mount)?;
+
+        // 5. Switch root
+        eprintln!("initos: switching root to {} init={}", root_mount, init);
+        initos::mount::switch_root(root_mount, &init)?;
+        Ok(())
+    };
+
+    if let Err(e) = boot_run() {
+        eprintln!("initos: boot failed: {}", e);
+        if is_dev_mode {
+            let dev_init_path = "/opt/initos/bin/initos-init-dev";
+            eprintln!("initos: executing dev init fallback: {}", dev_init_path);
+            let init_c = std::ffi::CString::new(dev_init_path).unwrap();
+            let argv = [init_c.as_ptr(), std::ptr::null()];
+            unsafe { libc::execv(init_c.as_ptr(), argv.as_ptr()) };
+
+            eprintln!("initos: failed to exec dev init fallback: {}", std::io::Error::last_os_error());
+            process::exit(1);
+        } else {
+            eprintln!("initos: waiting 10 seconds before exit");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            process::exit(1);
+        }
     }
 
-    // 2. Find and mount STATE device
-    eprintln!("initos: looking for data device '{}'", data);
-    let dev = initos::mount::find_partition_by_label(&data)?;
-    eprintln!("initos: found data device: {:?}", dev);
-
-    let mount_point = "/mnt/data";
-    initos::mount::mount_filesystem(dev.to_str().unwrap(), mount_point, "ext4", false)?;
-
-    // 3. Verify image
-    let img_path = format!("{}/{}", mount_point, img.trim_start_matches('/'));
-    verify_image_if_key(&img_path, &pub_key)?;
-
-    // 4. Loop-mount
-    let root_mount = "/mnt/root";
-    eprintln!("initos: mounting image at {}", root_mount);
-    initos::mount::mount_loop(&img_path, root_mount)?;
-
-    let state_mount = format!("{}/z", root_mount);
-    eprintln!("initos: binding {} to {}", mount_point, state_mount);
-    initos::mount::bind_mount(mount_point, &state_mount)?;
-
-    // 5. Switch root
-    eprintln!("initos: switching root to {} init={}", root_mount, init);
-    initos::mount::switch_root(root_mount, &init)?;
     Ok(())
 }
 
