@@ -132,7 +132,7 @@
 
       # ── Docker Image (runs signer) ──────────────────────────────────────
 
-      docker-image = pkgs.dockerTools.buildImage {
+      docker-image = pkgs.dockerTools.buildLayeredImage {
         name = "initos-signer";
         tag = "latest";
         copyToRoot = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ] ++ signRuntimeDeps;

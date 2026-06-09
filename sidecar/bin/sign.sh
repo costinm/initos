@@ -78,7 +78,7 @@ sign_init() {
     openssl ec -in ${SECRETS}/root.key -pubout -out \
         ${SECRETS}/root.pem
     
-    ssh-keygen -y -f ${SECRETS}/root.key > ${SECRETS}/authorized_keys
+    #ssh-keygen -y -f ${SECRETS}/root.key > ${SECRETS}/authorized_keys
 
     # SSL and SSH key is the real public - minisign is using the sha.
 
@@ -88,7 +88,7 @@ sign_init() {
     echo $PUB
     #cat ${SECRETS}/minisign.pub
 
-    cat ${SECRETS}/authorized_keys
+    #cat ${SECRETS}/authorized_keys
 
     echo "Generating Ed25519 keypair..."
     openssl genpkey -algorithm ed25519 -out "${SECRETS}/image_key.pem" 2>/dev/null
@@ -487,7 +487,7 @@ _copy_uefi_public_keys() {
 
     echo "Installing UEFI public keys into ${dst_dir}..."
     mkdir -p "${dst_dir}"
-    for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth authorized_keys image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
+    for f in PK.crt PK.esl PK.auth KEK.crt KEK.esl KEK.auth db.crt db.esl db.auth image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
         if [ -f "${src_dir}/${f}" ]; then
             cp "${src_dir}/${f}" "${dst_dir}/"
         fi
