@@ -5,12 +5,82 @@ export PATH=/opt/initos/bin:/opt/busybox/bin:/z/a/initos/bin:/bin:/sbin:/usr/bin
 export initos_dbg=1
 set -x
 
+TPM_TEST_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+TPM_UNLOCK_FILE=/z/c/qemu-tpm-unlock.txt
+TPM_UNLOCK_TEXT="tpm-initrd-unlock-ok"
+
+run_tpm_setup() {
+    echo "=== INITRD TPM UNLOCK SETUP ==="
+    mkdir -p /z/initos/tpm /z/c
+
+    initos primary
+    echo "primary exit=$?"
+    cat /z/initos/tpm/tpm_primary
+
+    initos seal "${TPM_TEST_KEY}"
+    echo "seal exit=$?"
+    cat /z/initos/tpm/tpm_handle
+
+    FSCRYPT_KEY="${TPM_TEST_KEY}" initos fscrypt-setup /z/c
+    echo "fscrypt-setup (/z/c tpm) exit=$?"
+
+    echo "${TPM_UNLOCK_TEXT}" > "${TPM_UNLOCK_FILE}"
+    sync
+
+    if [ "$(cat "${TPM_UNLOCK_FILE}" 2>/dev/null)" = "${TPM_UNLOCK_TEXT}" ]; then
+        echo "=== INITRD TPM UNLOCK SETUP OK ==="
+    else
+        echo "=== INITRD TPM UNLOCK SETUP FAIL ==="
+    fi
+
+    sleep 2
+    reboot -f
+}
+
+verify_tpm_initrd_unlock() {
+    echo "=== INITRD TPM UNLOCK VERIFY ==="
+    TDATA=$(cat "${TPM_UNLOCK_FILE}" 2>&1)
+    echo "INITRD TPM UNLOCK READ: [${TDATA}]"
+
+    if [ "${TDATA}" = "${TPM_UNLOCK_TEXT}" ]; then
+        echo "=== INITRD TPM UNLOCK OK ==="
+    else
+        echo "=== INITRD TPM UNLOCK FAIL ==="
+        ls -la /z/c 2>&1 || true
+    fi
+}
+
+verify_mount_fixtures() {
+    echo "=== INITRD MODULES/FIRMWARE MOUNT VERIFY ==="
+
+    FDATA=$(cat /mnt/firmware/test/fixture.txt 2>&1)
+    echo "FIRMWARE FIXTURE READ: [${FDATA}]"
+    if [ "${FDATA}" = "initos qemu firmware fixture" ]; then
+        echo "=== INITRD FIRMWARE MOUNT OK ==="
+    else
+        echo "=== INITRD FIRMWARE MOUNT FAIL ==="
+    fi
+
+    MDATA=$(cat /mnt/modules/kernel/fixture.txt 2>&1)
+    echo "MODULES FIXTURE READ: [${MDATA}]"
+    if [ "${MDATA}" = "initos qemu modules fixture for $(uname -r)" ]; then
+        echo "=== INITRD MODULES MOUNT OK ==="
+    else
+        echo "=== INITRD MODULES MOUNT FAIL ==="
+    fi
+}
+
 run_tests() {
     echo "===== Hello World from initos! ====="
     echo "Kernel: $(uname -r)"
     echo "Init PID: $$"
     env
     set -x
+
+    if [ "${INITOS_QEMU_PHASE:-basic}" = "verify" ]; then
+        verify_tpm_initrd_unlock
+        verify_mount_fixtures
+    fi
 
     echo "=== TPM2 TEST ==="
 
@@ -21,7 +91,7 @@ run_tests() {
     cat /z/initos/tpm/tpm_primary
 
     export INITOS_PUB_KEY="GOmR9GEy3xbI/4ybZDnv9coSOuD4kMkEkQcGGsbfkus="
-    initos seal "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    initos seal "${TPM_TEST_KEY}"
     echo "seal exit=$?"
     cat /z/initos/tpm/tpm_handle
 
@@ -49,7 +119,7 @@ run_tests() {
     FSCRYPT_DIR2=/z/tmp/test_tpm_encrypted
     mkdir -p "${FSCRYPT_DIR2}"
 
-    FSCRYPT_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" initos fscrypt-setup "${FSCRYPT_DIR2}"
+    FSCRYPT_KEY="${TPM_TEST_KEY}" initos fscrypt-setup "${FSCRYPT_DIR2}"
     echo "fscrypt-setup (tpm) exit=$?"
 
     echo "tpm-secret-data" > "${FSCRYPT_DIR2}/test.txt"
@@ -85,6 +155,12 @@ run_tests() {
 }
 
 initos-init mount_sys
+
+case "${INITOS_QEMU_PHASE:-basic}" in
+    setup)
+        run_tpm_setup
+        ;;
+esac
 
 if ! touch /z/.initos-qemu-state-check 2>/dev/null; then
     echo "ERROR: /z is not writable; STATE was not bind-mounted before switch_root"

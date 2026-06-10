@@ -99,8 +99,9 @@ mount_sys() {
     # Only on RO rootfs.
     # mount -t tmpfs tmpfs ${b}/tmp
 
-    # Mount points even on RO rootfs.
-    mount -t tmpfs tmpfs ${b}/mnt
+    # Mount points even on RO rootfs. Keep an existing /mnt mount because PID 1
+    # may have placed preserved initrd mounts there before switch_root.
+    mountpoint -q ${b}/mnt || mount -t tmpfs tmpfs ${b}/mnt
     mount -t tmpfs tmpfs ${b}/tmp
 
     chmod 1777 ${b}/dev/shm

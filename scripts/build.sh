@@ -218,6 +218,7 @@ build_qemu_test() {
     }
 
     SECRETS="${keys}" "${src}/sidecar/bin/sign.sh" image "${ARTIFACTS}/img" "initos.erofs"
+    build_qemu_mount_fixtures "${keys}"
 
     # Build the three boot variants — sign.sh reads from artifacts/
     "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
@@ -225,6 +226,31 @@ build_qemu_test() {
     "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
 
     build_qemu_state
+}
+
+build_qemu_mount_fixtures() {
+    local keys="${1:?Usage: build_qemu_mount_fixtures <keys-dir>}"
+    local fixture_root="${out}/staging/qemu-mount-fixtures"
+    local kernel_release="${INITOS_QEMU_KERNEL_RELEASE:-6.18.34}"
+
+    mkdir -p "${ARTIFACTS}/img"
+    rm -rf "${fixture_root}"
+
+    mkdir -p "${fixture_root}/firmware/test"
+    printf 'initos qemu firmware fixture\n' > "${fixture_root}/firmware/test/fixture.txt"
+    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 \
+        "${ARTIFACTS}/img/firmware.erofs" \
+        "${fixture_root}/firmware"
+    SECRETS="${keys}" "${src}/sidecar/bin/sign.sh" image "${ARTIFACTS}/img" "firmware.erofs"
+
+    mkdir -p "${fixture_root}/modules/kernel"
+    printf 'initos qemu modules fixture for %s\n' "${kernel_release}" \
+        > "${fixture_root}/modules/kernel/fixture.txt"
+    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 \
+        "${ARTIFACTS}/img/modules-${kernel_release}.erofs" \
+        "${fixture_root}/modules"
+    SECRETS="${keys}" "${src}/sidecar/bin/sign.sh" image \
+        "${ARTIFACTS}/img" "modules-${kernel_release}.erofs"
 }
 
 # 4.1 Pack a STATE rootfs containing all image artifacts.

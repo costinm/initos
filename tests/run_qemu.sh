@@ -82,7 +82,7 @@ stage_nix_artifacts() {
 
 nix() {
     stage_nix_artifacts "${1:-${NIX_RESULT:-result}}"
-    test
+    RESET_QEMU_STATE_FROM_ARTIFACTS=0 test
 }
 
 build_qemu_state() {
@@ -145,10 +145,14 @@ run() {
     OVMF_VARS="$(dirname "${OVMF}")/OVMF_VARS.fd"
     QEMU_ARGS+=(-drive "if=pflash,format=raw,file=${OVMF_VARS}")
 
-    TPM_DIR="${out}/tmp/mytpm1"
-    rm -rf "${TPM_DIR}"
+    TPM_DIR="${QEMU_TPM_DIR:-${out}/tmp/mytpm1}"
+    if [[ "${RESET_TPM:-1}" != 0 ]]; then
+        rm -rf "${TPM_DIR}"
+    fi
     mkdir -p "${TPM_DIR}"
+    rm -f "${TPM_DIR}/swtpm-sock"
     swtpm socket --tpmstate dir="${TPM_DIR}" --ctrl type=unixio,path="${TPM_DIR}/swtpm-sock" --tpm2 &
+    local swtpm_pid=$!
     tpm="-chardev socket,id=chrtpm,path=${TPM_DIR}/swtpm-sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0"
     QEMU_ARGS+=(${tpm})
 
@@ -188,6 +192,8 @@ run() {
         set +e
         timeout --foreground "${timeout_s}s" qemu-system-x86_64 "${QEMU_ARGS[@]}"             -chardev "file,mux=on,id=char0,path=${log_file}"             -serial chardev:char0             -device virtconsole,chardev=char0             -no-reboot
    		rc=$?
+        kill "${swtpm_pid}" 2>/dev/null || true
+        wait "${swtpm_pid}" 2>/dev/null || true
         set -e
 		if [[ $rc -eq 124 ]]; then
 			echo ""
@@ -230,6 +236,7 @@ test_limine_signed() {
     echo "=== Running Signed Limine Direct Boot Test ==="
     rm -rf "${ESP_DIR}"
     mkdir -p "${ESP_DIR}"
+    local signed_timeout_s="${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
     
     # We want to re-run sign.sh build_boot_limine_signed with the correct INITOS_CMDLINE for testing console=hvc0
     local keys="${src}/prebuilt/testdata/uefi-keys"
@@ -242,7 +249,7 @@ test_limine_signed() {
     mcopy -i "${out}/disks/tmp/img/boot-limine-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
     local log_file="${out}/qemu_efi_limine_signed.log"
-    LOG_FILE="${log_file}" run 30
+    LOG_FILE="${log_file}" run "${signed_timeout_s}"
 
     echo "=== Analyzing Signed Limine Boot ==="
     
@@ -264,15 +271,38 @@ test_initos_signed() {
     local keys="${src}/prebuilt/testdata/uefi-keys"
     local pub_key
     pub_key=$(tr -d '\r\n' < "${keys}/image_key.pub.b64")
+    local tpm_dir="${out}/tmp/initos-signed-tpm"
+    local signed_timeout_s="${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
+    rm -rf "${tpm_dir}"
 
-    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5" \
+    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} INITOS_QEMU_PHASE=setup rw iommu=relaxed net.ifnames=0 panic=5" \
+        "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
+
+    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
+
+    local setup_log_file="${out}/qemu_efi_initos_signed_setup.log"
+    QEMU_TPM_DIR="${tpm_dir}" RESET_TPM=1 LOG_FILE="${setup_log_file}" run "${signed_timeout_s}"
+
+    echo "=== Analyzing Signed InitOS TPM Setup Boot ==="
+    if grep -q "=== INITRD TPM UNLOCK SETUP OK ===" "${setup_log_file}"; then
+        echo "✅ SUCCESS: Signed InitOS setup boot created TPM-backed /z/c state!"
+    else
+        echo "❌ FAILURE: Signed InitOS setup boot did not create TPM-backed /z/c state."
+        exit 1
+    fi
+
+    rm -rf "${ESP_DIR}"
+    mkdir -p "${ESP_DIR}"
+
+    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} INITOS_QEMU_PHASE=verify rw iommu=relaxed net.ifnames=0 panic=5" \
         "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
 
     mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
     mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
     local log_file="${out}/qemu_efi_initos_signed.log"
-    LOG_FILE="${log_file}" run 30
+    QEMU_TPM_DIR="${tpm_dir}" RESET_TPM=0 LOG_FILE="${log_file}" run "${signed_timeout_s}"
 
     echo "=== Analyzing Signed InitOS Boot ==="
 
@@ -281,14 +311,25 @@ test_initos_signed() {
         (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") && \
         (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") && \
         grep -q "initos: image signature verified OK" "${log_file}" && \
+        grep -q "initos: unlocked /z/c using TPM" "${log_file}" && \
+        grep -q "initos: verifying image /z/img/firmware.erofs" "${log_file}" && \
+        grep -q "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
+        grep -q "initos: mounting /z/img/firmware.erofs at /sysroot/mnt/firmware" "${log_file}" && \
+        grep -q "initos: mounting /z/img/modules-.*\\.erofs at /sysroot/mnt/modules" "${log_file}" && \
+        grep -q "=== INITRD TPM UNLOCK OK ===" "${log_file}" && \
+        grep -q "=== INITRD FIRMWARE MOUNT OK ===" "${log_file}" && \
+        grep -q "=== INITRD MODULES MOUNT OK ===" "${log_file}" && \
         grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
-        echo "✅ SUCCESS: Signed InitOS booted, verified signatures, and completed all tests!"
+        echo "✅ SUCCESS: Signed InitOS booted, unlocked /z/c in initrd, verified module/firmware mounts, and completed all tests!"
     else
         echo "❌ FAILURE: Signed InitOS boot verification failed."
         exit 1
     fi
 }
 test() {
+    if [[ "${RESET_QEMU_STATE_FROM_ARTIFACTS:-1}" != 0 ]]; then
+        "${src}/scripts/build.sh" build_qemu_state
+    fi
     require_artifacts
     test_unsigned_negative
     test_limine_signed

@@ -24,7 +24,7 @@ else
 fi
 # /z/c unlocked - encrypted dir.
 
-initos-init mount_modules
+#initos-init mount_modules
 
 # the rootfs is either an erofs image, with overlay under /z/c 
 # or a RW directory under /z/c - it is roughtly equivalent.
