@@ -1,0 +1,22 @@
+#!/opt/busybox/bin/sh
+
+# Initrd fallback/recovery/install path.
+#
+# the initrd will switch_root instead of pivot_root.
+set -x
+export PATH=/opt/initos/bin:/opt/busybox/bin:/bin:/sbin:/usr/bin:/usr/sbin
+
+echo "Starting initrd fallback script"
+if [ -n "${INITOS_BOOT_ERROR}" ]; then
+  echo "Boot fallback reason: ${INITOS_BOOT_ERROR}"
+fi
+
+initos-init mount_sys
+
+echo "Recovery shell: when done, it will switch root to /sysroot"
+sh 
+
+# Find and switch_root to the real rootfs, using files from the encrypted dir
+# and/or (verity) images.
+exec initos-init init_rootfs_switch
+

@@ -13,8 +13,6 @@ use std::path::Path;
 use base64::Engine;
 use x509_cert::der::{Decode, Encode};
 
-
-
 /// EFI global variable GUID.
 const EFI_GLOBAL_GUID: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 
@@ -23,8 +21,7 @@ const EFI_IMAGE_SECURITY_DB_GUID: &str = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
 
 /// EFI_CERT_X509_GUID: {a5c059a1-94e4-4aa7-87b5-ab155c2bf072}
 const EFI_CERT_X509_GUID: [u8; 16] = [
-    0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a, 0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0,
-    0x72,
+    0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a, 0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
 ];
 
 /// An X.509 certificate extracted from an EFI Signature List.
@@ -303,7 +300,10 @@ pub fn read_efi_info(base_path: &str) -> io::Result<String> {
     match read_db(base_path) {
         Ok(certs) => {
             for (i, cert) in certs.iter().enumerate() {
-                out.push_str(&format!("db[{}]: {} CN={}\n", i, cert.public_key_b64, cert.cn));
+                out.push_str(&format!(
+                    "db[{}]: {} CN={}\n",
+                    i, cert.public_key_b64, cert.cn
+                ));
                 if !cert.sans.is_empty() {
                     out.push_str(&format!("db[{}] SAN: {}\n", i, cert.sans.join(", ")));
                 }

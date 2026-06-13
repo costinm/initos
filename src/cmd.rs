@@ -286,9 +286,13 @@ pub fn print_help() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  (no args)                     As PID 1: full boot sequence. Otherwise: unseal.");
-    eprintln!("  boot                          Full initrd boot sequence (mount, verify, switch_root)");
+    eprintln!(
+        "  boot                          Full initrd boot sequence (mount, verify, switch_root)"
+    );
     eprintln!("  mount <IMG> <DIR>             Verify and loop-mount an erofs image");
-    eprintln!("  verify <IMG>                  Verify fsverity digest + .sig signature of an image");
+    eprintln!(
+        "  verify <IMG>                  Verify fsverity digest + .sig signature of an image"
+    );
     eprintln!("  efi                           Read EFI variables (SecureBoot, BootCurrent, db)");
     eprintln!("  unseal                        Unseal TPM2 key via PCR SHA256:7 policy");
     eprintln!("  seal <SECRET>                 Seal a key to TPM2 with PCR SHA256:7 policy");
@@ -299,14 +303,16 @@ pub fn print_help() {
     eprintln!("  encrypt [RECIPIENT...]        Encrypt stdin using age to x25519 recipients");
     eprintln!("  decrypt                       Decrypt stdin using age with identity from KEY_FILE or KEY");
     eprintln!("  recovery-encrypt <SECRET> [PUB_KEY]");
-    eprintln!("                                Encrypt a secret for recovery using an Ed25519 public key");
+    eprintln!(
+        "                                Encrypt a secret for recovery using an Ed25519 public key"
+    );
     eprintln!("  help                          Show this help message");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  INITOS_PUB_KEY   base64 ed25519 public key (empty = skip verification)");
     eprintln!("  INITOS_IMG       image path (default: /img/initos.erofs, boot mode)");
     eprintln!("  INITOS_DATA      partition label (default: STATE, boot mode)");
-    eprintln!("  INITOS_INIT      init path (default: /opt/initos/bin/initos-init-ver)");
+    eprintln!("  INITOS_INIT      init path (default: /opt/initos/bin/initos-init)");
     eprintln!("  FSCRYPT_KEY      raw fscrypt passphrase/key material");
     eprintln!("  KEY              age scrypt passphrase for encrypt/decrypt");
     eprintln!("  ID               age x25519 identity for decrypt");

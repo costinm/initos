@@ -56,7 +56,7 @@ initos_devui() {
   initos_dev
   ui
   # No local UI - but editor and remote access, plugins
-  add_code
+  #add_code
 }
 
 ######## Components 
@@ -229,7 +229,7 @@ deb_host() {
   # wpa, iputils, smartmontools, lvm2, htop,
   # findutils
 
-  virt_install
+  #virt_install
 }
 
 

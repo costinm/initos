@@ -21,6 +21,11 @@
 
 - [] add a 3rd EFI option: plain kernel with cmdline/initrd built-in and not accepting further modifications or input.
 
+- update 'setup-deb' script to install 'debnix' - debian slim docker image plus nix package manager. Maybe move it to the dockerfile.
+
+- [] add FQDN of the mesh domain to sign.sh, default command.
+
+- [] add 'deploy' to sign.sh, 'install' to initos-init
 
 ## P5
 

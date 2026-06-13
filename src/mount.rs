@@ -52,8 +52,7 @@ pub fn mount_pseudo_fs(fstype: &str, target: &str) -> io::Result<()> {
 /// `/dev/disk/by-label/<label>`, then scans `/sys/class/block/` for ext4
 /// filesystem labels and partition names.
 ///
-/// If the label starts with "USB", retries up to 10 times (1s sleep)
-/// to allow slow USB devices to enumerate.
+/// If the label starts with "USB", retries up to 10 times (1s sleep).
 pub fn find_partition_by_label(label: &str) -> io::Result<PathBuf> {
     if label.starts_with("/dev/") {
         return Ok(PathBuf::from(label));
@@ -71,47 +70,8 @@ pub fn find_partition_by_label(label: &str) -> io::Result<PathBuf> {
         }
 
         if attempt < max_attempts {
-            eprintln!(
-                "initos: block device '{}' not found, retrying ({}/{})",
-                label, attempt, max_attempts
-            );
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-    }
-
-    // Final failure — dump diagnostics
-    let block_dir = Path::new("/sys/class/block");
-    eprintln!(
-        "initos: Could not find block device with label '{}'. Dumping block devices:",
-        label
-    );
-    if block_dir.exists() {
-        if let Ok(entries) = fs::read_dir(block_dir) {
-            for entry in entries.flatten() {
-                let dev_name = entry.file_name();
-                let dev_path = PathBuf::from("/dev").join(&dev_name);
-                let uevent_path = entry.path().join("uevent");
-                let mut properties = Vec::new();
-                if let Ok(uevent) = fs::read_to_string(&uevent_path) {
-                    for line in uevent.lines() {
-                        if line.starts_with("PARTNAME=")
-                            || line.starts_with("DEVNAME=")
-                            || line.starts_with("DEVTYPE=")
-                        {
-                            properties.push(line.to_string());
-                        }
-                    }
-                }
-                match read_ext4_label(&dev_path) {
-                    Ok(Some(fs_label)) => properties.push(format!("FSLABEL={}", fs_label)),
-                    Ok(None) => {}
-                    Err(e) => properties.push(format!("FSLABEL_ERR={:?}", e)),
-                }
-                eprintln!("initos:   - {:?}: {}", dev_name, properties.join(", "));
-            }
-        }
-    } else {
-        eprintln!("initos:   /sys/class/block does not exist!");
     }
 
     Err(io::Error::new(
@@ -148,7 +108,6 @@ fn scan_sysfs_for_label(label: &str) -> Option<PathBuf> {
 
         match read_ext4_label(&dev_path) {
             Ok(Some(fs_label)) if fs_label == label => return Some(dev_path),
-            Err(e) => eprintln!("initos: read_ext4_label error for {:?}: {:?}", dev_path, e),
             _ => {}
         }
 
@@ -215,11 +174,6 @@ pub fn mount_filesystem(
 
     let flags = if readonly { libc::MS_RDONLY } else { 0 };
 
-    eprintln!(
-        "initos: mount_filesystem api - dev={} target={} fstype={} flags={}",
-        device, target, fs_type, flags
-    );
-
     let ret = unsafe {
         libc::mount(
             source.as_ptr(),
@@ -245,7 +199,6 @@ pub fn bind_mount(source: &str, target: &str) -> io::Result<()> {
     let target_c =
         CString::new(target).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    eprintln!("initos: bind_mount source={} target={}", source, target);
     let ret = unsafe {
         libc::mount(
             source_c.as_ptr(),
@@ -276,10 +229,8 @@ pub fn mount_ext4(device: &str, target: &str) -> io::Result<()> {
 /// Uses /dev/loop-control to allocate a free loop device, then configures
 /// it with the given image path.
 pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
-    eprintln!("initos: mount_loop - create_dir_all {}", target);
     fs::create_dir_all(target)?;
 
-    eprintln!("initos: mount_loop - opening /dev/loop-control");
     let ctrl_path = CString::new("/dev/loop-control").unwrap();
     let ctrl_fd = unsafe { libc::open(ctrl_path.as_ptr(), libc::O_RDWR) };
     if ctrl_fd < 0 {
@@ -295,7 +246,6 @@ pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
     }
 
     let loop_dev = format!("/dev/loop{}", free_idx);
-    eprintln!("initos: mount_loop - acquired {}", loop_dev);
 
     let loop_dev_c = CString::new(loop_dev.as_str())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -304,7 +254,6 @@ pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    eprintln!("initos: mount_loop - opening image file {}", image_path);
     let img_c =
         CString::new(image_path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let img_fd = unsafe { libc::open(img_c.as_ptr(), libc::O_RDONLY) };
@@ -314,7 +263,6 @@ pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
         return Err(err);
     }
 
-    eprintln!("initos: mount_loop - LOOP_SET_FD");
     const LOOP_SET_FD: libc::c_int = 0x4C00;
     let ret = unsafe { libc::ioctl(loop_fd, LOOP_SET_FD, img_fd) };
     unsafe { libc::close(img_fd) };
@@ -326,7 +274,6 @@ pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
     }
     unsafe { libc::close(loop_fd) };
 
-    eprintln!("initos: mount_loop - mounting erofs on {}", loop_dev);
     mount_filesystem(&loop_dev, target, "erofs", true)
 }
 
@@ -347,14 +294,12 @@ pub fn switch_root(new_root: &str, init_path: &str) -> io::Result<()> {
     let dot = CString::new(".").unwrap();
     let slash = CString::new("/").unwrap();
 
-    eprintln!("initos: switch_root - chdir to {}", new_root);
     if unsafe { libc::chdir(new_root_c.as_ptr()) } != 0 {
         let err = io::Error::last_os_error();
         eprintln!("initos: chdir failed: {}", err);
         return Err(err);
     }
 
-    eprintln!("initos: switch_root - mount --move . /");
     let fstype_null: *const libc::c_char = std::ptr::null();
     if unsafe {
         libc::mount(
@@ -371,21 +316,18 @@ pub fn switch_root(new_root: &str, init_path: &str) -> io::Result<()> {
         return Err(err);
     }
 
-    eprintln!("initos: switch_root - chroot .");
     if unsafe { libc::chroot(dot.as_ptr()) } != 0 {
         let err = io::Error::last_os_error();
         eprintln!("initos: chroot failed: {}", err);
         return Err(err);
     }
 
-    eprintln!("initos: switch_root - chdir /");
     if unsafe { libc::chdir(slash.as_ptr()) } != 0 {
         let err = io::Error::last_os_error();
         eprintln!("initos: post-chroot chdir / failed: {}", err);
         return Err(err);
     }
 
-    eprintln!("initos: switch_root - execv {}", init_path);
     let argv = [init_c.as_ptr(), std::ptr::null()];
     unsafe { libc::execv(init_c.as_ptr(), argv.as_ptr()) };
 

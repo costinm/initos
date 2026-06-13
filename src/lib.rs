@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "uefi", no_std)]
 
 #[cfg(not(target_os = "uefi"))]
+pub mod boot;
+#[cfg(not(target_os = "uefi"))]
 pub mod cmd;
 #[cfg(not(target_os = "uefi"))]
 pub mod efi;

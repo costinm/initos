@@ -114,12 +114,7 @@ pub fn set_policy(dir: &str, key_identifier: &[u8]) -> Result<(), Box<dyn std::e
                 dir
             ).into());
         }
-        return Err(format!(
-            "FS_IOC_SET_ENCRYPTION_POLICY on {}: {}",
-            dir,
-            err
-        )
-        .into());
+        return Err(format!("FS_IOC_SET_ENCRYPTION_POLICY on {}: {}", dir, err).into());
     }
 
     Ok(())

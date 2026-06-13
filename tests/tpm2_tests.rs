@@ -64,7 +64,9 @@ impl SwtpmSession {
                 let mut process = process;
                 let _ = process.kill();
                 let _ = process.wait();
-                return Err(format!("failed to connect to swtpm on 127.0.0.1:{port} after 2s"));
+                return Err(format!(
+                    "failed to connect to swtpm on 127.0.0.1:{port} after 2s"
+                ));
             }
         };
         stream

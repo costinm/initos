@@ -6,7 +6,7 @@
 # The EFI boot should be configured to load ext4 
 # as rw, by PARTLABEL.
 #
-# There is no pivot_root in this mode - or expectation
+# This rootfs/dev path uses pivot_root, without an expectation
 # of protection against 'evil maid' and physical access,
 # which is the case for almost all linux distros.
 #
@@ -21,6 +21,9 @@ set -x
 export PATH=/opt/initos/bin:/opt/busybox/bin:/bin:/sbin:/usr/bin:/usr/sbin
 
 # Mount system (proc,sys,dev,etc) and tmp fs
+echo "Starting dev script"
+sh
+
 initos-init mount_sys
 
 if [ -n "${INITOS_INITRD}" ]; then
@@ -35,13 +38,13 @@ read -n 1 -t 3 debugkey
 
 echo "- mounting STATE"
 # Mount STATE disk - make sure ecryptfs is enabled
-initos-init init_ext4_data_dir
+#initos-init init_ext4_data_dir
 
-echo "- mounting modules/firmware"
+#echo "- mounting modules/firmware"
 # From STATE, mount firmware and modules
 # initos-init mount_modules
 
-if [ ! -d /z/c ] ; then
+init_c() {
   echo "Encrypted STATE disk doesn't exist - initializing it"
 
   mkdir /z/c
@@ -53,8 +56,11 @@ if [ ! -d /z/c ] ; then
   echo -n ${FSCRYPT_KEY} | KEY=${KEY} initos encrypt > /z/initos/c.age
 
   FSCRYPT_KEY=${FSCRYPT_KEY} initos fscrypt-setup /z/c
+}
 
-  echo "Initial setup done - debug shell (exit when done):"
+if [ ! -d /z/c ] ; then
+
+  echo "Initial setup done - debug shell - use init_c to setup (exit when done):"
   sh
 
   mkdir -p /z/c/home/root
@@ -64,48 +70,30 @@ if [ ! -d /z/c ] ; then
   #cp -a /z/home/* /z/c/home/
   #cp -a /z/initos/etc /z/c/
   
-else
+#else
   # if [ "${debugkey}" = "d" ]; then
   #   echo "Before unlock /c"
   #   sh 
   # fi
   # From STATE, mount the system encrypted disk (/c).
   # 
-  initos-init unlock_home
+  #initos-init unlock_home
 fi
 
-initos-init mount_modules
+#initos-init mount_modules
 
 
 if [ "${debugkey}" = "d" ]; then
   echo "Before rootfs pivot"
-  sh 
+  sh
 fi
 # Find and pivot to the real rootfs, using files from the encrypted dir
-# and/or (verity) images. 
+# and/or (verity) images.
 initos-init init_rootfs
 
 if [ "${debugkey}" = "d" ]; then
-  echo "After pivot - root is the target disk"
-  sh 
-fi
-
-# On dev machines - load the images RW, no verification anyways
-mkdir -p /mnt/INITOSA /mnt/INITOSB /mnt/BOOTA /mnt/BOOTB
-mount LABEL=INITOSB /mnt/INITOSB
-mount LABEL=INITOSA /mnt/INITOSA
-mount LABEL=BOOTA /mnt/BOOTA
-mount LABEL=BOOTB /mnt/BOOTB
-(cd /mnt/INITOSA && mount -o remount -rw .)
-(cd /mnt/INITOSB && mount -o remount -rw .)
-
-if [ "${debugkey}" = "d" ]; then
-  echo "Before starting init or systemd"
+  echo "After root handoff - root is the target disk"
   sh
 fi
 
 exec initos-init end_init
-
-
-
-

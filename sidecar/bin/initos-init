@@ -292,6 +292,7 @@ init_rootfs() {
     
     
     pivot_root . mnt/initos
+    
     cd /
 
     echo "After pivot"
@@ -317,6 +318,26 @@ init_rootfs() {
 
     chmod 1777 /run
     chmod 1777 /tmp
+}
+
+init_rootfs_switch() {
+    local name=${INITOS_ROOT:-ROOTA}
+
+    # Make common host mounts visible in the new root before switch_root.
+    mkdir -p /sysroot/usr/lib/firmware /sysroot/lib/modules/${ver}
+    ovl firmware /sysroot/usr/lib/firmware
+    ovl modules-${ver} /sysroot/lib/modules/${ver}
+
+    if [ -d /z/c/home ]; then
+      mkdir -p /z/c/initos/mnt /sysroot/home /sysroot/root
+      mount -o bind /z/c/home /sysroot/home
+      mount -o bind /z/c/home/root /sysroot/root
+    fi
+
+    move_mounted_to_sysroot
+
+    echo "Switching root"
+    exec switch_root /sysroot /opt/initos/bin/initos-init end_init
 }
 
 # All remaining mounted dirs will be moved under same dir in /sysroot,
@@ -346,9 +367,8 @@ end_init() {
   chgrp shadow /etc/shadow /usr/sbin/unix_chkpwd
   chmod u+s /usr/sbin/unix_chkpwd
  
-  mount --bind /z/flatpak /var/lib/flatpak
-  mount --bind /z/nix /nix
-  mount --bind /z/ws /ws
+  mount --bind /z/c/nix /nix
+  mount --bind /z/c/ws /ws
   if [ -f /z/c/initos/init ]; then
       /z/c/initos/init
   fi
@@ -419,16 +439,19 @@ export TPM_DIR=/z/initos/tpm
 #### Entry point
 
 if [ "$$" = "1" ] && [ $# -eq 0 ]; then
+  echo "Secure boot (in debug)"
+  sh
+
   mount_sys
   init_ext4_data_dir
 
-  if [ -f ${TPM_DIR}/tpm_handle ]; then
-    #initos-init load_drivers
-    unlock_c_tpm
-  else
-    # For machines without TPM, password required at boot.
-    unlock_home
-  fi
+  # if [ -f ${TPM_DIR}/tpm_handle ]; then
+  #   #initos-init load_drivers
+  #   unlock_c_tpm
+  # else
+  #   # For machines without TPM, password required at boot.
+  #   unlock_home
+  # fi
 
   #mount_modules
 

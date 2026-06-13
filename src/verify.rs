@@ -94,15 +94,11 @@ pub fn verify_signature(
 /// * `Err` on I/O or format errors
 pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Result<bool> {
     let img = img_path.as_ref();
-    eprintln!("initos: verity check - opening image: {:?}", img);
 
     // Get verity digest from the kernel
     let (_alg, digest) = match crate::verity::measure_verity(img) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("initos: verity measure returned: {}", e);
-            eprintln!("initos: attempting to dynamically enable fs-verity...");
-
             // Try enabling fs-verity by opening RO and calling the enable ioctl.
             // (Linux requires O_RDONLY, because any writable FD causes ETXTBSY)
             match std::fs::OpenOptions::new().read(true).open(img) {
@@ -117,13 +113,12 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Resul
                             format!("Measure failed: {}, Enable failed: {}", e, enable_err),
                         ));
                     } else {
-                        eprintln!("initos: dynamically enabled fs-verity. Measuring again...");
                         crate::verity::measure_verity(img)?
                     }
                 }
                 Err(open_err) => {
                     eprintln!(
-                        "initos: failed to open image for R/W to enable verity: {}",
+                        "initos: failed to open image for verity enable: {}",
                         open_err
                     );
                     return Err(e);
@@ -131,7 +126,6 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Resul
             }
         }
     };
-    eprintln!("initos: verity digest successfully obtained.");
 
     // Read signature file
     let sig_path = img.with_extension(
