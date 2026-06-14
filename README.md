@@ -128,22 +128,9 @@ Run `initos help` to list all subcommands:
 
 ## Build and Container Cycle
 
-The project uses a containerized runtime environment via `cctl` to build and test the boot sequence cleanly:
-
-```bash
-# Setup the debian container
-./scripts/container_build.sh initos_dev
-
-# Build all binaries & images inside the container
-./scripts/container_build.sh build
-
-# Run tests
-POD=initos_dev cctl cargo test -p initos
-
-# Boot and verify the images inside QEMU with a simulated TPM2
-POD=initos_dev cctl bash -lc 'TIMEOUT=90 tests/run_qemu.sh'
-```
-
+The build is based on 2 nix flakes - top level 'initos' for the rust and utils and 'linux'
+for the kernel compilation with the required options. Technically other kernels that have
+the essential drivers built in can be used as well. 
 
 ## Background
 

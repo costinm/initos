@@ -287,10 +287,19 @@ pub fn mount_loop(image_path: &str, target: &str) -> io::Result<()> {
 ///
 /// This function does not return on success.
 pub fn switch_root(new_root: &str, init_path: &str) -> io::Result<()> {
+    switch_root_with_args(new_root, init_path, &[])
+}
+
+/// Switch root to the new filesystem and exec init with additional arguments.
+pub fn switch_root_with_args(new_root: &str, init_path: &str, args: &[&str]) -> io::Result<()> {
     let new_root_c =
         CString::new(new_root).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let init_c =
         CString::new(init_path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let arg_cstrings = args
+        .iter()
+        .map(|arg| CString::new(*arg).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e)))
+        .collect::<io::Result<Vec<_>>>()?;
     let dot = CString::new(".").unwrap();
     let slash = CString::new("/").unwrap();
 
@@ -328,7 +337,10 @@ pub fn switch_root(new_root: &str, init_path: &str) -> io::Result<()> {
         return Err(err);
     }
 
-    let argv = [init_c.as_ptr(), std::ptr::null()];
+    let mut argv = Vec::with_capacity(args.len() + 2);
+    argv.push(init_c.as_ptr());
+    argv.extend(arg_cstrings.iter().map(|arg| arg.as_ptr()));
+    argv.push(std::ptr::null());
     unsafe { libc::execv(init_c.as_ptr(), argv.as_ptr()) };
 
     let err = io::Error::last_os_error();

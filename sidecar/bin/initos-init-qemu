@@ -1,4 +1,7 @@
 #!/opt/busybox/bin/sh
+#
+# Test script - will run in Qemu for integration/e2e testing.
+
 
 export PATH=/opt/initos/bin:/opt/busybox/bin:/z/a/initos/bin:/bin:/sbin:/usr/bin:/usr/sbin
 
@@ -24,7 +27,11 @@ run_tpm_setup() {
     FSCRYPT_KEY="${TPM_TEST_KEY}" initos fscrypt-setup /z/c
     echo "fscrypt-setup (/z/c tpm) exit=$?"
 
+    mkdir -p /z/c/home/root
+    mkdir -p /z/c/nix
     echo "${TPM_UNLOCK_TEXT}" > "${TPM_UNLOCK_FILE}"
+    echo "initos-qemu-root-bind-ok" > /z/c/home/root/bind-check.txt
+    echo "initos-qemu-nix-bind-ok" > /z/c/nix/bind-check.txt
     sync
 
     if [ "$(cat "${TPM_UNLOCK_FILE}" 2>/dev/null)" = "${TPM_UNLOCK_TEXT}" ]; then
@@ -61,12 +68,56 @@ verify_mount_fixtures() {
         echo "=== INITRD FIRMWARE MOUNT FAIL ==="
     fi
 
-    MDATA=$(cat /mnt/modules/kernel/fixture.txt 2>&1)
+    MDATA=$(cat "/mnt/modules/$(uname -r)/kernel/fixture.txt" 2>&1)
     echo "MODULES FIXTURE READ: [${MDATA}]"
     if [ "${MDATA}" = "initos qemu modules fixture for $(uname -r)" ]; then
         echo "=== INITRD MODULES MOUNT OK ==="
     else
         echo "=== INITRD MODULES MOUNT FAIL ==="
+    fi
+
+    RFDATA=$(cat /lib/firmware/test/fixture.txt 2>&1)
+    echo "ROOTFS FIRMWARE FIXTURE READ: [${RFDATA}]"
+    if [ "${RFDATA}" = "initos qemu firmware fixture" ]; then
+        echo "=== INITRD ROOTFS FIRMWARE BIND OK ==="
+    else
+        echo "=== INITRD ROOTFS FIRMWARE BIND FAIL ==="
+    fi
+
+    RMDATA=$(cat "/lib/modules/$(uname -r)/kernel/fixture.txt" 2>&1)
+    echo "ROOTFS MODULES FIXTURE READ: [${RMDATA}]"
+    if [ "${RMDATA}" = "initos qemu modules fixture for $(uname -r)" ]; then
+        echo "=== INITRD ROOTFS MODULES BIND OK ==="
+    else
+        echo "=== INITRD ROOTFS MODULES BIND FAIL ==="
+    fi
+
+    HDATA=$(cat /home/root/bind-check.txt 2>&1)
+    echo "ROOTFS HOME BIND READ: [${HDATA}]"
+    if [ "${HDATA}" = "initos-qemu-root-bind-ok" ]; then
+        echo "=== INITRD ROOTFS HOME BIND OK ==="
+    else
+        echo "=== INITRD ROOTFS HOME BIND FAIL ==="
+    fi
+
+    if [ -d /root ]; then
+        RDATA=$(cat /root/bind-check.txt 2>&1)
+        echo "ROOTFS ROOT BIND READ: [${RDATA}]"
+        if [ "${RDATA}" = "initos-qemu-root-bind-ok" ]; then
+            echo "=== INITRD ROOTFS ROOT BIND OK ==="
+        else
+            echo "=== INITRD ROOTFS ROOT BIND FAIL ==="
+        fi
+    else
+        echo "=== INITRD ROOTFS ROOT BIND SKIP ==="
+    fi
+
+    NDATA=$(cat /nix/bind-check.txt 2>&1)
+    echo "ROOTFS NIX BIND READ: [${NDATA}]"
+    if [ "${NDATA}" = "initos-qemu-nix-bind-ok" ]; then
+        echo "=== INITRD ROOTFS NIX BIND OK ==="
+    else
+        echo "=== INITRD ROOTFS NIX BIND FAIL ==="
     fi
 }
 

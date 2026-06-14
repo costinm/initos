@@ -1,6 +1,16 @@
 #!/opt/busybox/bin/sh
+#
+# Main 'init' script, post switch_root.
+# 
+# This is expected to be located as /opt/initos/bin/initos-init in the rootfs
+# or in /z/c/opt/initios/bin/initos-init (/z/c is the encrypted dir).
+#
+# Used to do have all the logic - now almost all moved to the rust initrd, which
+# will attempt to run systemd or /sbin/init if they are found - and only fallback
+# to this init.
+# 
 
-export PATH=/opt/initos/bin:/opt/busybox/bin:/z/a/initos/bin:/bin:/sbin:/usr/bin:/usr/sbin
+export PATH=/opt/initos/bin:/opt/busybox/bin:/z/c/opt/initos/bin:/z/c/opt/busybox/bin:/bin:/sbin:/usr/bin:/usr/sbin
 ver=$(uname -r)
 
 if [ "${initos_dbg}" = 1 ]; then
@@ -368,7 +378,7 @@ end_init() {
   chmod u+s /usr/sbin/unix_chkpwd
  
   mount --bind /z/c/nix /nix
-  mount --bind /z/c/ws /ws
+
   if [ -f /z/c/initos/init ]; then
       /z/c/initos/init
   fi
@@ -439,24 +449,26 @@ export TPM_DIR=/z/initos/tpm
 #### Entry point
 
 if [ "$$" = "1" ] && [ $# -eq 0 ]; then
-  echo "Secure boot (in debug)"
-  sh
-
-  mount_sys
-  init_ext4_data_dir
-
-  # if [ -f ${TPM_DIR}/tpm_handle ]; then
-  #   #initos-init load_drivers
-  #   unlock_c_tpm
-  # else
-  #   # For machines without TPM, password required at boot.
-  #   unlock_home
-  # fi
-
-  #mount_modules
+  if [ -z "$INITOS_PUB_KEY" ]; then
+    echo "Unlocked boot (debugging post-pivot init)"
+    
+    # Temp: shell to verify the setup done in rust.
+    echo
+    echo "Press d to enter debug shell in 3 seconds"
+    echo
+    read -n 1 -t 3 debugkey
+    if [ "${debugkey}" = "d" ]; then
+      echo "Before rootfs pivot"
+      sh
+    fi
+  fi
 
   init_rootfs
 
+  if [ "${debugkey}" = "d" ]; then
+    echo "Before rootfs pivot"
+    sh
+  fi
   end_init
 else
   "$@"

@@ -47,16 +47,6 @@ src/bin/efi.rs     EFI loader binary
 src/efi.rs         EFI verification/loading support
 ```
 
-Sidecar tooling:
-
-```text
-sidecar/bin/cctl
-sidecar/bin/setup-deb
-sidecar/bin/setup-initos-host
-sidecar/bin/initos-init
-sidecar/bin/initos-init-ver
-```
-
 Nix entry points:
 
 ```text

@@ -179,6 +179,7 @@ image() {
 _build_fat_image() {
     local boot_path="${1:?Usage: _build_fat_image <boot_path> <img_file>}"
     local img_file="${2:?Usage: _build_fat_image <boot_path> <img_file>}"
+    local label=${3:-INITOSBOOT}
 
     # Ensure absolute paths for operations since we perform 'cd'
     mkdir -p "${boot_path}"
@@ -193,7 +194,7 @@ _build_fat_image() {
 
     mkdir -p "$(dirname "${img_file}")"
     dd if=/dev/zero of="${img_file}" bs=1M count="${img_size_mb}" status=none
-    mformat -i "${img_file}" -F -v "INITOSBOOT" ::
+    mformat -i "${img_file}" -F -v "${label}" ::
     (cd "${boot_path}" && mcopy -i "${img_file}" -s ./* ::)
 
     echo "  Created: ${img_file} ($(du -h "${img_file}" | cut -f1))"
@@ -420,8 +421,8 @@ build_boot_limine_unsigned() {
     _copy_uefi_public_keys "${boot_path}/keys" "${sec_dir}"
 
     mkdir -p "${output_dir}/img"
-    _build_fat_image "${boot_path}" "${output_dir}/img/boot-limine-unsigned.vfat"
-    rm -rf "${boot_path}"
+    _build_fat_image "${boot_path}" "${output_dir}/img/boot-limine-unsigned.vfat" "INITOS-DEV"
+    rm -rf "${boot_path}"d
 }
 
 build_boot_limine_signed() {
@@ -490,7 +491,7 @@ LIMINECFG
     _copy_uefi_public_keys "${boot_path}/keys" "${sec_dir}"
 
     mkdir -p "${output_dir}/img"
-    _build_fat_image "${boot_path}" "${output_dir}/img/boot-limine-signed.vfat"
+    _build_fat_image "${boot_path}" "${output_dir}/img/boot-limine-signed.vfat" "INITOSL"
     rm -rf "${boot_path}"
 }
 
@@ -524,7 +525,8 @@ build_boot_initos_signed() {
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
     
-    local cmdline="${INITOS_CMDLINE:-console=tty1 INITOS_INIT=/opt/initos/bin/initos-init-dev loglevel=6 net.ifnames=0 panic=5} INITOS_PUB_KEY=${pub_key}"
+    local cmdline="${INITOS_CMDLINE:-console=tty1 loglevel=6 net.ifnames=0 panic=5} INITOS_PUB_KEY=${pub_key}"
+
     printf '%s\n' "${cmdline}" > "${boot_path}/EFI/BOOT/config"
 
     local signed="${boot_path}/EFI/BOOT/BOOTX64.EFI"
@@ -557,7 +559,7 @@ build_boot_initos_signed() {
     _copy_uefi_public_keys "${boot_path}/keys" "${sec_dir}"
 
     mkdir -p "${output_dir}/img"
-    _build_fat_image "${boot_path}" "${output_dir}/img/boot-initos-signed.vfat"
+    _build_fat_image "${boot_path}" "${output_dir}/img/boot-initos-signed.vfat" "INITOSB"
     rm -rf "${boot_path}"
 }
 

@@ -236,6 +236,25 @@ genpass() {
      head -c14; echo
 }
 
+init_c() {
+  echo "Encrypted STATE disk doesn't exist - initializing it"
+
+  mkdir /z/c
+  
+  FSCRYPT_KEY=$(cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14)
+
+  echo "Enter host unlock password:"
+	read -s -r KEY 2>/dev/null 
+  echo -n ${FSCRYPT_KEY} | KEY=${KEY} initos encrypt > /z/initos/c.age
+
+  FSCRYPT_KEY=${FSCRYPT_KEY} initos fscrypt-setup /z/c
+
+  mkdir -p /z/c/home/root
+  mkdir -p /z/c/mnt
+
+}
+
+
 
 chk_firmware() {
   set +x

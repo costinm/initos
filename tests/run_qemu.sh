@@ -315,10 +315,20 @@ test_initos_signed() {
         grep -q "initos: verifying image /z/img/firmware.erofs" "${log_file}" && \
         grep -q "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
         grep -q "initos: mounting /z/img/firmware.erofs at /sysroot/mnt/firmware" "${log_file}" && \
-        grep -q "initos: mounting /z/img/modules-.*\\.erofs at /sysroot/mnt/modules" "${log_file}" && \
+        grep -q "initos: mounting /z/img/modules-.*\\.erofs at /sysroot/mnt/modules/.*" "${log_file}" && \
+        grep -q "initos: binding /sysroot/mnt/firmware to /sysroot/usr/lib/firmware" "${log_file}" && \
+        grep -q "initos: binding /sysroot/mnt/modules to /sysroot/usr/lib/modules" "${log_file}" && \
+        grep -q "initos: mounting proc at /sysroot/proc" "${log_file}" && \
+        grep -q "initos: mounting sysfs at /sysroot/sys" "${log_file}" && \
+        grep -q "initos: mounting devtmpfs at /sysroot/dev" "${log_file}" && \
         grep -q "=== INITRD TPM UNLOCK OK ===" "${log_file}" && \
         grep -q "=== INITRD FIRMWARE MOUNT OK ===" "${log_file}" && \
         grep -q "=== INITRD MODULES MOUNT OK ===" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS FIRMWARE BIND OK ===" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS MODULES BIND OK ===" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS HOME BIND OK ===" "${log_file}" && \
+        (grep -q "=== INITRD ROOTFS ROOT BIND OK ===" "${log_file}" || grep -q "=== INITRD ROOTFS ROOT BIND SKIP ===" "${log_file}") && \
+        grep -q "=== INITRD ROOTFS NIX BIND OK ===" "${log_file}" && \
         grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
         echo "✅ SUCCESS: Signed InitOS booted, unlocked /z/c in initrd, verified module/firmware mounts, and completed all tests!"
     else
