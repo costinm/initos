@@ -18,11 +18,11 @@ run_tpm_setup() {
 
     initos primary
     echo "primary exit=$?"
-    cat /z/initos/tpm/tpm_primary
+    echo "primary handle=0x81000000"
 
     initos seal "${TPM_TEST_KEY}"
     echo "seal exit=$?"
-    cat /z/initos/tpm/tpm_handle
+    echo "sealed handles dev=0x81001002 secure=0x81001003"
 
     FSCRYPT_KEY="${TPM_TEST_KEY}" initos fscrypt-setup /z/c
     echo "fscrypt-setup (/z/c tpm) exit=$?"
@@ -139,12 +139,12 @@ run_tests() {
 
     initos primary
     echo "primary exit=$?"
-    cat /z/initos/tpm/tpm_primary
+    echo "primary handle=0x81000000"
 
     export INITOS_PUB_KEY="GOmR9GEy3xbI/4ybZDnv9coSOuD4kMkEkQcGGsbfkus="
     initos seal "${TPM_TEST_KEY}"
     echo "seal exit=$?"
-    cat /z/initos/tpm/tpm_handle
+    echo "sealed handles dev=0x81001002 secure=0x81001003"
 
     echo "=== FSCRYPT ENV KEY TEST ==="
     FSCRYPT_DIR=/z/tmp/test_env_encrypted

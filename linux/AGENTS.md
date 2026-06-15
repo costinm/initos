@@ -40,3 +40,16 @@ Expected outputs after `kernel_pack`:
 
 - `target/opt/kernel-image/': `bzImage` `.config` `modules-$(cat /build/linux/include/config/kernel.release).erofs`
 
+## Config Verification Trick
+
+Before doing a full host-kernel rebuild, verify fragment changes through the
+same Nix merge path used by `kernel-host`:
+
+```sh
+nix build ./linux#kernel-host.passthru.mergedConfig -o /tmp/initos-merged-kernel-config
+rg '^(CONFIG_USB_HID|CONFIG_HID|CONFIG_HID_GENERIC|CONFIG_USB_RTL8152|CONFIG_USB_USBNET|CONFIG_USB_NET_AX88179_178A)=' /tmp/initos-merged-kernel-config
+```
+
+This catches cases where later fragments or Kconfig dependencies turn a requested
+`=y` into `=m` or unset it. For built-in USB keyboard and early USB Ethernet
+support, the resolved config should keep the required symbols as `=y`, not `=m`.

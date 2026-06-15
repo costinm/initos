@@ -7,6 +7,7 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// Mount a pseudo-filesystem (proc, sysfs, devtmpfs).
@@ -300,6 +301,7 @@ pub fn switch_root_with_args(new_root: &str, init_path: &str, args: &[&str]) -> 
         .iter()
         .map(|arg| CString::new(*arg).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e)))
         .collect::<io::Result<Vec<_>>>()?;
+    let env_cstrings = current_environment()?;
     let dot = CString::new(".").unwrap();
     let slash = CString::new("/").unwrap();
 
@@ -341,9 +343,26 @@ pub fn switch_root_with_args(new_root: &str, init_path: &str, args: &[&str]) -> 
     argv.push(init_c.as_ptr());
     argv.extend(arg_cstrings.iter().map(|arg| arg.as_ptr()));
     argv.push(std::ptr::null());
-    unsafe { libc::execv(init_c.as_ptr(), argv.as_ptr()) };
+
+    let mut envp = Vec::with_capacity(env_cstrings.len() + 1);
+    envp.extend(env_cstrings.iter().map(|entry| entry.as_ptr()));
+    envp.push(std::ptr::null());
+
+    unsafe { libc::execve(init_c.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
 
     let err = io::Error::last_os_error();
-    eprintln!("initos: execv failed: {}", err);
+    eprintln!("initos: execve failed: {}", err);
     Err(err)
+}
+
+fn current_environment() -> io::Result<Vec<CString>> {
+    std::env::vars_os()
+        .map(|(key, value)| {
+            let mut entry = Vec::new();
+            entry.extend_from_slice(key.as_os_str().as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_os_str().as_bytes());
+            CString::new(entry).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+        })
+        .collect()
 }

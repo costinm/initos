@@ -1,4 +1,7 @@
 //! PID 1 boot sequence and initrd image handling.
+//!
+//! Keep docs/boot_sequence.md in sync with this module when changing boot
+//! environment variables, paths, mount order, or switch-root behavior.
 
 use std::env;
 use std::fs;
@@ -8,18 +11,42 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const DEV_TPM_PREFIX: &[u8] = b"devc:";
+const SECURE_TPM_PREFIX: &[u8] = b"secc:";
+
 /// Unseal the key from TPM and return raw bytes.
-pub fn unseal_key() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let handle = crate::tpm2::read_handle_file(
-        crate::tpm2::SEALED_HANDLE_PATH,
-        crate::tpm2::DEFAULT_SEALED_HANDLE,
-    )?;
+pub fn unseal_key(secure_boot: bool) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let (handle, prefix, mode) = if secure_boot {
+        (
+            crate::tpm2::DEFAULT_SEALED_HANDLE_SECURE,
+            SECURE_TPM_PREFIX,
+            "secure",
+        )
+    } else {
+        (
+            crate::tpm2::DEFAULT_SEALED_HANDLE_DEV,
+            DEV_TPM_PREFIX,
+            "dev",
+        )
+    };
+    unseal_key_from_handle(handle, prefix, mode)
+}
+
+pub fn unseal_key_from_handle(
+    handle: u32,
+    prefix: &[u8],
+    mode: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     eprintln!("initos: unseal handle=0x{:08X}", handle);
     let mut dev = crate::tpm2::open()?;
     let session = crate::tpm2::start_policy_session(&mut dev)?;
     crate::tpm2::policy_pcr(&mut dev, session)?;
-    let secret = crate::tpm2::unseal(&mut dev, handle, session)?;
-    eprintln!("initos: unsealed {} bytes", secret.len());
+    let secret = strip_tpm_prefix(
+        crate::tpm2::unseal(&mut dev, handle, session)?,
+        prefix,
+        mode,
+    )?;
+    eprintln!("initos: unsealed {} {} bytes", mode, secret.len());
 
     Ok(secret)
 }
@@ -28,7 +55,7 @@ pub fn unseal_key() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 /// loop-mount, preserve host images under /mnt, and switch_root.
 pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
     let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    let is_dev_mode = pub_key.is_empty();
+    let verified_boot_mode = std::cell::Cell::new(!pub_key.is_empty());
 
     let boot_run = || -> Result<(), Box<dyn std::error::Error>> {
         let img = env::var("INITOS_IMG").unwrap_or_else(|_| "/img/initos.erofs".to_string());
@@ -48,6 +75,8 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
             };
         }
+        let verified_boot = detect_verified_boot(!pub_key.is_empty());
+        verified_boot_mode.set(verified_boot);
 
         let dev = find_data_device(&data)?;
         eprintln!("initos: found data device: {:?}", dev);
@@ -55,7 +84,7 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         let state_mount = "/z";
         crate::mount::mount_filesystem(dev.to_str().unwrap(), state_mount, "ext4", false)?;
         eprintln!("initos: mounted data device at {}", state_mount);
-        unlock_state_c(state_mount, !pub_key.is_empty())?;
+        unlock_state_c(state_mount, verified_boot)?;
 
         let root_mount = "/sysroot";
         mount_rootfs(state_mount, root_mount, &img, &pub_key)?;
@@ -77,7 +106,7 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = boot_run() {
         eprintln!("initos: boot failed: {}", e);
-        if is_dev_mode {
+        if !verified_boot_mode.get() {
             let dev_init_path = "/opt/initos/bin/initos-initrd";
             let boot_error = e.to_string().replace('\0', "\\0");
             env::set_var("INITOS_BOOT_ERROR", &boot_error);
@@ -224,10 +253,8 @@ fn unlock_state_c(
     }
 
     let c_age = Path::new(state_mount).join("initos/c.age");
-    let tpm_handle = Path::new(state_mount).join("initos/tpm/tpm_handle");
-
-    if tpm_handle.exists() && Path::new("/dev/tpmrm0").exists() {
-        match unlock_c_with_tpm(&c_dir, &c_age) {
+    if Path::new("/dev/tpmrm0").exists() {
+        match unlock_c_with_tpm(&c_dir, verified_boot) {
             Ok(()) => return Ok(()),
             Err(e) => eprintln!("initos: TPM /c unlock failed: {}", e),
         }
@@ -240,13 +267,8 @@ fn c_is_unlocked(c_dir: &Path) -> bool {
     c_dir.join("home").is_dir()
 }
 
-fn unlock_c_with_tpm(c_dir: &Path, c_age: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let tpm_key = unseal_key()?;
-    let fscrypt_key = if c_age.exists() {
-        decrypt_age_with_key_file(c_age, &tpm_key)?
-    } else {
-        tpm_key
-    };
+fn unlock_c_with_tpm(c_dir: &Path, verified_boot: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let fscrypt_key = unseal_key(verified_boot)?;
     add_fscrypt_key(c_dir, &fscrypt_key)?;
     if !c_is_unlocked(c_dir) {
         return Err(format!("{} did not unlock with TPM", c_dir.display()).into());
@@ -354,6 +376,36 @@ fn decrypt_age_with_key(
     let mut result = Vec::new();
     reader.read_to_end(&mut result)?;
     Ok(result)
+}
+
+fn strip_tpm_prefix(
+    secret: Vec<u8>,
+    prefix: &[u8],
+    mode: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    secret
+        .strip_prefix(prefix)
+        .map(|stripped| stripped.to_vec())
+        .ok_or_else(|| format!("TPM {} secret has wrong prefix", mode).into())
+}
+
+fn detect_verified_boot(pub_key_set: bool) -> bool {
+    let base_path =
+        env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+    match crate::efi::read_secure_boot(&base_path) {
+        Ok(value) => {
+            let enabled = value != 0;
+            eprintln!("initos: EFI SecureBoot={} verified_boot={}", value, enabled);
+            enabled
+        }
+        Err(e) => {
+            eprintln!(
+                "initos: failed to read EFI SecureBoot from {}, using INITOS_PUB_KEY fallback: {}",
+                base_path, e
+            );
+            pub_key_set
+        }
+    }
 }
 
 fn mount_host_images(

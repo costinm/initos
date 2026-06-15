@@ -2,10 +2,12 @@
 //!
 //! Subcommands:
 //!   (no args)              As PID 1: full boot sequence. Otherwise: unseal.
-//!   unseal                 Unseal TPM2 key via PCR SHA256:7 policy
+//!   unseal [--dev|--secure] [--handle HANDLE]
+//!                          Unseal TPM2 key via PCR SHA256:7 policy
 //!   lock_tpm               Extend PCR 7 to prevent further unsealing
 //!   primary                Create a TPM2 primary key and persist it, required for seal.
-//!   seal <SECRET>          Seal a key to TPM2 with PCR SHA256:7 policy
+//!   seal [--dev|--secure] [--handle HANDLE] <SECRET>
+//!                          Seal a key to TPM2 with PCR SHA256:7 policy
 //!   fscrypt <PATH>         Check FSCRYPT_KEY env or prompt for key + add to filesystem keyring (unlock)
 //!   fscrypt-setup <DIR>    Check FSCRYPT_KEY env or prompt for key + add to keyring + set encryption policy
 //!   boot                   Full initrd boot sequence (mount, verify, switch_root)
@@ -23,7 +25,6 @@
 //!   INITOS_DATA      partition label (default: STATE, boot mode)
 
 use std::env;
-use std::fs;
 use std::io::{self, Write};
 use std::process;
 
@@ -34,19 +35,30 @@ fn main() {
         if process::id() == 1 {
             initos::boot::cmd_boot()
         } else {
-            cmd_unseal()
+            cmd_unseal(detect_seal_mode(), None)
         }
     } else {
         match args[1].as_str() {
-            "unseal" => cmd_unseal(),
+            "unseal" => match parse_unseal_args(&args[2..]) {
+                Ok((mode, handle)) => cmd_unseal(mode, handle),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    eprintln!("Usage: initos unseal [--dev|--secure] [--handle HANDLE]");
+                    process::exit(1);
+                }
+            },
             "lock_tpm" => cmd_lock_tpm(),
             "primary" => cmd_primary(),
             "seal" => {
-                if args.len() < 3 {
-                    eprintln!("Usage: initos seal <SECRET>");
-                    process::exit(1);
-                }
-                cmd_seal(&args[2])
+                let (mode, handle, secret) = match parse_seal_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        eprintln!("Usage: initos seal [--dev|--secure] [--handle HANDLE] <SECRET>");
+                        process::exit(1);
+                    }
+                };
+                cmd_seal(&secret, mode, handle)
             }
             "fscrypt" => {
                 if args.len() < 3 {
@@ -127,8 +139,11 @@ fn cmd_lock_tpm() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Unseal and print to stdout.
-fn cmd_unseal() -> Result<(), Box<dyn std::error::Error>> {
-    let secret = initos::boot::unseal_key()?;
+fn cmd_unseal(mode: SealMode, handle: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
+    let secret = match handle {
+        Some(handle) => initos::boot::unseal_key_from_handle(handle, mode.prefix(), mode.name())?,
+        None => initos::boot::unseal_key(mode.is_secure())?,
+    };
     io::stdout().write_all(&secret)?;
     Ok(())
 }
@@ -161,7 +176,6 @@ fn cmd_fscrypt_setup(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Primary: create RSA-2048 storage primary key, persist at 0x81000000, save handle.
 fn cmd_primary() -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(initos::tpm2::TPM_DIR)?;
     let mut dev = initos::tpm2::open()?;
 
     let transient = initos::tpm2::create_primary(&mut dev)?;
@@ -171,23 +185,163 @@ fn cmd_primary() -> Result<(), Box<dyn std::error::Error>> {
     initos::tpm2::try_evict_persistent(&mut dev, persistent);
     initos::tpm2::evict_control(&mut dev, transient, persistent)?;
     eprintln!("initos: persisted primary at 0x{:08X}", persistent);
-
-    fs::write(
-        initos::tpm2::PRIMARY_HANDLE_PATH,
-        format!("0x{:08X}\n", persistent),
-    )?;
-    eprintln!("initos: saved {}", initos::tpm2::PRIMARY_HANDLE_PATH);
     Ok(())
 }
 
-/// Seal: create trial policy, create sealed object, load, persist, save handle.
-fn cmd_seal(secret: &str) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(initos::tpm2::TPM_DIR)?;
+enum SealMode {
+    Dev,
+    Secure,
+}
 
-    let primary = initos::tpm2::read_handle_file(
-        initos::tpm2::PRIMARY_HANDLE_PATH,
-        initos::tpm2::DEFAULT_PRIMARY_HANDLE,
-    )?;
+impl SealMode {
+    fn is_secure(&self) -> bool {
+        matches!(self, SealMode::Secure)
+    }
+
+    fn persistent_handle(&self) -> u32 {
+        match self {
+            SealMode::Dev => initos::tpm2::DEFAULT_SEALED_HANDLE_DEV,
+            SealMode::Secure => initos::tpm2::DEFAULT_SEALED_HANDLE_SECURE,
+        }
+    }
+
+    fn prefix(&self) -> &'static [u8] {
+        match self {
+            SealMode::Dev => b"devc:",
+            SealMode::Secure => b"secc:",
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            SealMode::Dev => "dev",
+            SealMode::Secure => "secure",
+        }
+    }
+}
+
+fn parse_unseal_args(args: &[String]) -> Result<(SealMode, Option<u32>), String> {
+    let mut mode = None;
+    let mut handle = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--secure" => mode = Some(SealMode::Secure),
+            "--dev" => mode = Some(SealMode::Dev),
+            "--handle" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--handle requires a value".to_string())?;
+                handle = Some(parse_tpm_handle(value)?);
+            }
+            other => return Err(format!("unexpected unseal argument: {}", other)),
+        }
+        i += 1;
+    }
+    Ok((mode.unwrap_or_else(detect_seal_mode), handle))
+}
+
+fn parse_seal_args(args: &[String]) -> Result<(SealMode, Option<u32>, String), String> {
+    let mut mode = None;
+    let mut handle = None;
+    let mut secret = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--secure" => mode = Some(SealMode::Secure),
+            "--dev" => mode = Some(SealMode::Dev),
+            "--handle" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--handle requires a value".to_string())?;
+                handle = Some(parse_tpm_handle(value)?);
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("unexpected seal argument: {}", value));
+            }
+            value => {
+                if secret.is_some() {
+                    return Err("seal accepts exactly one SECRET argument".to_string());
+                }
+                secret = Some(value.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let secret = secret.ok_or_else(|| "seal requires SECRET".to_string())?;
+    Ok((mode.unwrap_or_else(detect_seal_mode), handle, secret))
+}
+
+fn parse_tpm_handle(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("TPM handle is empty".to_string());
+    }
+
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bad TPM handle '{}': expected hex", value));
+    }
+
+    let parsed =
+        u32::from_str_radix(hex, 16).map_err(|e| format!("bad TPM handle '{}': {}", value, e))?;
+    let handle = if !trimmed.starts_with("0x") && !trimmed.starts_with("0X") && hex.len() <= 4 {
+        0x8100_0000 | parsed
+    } else {
+        parsed
+    };
+    if !(0x8100_0000..=0x81FF_FFFF).contains(&handle) {
+        return Err(format!(
+            "bad TPM handle 0x{:08X}: expected persistent handle 0x81000000..0x81FFFFFF",
+            handle
+        ));
+    }
+    Ok(handle)
+}
+
+fn detect_seal_mode() -> SealMode {
+    let base_path =
+        env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+    match initos::efi::read_secure_boot(&base_path) {
+        Ok(value) if value != 0 => {
+            eprintln!("initos: EFI SecureBoot={} using secure TPM handle", value);
+            SealMode::Secure
+        }
+        Ok(value) => {
+            eprintln!("initos: EFI SecureBoot={} using dev TPM handle", value);
+            SealMode::Dev
+        }
+        Err(e) => {
+            let pub_key_set = env::var("INITOS_PUB_KEY").is_ok_and(|key| !key.is_empty());
+            let mode = if pub_key_set {
+                SealMode::Secure
+            } else {
+                SealMode::Dev
+            };
+            eprintln!(
+                "initos: failed to read EFI SecureBoot from {}, using {} TPM handle from INITOS_PUB_KEY fallback: {}",
+                base_path,
+                mode.name(),
+                e
+            );
+            mode
+        }
+    }
+}
+
+/// Seal: create trial policy, create sealed object, load, and persist at fixed handle.
+fn cmd_seal(
+    secret: &str,
+    mode: SealMode,
+    handle: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let primary = initos::tpm2::DEFAULT_PRIMARY_HANDLE;
     eprintln!("initos: seal under primary=0x{:08X}", primary);
 
     let mut dev = initos::tpm2::open()?;
@@ -200,8 +354,10 @@ fn cmd_seal(secret: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("initos: policy digest ({} bytes)", digest.len());
 
     // 2. Create sealed object under the primary
-    let (priv_area, pub_area) =
-        initos::tpm2::create(&mut dev, primary, secret.as_bytes(), &digest)?;
+    let mut sealed_secret = Vec::with_capacity(mode.prefix().len() + secret.len());
+    sealed_secret.extend_from_slice(mode.prefix());
+    sealed_secret.extend_from_slice(secret.as_bytes());
+    let (priv_area, pub_area) = initos::tpm2::create(&mut dev, primary, &sealed_secret, &digest)?;
     eprintln!(
         "initos: created sealed object (priv={}, pub={})",
         priv_area.len(),
@@ -213,17 +369,14 @@ fn cmd_seal(secret: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("initos: loaded transient=0x{:08X}", loaded);
 
     // 4. Persist it
-    let persistent = initos::tpm2::DEFAULT_SEALED_HANDLE;
+    let persistent = handle.unwrap_or_else(|| mode.persistent_handle());
     initos::tpm2::try_evict_persistent(&mut dev, persistent);
     initos::tpm2::evict_control(&mut dev, loaded, persistent)?;
-    eprintln!("initos: persisted sealed at 0x{:08X}", persistent);
-
-    // 5. Save handle
-    fs::write(
-        initos::tpm2::SEALED_HANDLE_PATH,
-        format!("0x{:08X}\n", persistent),
-    )?;
-    eprintln!("initos: saved {}", initos::tpm2::SEALED_HANDLE_PATH);
+    eprintln!(
+        "initos: persisted {} sealed at 0x{:08X}",
+        mode.name(),
+        persistent
+    );
     Ok(())
 }
 

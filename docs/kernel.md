@@ -1,16 +1,17 @@
 # Why a custom kernel build
 
-It is perfectly possible to use a 'distro' kernel - with 
-an initrd that loads storage and filesystem modules. 
+It is possible to use a 'distro' kernel - with storage and filesystem 
+modules included on the initrd. The question is what's the benefit
+for this complexity. Boot won't be faster, since initrd is loaded
+in RAM. 
 
-However it is far simpler to just have a kernel that 
-has what it needs to boot - storage and filesystem for the 
-system partition. 
+It is far simpler to just have a kernel that has what it needs to
+boot - storage and filesystem for the system partition. 
 
 Few distros do this - and their kernels could be used - but
 I have a variety of old machines with odd drivers I don't want
 to throw away - and I think for a secure boot it is quite
-useful to have control and know how to build kernels. 
+useful to have control and know how to automate building kernels. 
 
 LLMs can handle this without any trouble - so a lot can 
 be automated and just review is required.
@@ -77,5 +78,6 @@ Can be built in a debian container or VM - with all deps installed, and in nix.
 
 Main difference is that in nix it is using the kernel source
 from a nix cache - while in debian it is getting directly 
-from github. 
+from github. May update nix build to also use the upstream kernel
+and drop debian dev environment.
 

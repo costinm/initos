@@ -6,16 +6,22 @@
 
 disk_setup() {
   DISK=${1:-"/dev/sdb"}
-  
+  suffix=""
+  if echo "$DISK" | grep -q "nvme"; then
+    suffix="p"
+  fi
+  if echo "$DISK" | grep -q "mmcblk"; then
+    suffix="p"
+  fi
+
 
   sfdisk --label gpt "$DISK" <<EOF
 label-id: gpt
 
+partition-100 : size=64M, name="BOOTD", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 partition-101 : size=64M, name="BOOT1", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 partition-102 : size=64M, name="BOOT2", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-partition-111 : size=64M, name="INITOS1"
-partition-112 : size=64M, name="INITOS2"
-partition-1   : size=+, name="ROOT"
+partition-1   : size=+, name="STATE"
 EOF
 }
 
@@ -32,17 +38,16 @@ setup_fs() {
 }
 
 upgrade() {
-  cp /z/img/bzImage /mnt/BOOTB/EFI/BOOT/
+  DISK=${1:-/dev/sdb}
+  dd if=/z/img/initos-signed.fat of=/dev/${DISK}102
   sync
   /opt/busybox/bin/reboot -f
 
 }
 
 mount_install() {
-  mkdir -p /mnt/STATE /mnt/BOOT1 /mnt/BOOT2 /mnt/INITOS1 /mnt/INITOS2
+  mkdir -p /mnt/STATE /mnt/BOOT1 /mnt/BOOT2 
   mount LABEL=STATE /mnt/STATE
-  mount LABEL=INITOS1 /mnt/INITOS1
-  mount LABEL=INITOS2 /mnt/INITOS2
   mount LABEL=BOOT1 /mnt/BOOT1
   mount LABEL=BOOT2 /mnt/BOOT2
 }
@@ -50,38 +55,37 @@ mount_install() {
 part_labels() {
   local d=${1}
 
-  sfdisk --part-label $d 101 BOOTA
-  sfdisk --part-label $d 102 BOOTB
-  sfdisk --part-label $d 103 INITOSA
-  sfdisk --part-label $d 104 INITOSB
+  sfdisk --part-label $d 100 BOOTD
+  sfdisk --part-label $d 101 BOOT1
+  sfdisk --part-label $d 102 BOOT2
   sfdisk --part-label $d 1 STATE
 
   mkfs.ext4 -L STATE -O encrypt,verity ${d}1
-  mkfs.vfat -n BOOTA ${d}101
-  mkfs.vfat -n BOOTB ${d}102
+  #mkfs.vfat -n BOOTA ${d}101
+  #mkfs.vfat -n BOOTB ${d}102
 
   # use e2label or fatlabel to change
 }
 
-rebuild_root() {
-    # Excluding some directories since for dev the ext4 may
-    # be an actual root install. It is bind mounted to /z/a/ROOTA,
-    # but includes /z as well.
-    (cd /z/a/ROOTA && \
-        mkfs.erofs -zlz4 /z/img/ROOTA.erofs . \
-        --exclude-path c \
-        --exclude-path tmp \
-        --exclude-path initos \
-        --exclude-path img \
-        --exclude-path z \
-        --exclude-path a \
-        )
-}
+# rebuild_root() {
+#     # Excluding some directories since for dev the ext4 may
+#     # be an actual root install. It is bind mounted to /z/a/ROOTA,
+#     # but includes /z as well.
+#     (cd /z/a/ROOTA && \
+#         mkfs.erofs -zlz4 /z/img/ROOTA.erofs . \
+#         --exclude-path c \
+#         --exclude-path tmp \
+#         --exclude-path initos \
+#         --exclude-path img \
+#         --exclude-path z \
+#         --exclude-path a \
+#         )
+# }
 
-rebuild_initos() {
-    (cd /z/a/initos && \
-        mkfs.erofs -zlz4 /z/img/initos.erofs .)
-}
+# rebuild_initos() {
+#     (cd /z/a/initos && \
+#         mkfs.erofs -zlz4 /z/img/initos.erofs .)
+# }
 
 
 part_labels_usb() {
@@ -89,115 +93,93 @@ part_labels_usb() {
 
   sfdisk --part-label $d 101 UBOOTA
   sfdisk --part-label $d 102 UBOOTB
-  sfdisk --part-label $d 103 UINITOSA
-  sfdisk --part-label $d 104 UINITOSB
   sfdisk --part-label $d 1 USTATE
 
   mkfs.ext4 -L USTATE -O encrypt,verity ${d}1
-  mkfs.vfat -n UBOOTA ${d}101
-  mkfs.vfat -n UBOOTB ${d}102
+  # mkfs.vfat -n UBOOTA ${d}101
+  # mkfs.vfat -n UBOOTB ${d}102
 
   # use e2label or fatlabel to change
 }
 
-init_secrets() {
-  mkdir -p /run/secrets/root
-  chown root /run/secrets/root
-  chmod 600 /run/secrets/root
-  age-keygen -o /run/secrets/root/c_key
-  chmod 600 /run/secrets/root/c_key
-}
+# init_secrets() {
+#   mkdir -p /run/secrets/root
+#   chown root /run/secrets/root
+#   chmod 600 /run/secrets/root
+#   age-keygen -o /run/secrets/root/c_key
+#   chmod 600 /run/secrets/root/c_key
+# }
 
 
 
-# Will wipe a disk a create the partitions needed for initos.
-# This should be called explicitly by the user - it will normally not be done automatically.
-# In practice we need ~100M on the EFI, and some btrfs volume.
-#
-install_wipe_disk() {
-  DISK=${1:-/dev/nvme0n1}
+# # Will wipe a disk a create the partitions needed for initos.
+# # This should be called explicitly by the user - it will normally not be done automatically.
+# # In practice we need ~100M on the EFI, and some btrfs volume.
+# #
+# install_wipe_disk() {
+#   DISK=${1:-/dev/nvme0n1}
 
-  suffix=""
-  if echo "$DISK" | grep -q "nvme"; then
-    suffix="p"
-  fi
-  if echo "$DISK" | grep -q "mmcblk"; then
-    suffix="p"
-  fi
+#   suffix=""
+#   if echo "$DISK" | grep -q "nvme"; then
+#     suffix="p"
+#   fi
+#   if echo "$DISK" | grep -q "mmcblk"; then
+#     suffix="p"
+#   fi
 
-  # List partitions with parted
-  partitions=$(parted --script --machine -- "${DISK}" unit s print)
+#   # List partitions with parted
+#   partitions=$(parted --script --machine -- "${DISK}" unit s print)
 
-  parted --script --machine -- "${DISK}" mklabel gpt
+#   parted --script --machine -- "${DISK}" mklabel gpt
 
-  parted "$DISK" mkpart BOOTA vfat 101 2048
-  parted "$DISK" set 1 boot on
-  parted "$DISK" set 1 esp on
-  parted "$DISK" name 1 "BOOTA"
+#   parted "$DISK" mkpart BOOTA vfat 101 2048
+#   parted "$DISK" set 1 boot on
+#   parted "$DISK" set 1 esp on
+#   parted "$DISK" name 1 "BOOTA"
 
-  parted "$DISK" mkpart BOOTB fat32 2048 4096
-  parted "$DISK" name 2 "BOOTB"
-  parted "$DISK" set 2 esp on
+#   parted "$DISK" mkpart BOOTB fat32 2048 4096
+#   parted "$DISK" name 2 "BOOTB"
+#   parted "$DISK" set 2 esp on
 
-  parted "$DISK" mkpart INITOSA fat32 2048 4096
-  parted "$DISK" name 3 "INITOSA"
-  parted "$DISK" set 3 esp on
+#   parted "$DISK" mkpart INITOSA fat32 2048 4096
+#   parted "$DISK" name 3 "INITOSA"
+#   parted "$DISK" set 3 esp on
 
-  parted "$DISK" mkpart INITOSB fat32 2048 4096
-  parted "$DISK" name 2 "INITOSB"
-  parted "$DISK" set 2 esp on
+#   parted "$DISK" mkpart INITOSB fat32 2048 4096
+#   parted "$DISK" name 2 "INITOSB"
+#   parted "$DISK" set 2 esp on
 
-  parted "$DISK" mkpart STATE ext4 4096 100%
-  parted "$DISK" name 3 "STATE"
+#   parted "$DISK" mkpart STATE ext4 4096 100%
+#   parted "$DISK" name 3 "STATE"
 
-  partprobe $DISK
+#   partprobe $DISK
 
-  bootd ${DISK}${suffix}1 BOOTA
-  bootd ${DISK}${suffix}2 BOOTB
+#   bootd ${DISK}${suffix}1 BOOTA
+#   bootd ${DISK}${suffix}2 BOOTB
 
-  #install_boot_options ${DISK}
-}
+#   #install_boot_options ${DISK}
+# }
 
-set_label() {
-  local disk=$1
-  local part=$2
+# install_wipe_usb() {
+#   DISK=${1:-/dev/sda}
 
-  sfdisk --part-label ${disk} ${part} "STATE"
-  #parted "$DISK" name $part $label
-}
+#   parted --script --machine -- "${DISK}" mklabel gpt
 
-install_wipe_usb() {
-  DISK=${1:-/dev/sda}
+#   parted "$DISK" mkpart primary fat32 1 4096
+#   parted "$DISK" set 1 boot on
+#   parted "$DISK" set 1 esp on
+#   parted "$DISK" name 1 "BOOTUSB"
 
-  parted --script --machine -- "${DISK}" mklabel gpt
+#   # Create the LUKS partition
+#   parted "$DISK" mkpart primary ext4 4096 100%
+#   parted "$DISK" name 2 "INITOSLUKSUSB"
 
-  parted "$DISK" mkpart primary fat32 1 4096
-  parted "$DISK" set 1 boot on
-  parted "$DISK" set 1 esp on
-  parted "$DISK" name 1 "BOOTUSB"
+#   partprobe $DISK
 
-  # Create the LUKS partition
-  parted "$DISK" mkpart primary ext4 4096 100%
-  parted "$DISK" name 2 "INITOSLUKSUSB"
+#   bootd ${DISK}1 BOOTUSB
 
-  partprobe $DISK
-
-  bootd ${DISK}1 BOOTUSB
-
-  #install_boot_options ${DISK}
-}
-
-# Initialize the boot partition - make filesystem, copy the
-# EFI files from USB (or primary partition)
-bootd() {
-  local PART=$1
-  local LABEL=$2
-
-  mkfs.vfat ${PART} -n $LABEL
-  mkdir -p /mnt/$LABEL
-  mount ${PART} /mnt/$LABEL
-  cp -a /boot/efi/* /mnt/$LABEL
-}
+#   #install_boot_options ${DISK}
+# }
 
 
 ### Host tools ###
@@ -206,14 +188,13 @@ bootd() {
 # for closing the screen is broken
 fixtty() {
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty2
-
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty0
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty1
 }
 
-hdinfo() {
-  cryptsetup luksDump $1
-}
+# hdinfo() {
+#   cryptsetup luksDump $1
+# }
 
 # On debian, find the explicitly installed packages
 find_installed_deb() {
@@ -237,24 +218,20 @@ genpass() {
 }
 
 init_c() {
-  echo "Encrypted STATE disk doesn't exist - initializing it"
-
-  mkdir /z/c
+  local p=${1:-/mnt/STATE}
+  mkdir ${p}/c ${p}/initos
   
   FSCRYPT_KEY=$(cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14)
 
   echo "Enter host unlock password:"
 	read -s -r KEY 2>/dev/null 
-  echo -n ${FSCRYPT_KEY} | KEY=${KEY} initos encrypt > /z/initos/c.age
+  echo -n ${FSCRYPT_KEY} | KEY=${KEY} initos encrypt > ${p}/initos/c.age
 
-  FSCRYPT_KEY=${FSCRYPT_KEY} initos fscrypt-setup /z/c
+  FSCRYPT_KEY=${FSCRYPT_KEY} initos fscrypt-setup ${p}/c
 
-  mkdir -p /z/c/home/root
-  mkdir -p /z/c/mnt
-
+  mkdir -p ${p}/c/home/root
+  mkdir -p ${p}/c/mnt
 }
-
-
 
 chk_firmware() {
   set +x

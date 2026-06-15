@@ -294,8 +294,10 @@ pub fn print_help() {
         "  verify <IMG>                  Verify fsverity digest + .sig signature of an image"
     );
     eprintln!("  efi                           Read EFI variables (SecureBoot, BootCurrent, db)");
-    eprintln!("  unseal                        Unseal TPM2 key via PCR SHA256:7 policy");
-    eprintln!("  seal <SECRET>                 Seal a key to TPM2 with PCR SHA256:7 policy");
+    eprintln!("  unseal [--dev|--secure] [--handle HANDLE]");
+    eprintln!("                                 Unseal TPM2 key via PCR SHA256:7 policy");
+    eprintln!("  seal [--dev|--secure] [--handle HANDLE] <SECRET>");
+    eprintln!("                                 Seal a key to TPM2 with PCR SHA256:7 policy");
     eprintln!("  primary                       Create a TPM2 primary key and persist it");
     eprintln!("  lock_tpm                      Extend PCR 7 to prevent further unsealing");
     eprintln!("  fscrypt <PATH>                Add encryption key to filesystem keyring (unlock)");

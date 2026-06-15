@@ -5,7 +5,7 @@
 //!
 //! Zero external dependencies — only uses std.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
 // ─── TPM2 command codes ─────────────────────────────────────────────────────
@@ -52,12 +52,12 @@ const SEALED_OBJ_ATTRS: u32 = 0x0000_0012;
 
 /// Default persistent handles
 pub const DEFAULT_PRIMARY_HANDLE: u32 = 0x8100_0000;
-pub const DEFAULT_SEALED_HANDLE: u32 = 0x8100_0001;
+pub const DEFAULT_SEALED_HANDLE_DEV: u32 = 0x8100_1002;
+pub const DEFAULT_SEALED_HANDLE_SECURE: u32 = 0x8100_1003;
+pub const DEFAULT_SEALED_HANDLE: u32 = DEFAULT_SEALED_HANDLE_DEV;
 
 /// Config paths
 pub const TPM_DIR: &str = "/z/initos/tpm";
-pub const PRIMARY_HANDLE_PATH: &str = "/z/initos/tpm/tpm_primary";
-pub const SEALED_HANDLE_PATH: &str = "/z/initos/tpm/tpm_handle";
 const TPM_DEVICE: &str = "/dev/tpmrm0";
 
 const PW_AUTH_SIZE: u32 = 9; // 4+2+1+2
@@ -81,25 +81,6 @@ pub fn startup(dev: &mut (impl Read + Write)) -> Result<(), Box<dyn std::error::
     put_u16(&mut cmd, off, 0x0000); // TPM_SU_CLEAR
     let rsp = tpm_transact(dev, &cmd)?;
     check_response(&rsp, "Startup")
-}
-
-/// Read a hex handle from a file, falling back to a default.
-pub fn read_handle_file(path: &str, default: u32) -> Result<u32, Box<dyn std::error::Error>> {
-    match fs::read_to_string(path) {
-        Ok(s) => {
-            let s = s.trim();
-            let s = s
-                .strip_prefix("0x")
-                .or_else(|| s.strip_prefix("0X"))
-                .unwrap_or(s);
-            u32::from_str_radix(s, 16)
-                .map_err(|e| format!("bad handle in {}: '{}': {}", path, s, e).into())
-        }
-        Err(_) => {
-            eprintln!("tpm2: {} not found, using 0x{:08X}", path, default);
-            Ok(default)
-        }
-    }
 }
 
 /// Start an auth session (policy or trial).
