@@ -1,0 +1,39 @@
+name: Latest Nixpkgs Build
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: latest-nixpkgs
+  cancel-in-progress: false
+
+jobs:
+  build-latest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build with latest Nixpkgs
+        run: scripts/build-latest-nixpkgs.sh
+
+      - name: Show refreshed locks
+        if: always()
+        run: git diff -- flake.lock linux/flake.lock || true
+
+      - name: Upload refreshed locks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-nixpkgs-locks
+          path: |
+            flake.lock
+            linux/flake.lock
