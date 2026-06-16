@@ -85,8 +85,10 @@
         fsverity-utils
         gnugrep
         gawk
+        kmod
         mtools
         minisign
+        limine
         openssh
         openssl
         sbsigntool
@@ -104,12 +106,14 @@
         src = ./.;
         nativeBuildInputs = with pkgs; [
           cpio gzip erofs-utils mtools makeWrapper
-        ] ++ [ initos efi ];
+        ] ++ [ initos efi pkgs.limine ];
       } ''
         export out="$out"
         export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
+        export LIMINE_EFI="${pkgs.limine}/share/limine/BOOTX64.EFI"
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
+        export KERNEL_DIR="${linuxFlake.packages.${system}.kernel-host}/opt/kernel-image"
 
         bash $src/scripts/build.sh build_initos
         bash $src/scripts/build.sh build_boot

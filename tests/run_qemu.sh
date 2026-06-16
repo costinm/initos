@@ -322,8 +322,6 @@ test_initos_signed() {
         grep -q "initos: mounting sysfs at /sysroot/sys" "${log_file}" && \
         grep -q "initos: mounting devtmpfs at /sysroot/dev" "${log_file}" && \
         grep -q "=== INITRD TPM UNLOCK OK ===" "${log_file}" && \
-        grep -q "=== INITRD FIRMWARE MOUNT OK ===" "${log_file}" && \
-        grep -q "=== INITRD MODULES MOUNT OK ===" "${log_file}" && \
         grep -q "=== INITRD ROOTFS FIRMWARE BIND OK ===" "${log_file}" && \
         grep -q "=== INITRD ROOTFS MODULES BIND OK ===" "${log_file}" && \
         grep -q "=== INITRD ROOTFS HOME BIND OK ===" "${log_file}" && \

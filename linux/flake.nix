@@ -81,7 +81,12 @@
         allowImportFromDerivation = true;
       };
 
-      nvidiaOpen = (pkgs.linuxPackagesFor kernel).nvidiaPackages.stable.open;
+      nvidiaOpen = (pkgs.linuxPackagesFor kernel).nvidiaPackages.stable.open.overrideAttrs (old: {
+        nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.removeReferencesTo ];
+        postFixup = (old.postFixup or "") + ''
+          find "$out" -type f -name '*.ko' -exec remove-references-to -t ${kernel.dev} '{}' +
+        '';
+      });
 
       firmwarePackages = [
         pkgs.linux-firmware
@@ -115,6 +120,7 @@
         fi
 
         cp ${mergedConfig} "$out/opt/kernel-image/config"
+        cp ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build/scripts/sign-file "$out/opt/kernel-image/sign-file"
 
         moduleDir=${kernel.modules}/lib/modules/${kernel.modDirVersion}
         nvidiaModuleDir=${nvidiaOpen}/lib/modules/${kernel.modDirVersion}
@@ -130,7 +136,7 @@
             find ${nvidiaOpen} -maxdepth 4 -type f >&2
             exit 1
           fi
-          (cd "$combined" && mkfs.erofs -zlz4 "$out/opt/kernel-image/modules-${kernel.modDirVersion}.erofs" .)
+          cp -a "$combined" "$out/opt/kernel-image/modules-${kernel.modDirVersion}"
         fi
 
         firmwareRoot="$TMPDIR/firmware"

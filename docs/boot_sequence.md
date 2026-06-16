@@ -73,6 +73,7 @@ Initial initrd mounts and devices:
 
 - `/proc`: initrd procfs mount.
 - `/sys`: initrd sysfs mount, also used for block-device scanning.
+- `/sys/firmware/efi/efivars`: initrd efivarfs mount for SecureBoot detection when available.
 - `/dev`: initrd devtmpfs mount.
 - `/dev/disk/by-label/<label>`: preferred label lookup path.
 - `/dev/tpmrm0`: TPM resource manager device required for TPM unlock attempts.
@@ -147,10 +148,11 @@ Auto-detected init paths:
 6. Mount initrd pseudo-filesystems:
    - `proc` at `/proc`
    - `sysfs` at `/sys`
+   - `efivarfs` at `/sys/firmware/efi/efivars`
    - `devtmpfs` at `/dev`
-7. Resolve the state block device selected by `INITOS_DATA`.
-8. Mount the state device as ext4 at `/z`.
-9. Detect verified mode from EFI SecureBoot, falling back to `INITOS_PUB_KEY` if EFI state is unavailable.
+7. Detect verified mode from EFI SecureBoot, falling back to `INITOS_PUB_KEY` if EFI state is unavailable.
+8. Resolve the state block device selected by `INITOS_DATA`.
+9. Mount the state device as ext4 at `/z`.
 10. Unlock `/z/c` if needed.
 11. Mount the root filesystem at `/sysroot`.
 12. Bind `/z` to `/sysroot/z`.
@@ -314,6 +316,7 @@ The following filesystems are mounted under `/sysroot` before `switch_root`:
 
 - `proc` at `/sysroot/proc`
 - `sysfs` at `/sysroot/sys`
+- `efivarfs` at `/sysroot/sys/firmware/efi/efivars` when available
 - `devtmpfs` at `/sysroot/dev`
 - `devpts` at `/sysroot/dev/pts`
 - `tmpfs` at `/sysroot/dev/shm`

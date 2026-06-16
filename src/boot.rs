@@ -69,7 +69,12 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
             data
         );
 
-        for (fs, mp) in [("proc", "/proc"), ("sysfs", "/sys"), ("devtmpfs", "/dev")] {
+        for (fs, mp) in [
+            ("proc", "/proc"),
+            ("sysfs", "/sys"),
+            ("efivarfs", "/sys/firmware/efi/efivars"),
+            ("devtmpfs", "/dev"),
+        ] {
             match crate::mount::mount_pseudo_fs(fs, mp) {
                 Ok(_) => {}
                 Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
@@ -576,12 +581,34 @@ fn resolve_root_path(root_mount: &str, rel_path: &str) -> io::Result<PathBuf> {
 fn mount_system_filesystems(root_mount: &str) -> Result<(), Box<dyn std::error::Error>> {
     mount_pseudo_in_root(root_mount, "proc", "proc")?;
     mount_pseudo_in_root(root_mount, "sysfs", "sys")?;
+    mount_optional_pseudo_in_root(root_mount, "efivarfs", "sys/firmware/efi/efivars")?;
     mount_pseudo_in_root(root_mount, "devtmpfs", "dev")?;
     mount_fs_in_root(root_mount, "devpts", "dev/pts", "devpts")?;
     mount_fs_in_root(root_mount, "tmpfs", "dev/shm", "tmpfs")?;
     mount_fs_in_root(root_mount, "tmpfs", "run", "tmpfs")?;
     mount_fs_in_root(root_mount, "none", "sys/fs/cgroup", "cgroup2")?;
     mount_fs_in_root(root_mount, "tmpfs", "tmp", "tmpfs")?;
+    Ok(())
+}
+
+fn mount_optional_pseudo_in_root(
+    root_mount: &str,
+    fs_type: &str,
+    target_rel: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = Path::new(root_mount).join(target_rel);
+    let target_str = target
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", target.display()))?;
+    eprintln!("initos: mounting {} at {}", fs_type, target.display());
+    if let Err(e) = crate::mount::mount_pseudo_fs(fs_type, target_str) {
+        eprintln!(
+            "initos: failed to mount {} at {}: {}",
+            fs_type,
+            target.display(),
+            e
+        );
+    }
     Ok(())
 }
 

@@ -200,6 +200,142 @@ _build_fat_image() {
     echo "  Created: ${img_file} ($(du -h "${img_file}" | cut -f1))"
 }
 
+_sign_kernel_module() {
+    local sign_file="${1:?Usage: _sign_kernel_module <sign-file> <key> <cert> <module>}"
+    local key="${2:?Usage: _sign_kernel_module <sign-file> <key> <cert> <module>}"
+    local cert="${3:?Usage: _sign_kernel_module <sign-file> <key> <cert> <module>}"
+    local module="${4:?Usage: _sign_kernel_module <sign-file> <key> <cert> <module>}"
+
+    case "${module}" in
+        *.ko)
+            "${sign_file}" sha256 "${key}" "${cert}" "${module}"
+            ;;
+        *)
+            echo "ERROR: unsupported kernel module path: ${module}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_strip_kernel_module_signature() {
+    local module="${1:?Usage: _strip_kernel_module_signature <module>}"
+    local magic="~Module signature appended~"
+    local magic_len=28
+    local sig_info_len=12
+    local size sig_len_offset bytes sig_len unsigned_size
+
+    while [ "$(stat -c %s "${module}")" -ge $((magic_len + sig_info_len)) ] && \
+          tail -c "${magic_len}" "${module}" | cmp -s - <(printf '%s\n' "${magic}"); do
+        size=$(stat -c %s "${module}")
+        sig_len_offset=$((size - magic_len - 4))
+        bytes=$(dd if="${module}" bs=1 skip="${sig_len_offset}" count=4 status=none | od -An -t u1)
+        # shellcheck disable=SC2086
+        set -- ${bytes}
+        sig_len=$((($1 << 24) + ($2 << 16) + ($3 << 8) + $4))
+        unsigned_size=$((size - magic_len - sig_info_len - sig_len))
+        if [ "${unsigned_size}" -le 0 ] || [ "${unsigned_size}" -ge "${size}" ]; then
+            echo "ERROR: invalid existing kernel module signature trailer in ${module}" >&2
+            return 1
+        fi
+        truncate -s "${unsigned_size}" "${module}"
+    done
+}
+
+_print_module_signing_key_info() {
+    local cert="${1:?Usage: _print_module_signing_key_info <cert> <modules-stage>}"
+    local stage="${2:?Usage: _print_module_signing_key_info <cert> <modules-stage>}"
+
+    local db_serial db_subject_key_id db_pubkey_id
+    db_serial=$(
+        openssl x509 -in "${cert}" -noout -serial 2>/dev/null | \
+            sed 's/^serial=//' | \
+            sed 's/../&:/g; s/:$//'
+    )
+    db_subject_key_id=$(
+        openssl x509 -in "${cert}" -noout -ext subjectKeyIdentifier 2>/dev/null | \
+            awk 'NF && $0 !~ /Subject Key Identifier/ { gsub(/^[[:space:]]+/, ""); print; exit }'
+    )
+    db_pubkey_id=$(
+        openssl x509 -in "${cert}" -pubkey -noout 2>/dev/null | \
+            openssl pkey -pubin -outform DER 2>/dev/null | \
+            openssl dgst -sha256 2>/dev/null | \
+            sed 's/.*= //' | \
+            cut -c 1-16
+    )
+
+    echo "  db.crt serial: ${db_serial:-unknown}"
+    echo "  db.crt subject key id: ${db_subject_key_id:-unknown}"
+    echo "  db.crt pubkey sha256 id: ${db_pubkey_id:-unknown}"
+
+    if ! command -v modinfo >/dev/null 2>&1; then
+        echo "  module sig_key sample: skipped (modinfo not found)"
+        return 0
+    fi
+
+    local sample signer sig_key
+    sample=$(find "${stage}" -type f -path '*/fs/btrfs/btrfs.ko' -print -quit)
+    if [ -z "${sample}" ]; then
+        sample=$(find "${stage}" -type f -name '*.ko' -print -quit)
+    fi
+    if [ -z "${sample}" ]; then
+        echo "  module sig_key sample: skipped (no .ko files found)"
+        return 0
+    fi
+
+    signer=$(modinfo -F signer "${sample}" 2>/dev/null || true)
+    sig_key=$(modinfo -F sig_key "${sample}" 2>/dev/null || true)
+
+    echo "  module sample: ${sample#${stage}/}"
+    echo "  module signer: ${signer:-unknown}"
+    echo "  module sig_key: ${sig_key:-unknown}"
+}
+
+_build_signed_modules_image() {
+    local modules_src="${1:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
+    local kernel_dir="${2:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
+    local img_dir="${3:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
+    local sec_dir="${4:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
+
+    local modules_name sign_file stage count stripped before_size after_size
+    modules_name=$(basename "${modules_src}")
+    sign_file="${kernel_dir}/sign-file"
+    if [ ! -x "${sign_file}" ]; then
+        echo "ERROR: kernel module signer not found: ${sign_file}" >&2
+        return 1
+    fi
+
+    stage=$(mktemp -d)
+    cp -a "${modules_src}/." "${stage}/"
+    chmod -R u+w "${stage}"
+
+    if find "${stage}" -type f \( -name '*.ko.xz' -o -name '*.ko.zst' -o -name '*.ko.gz' \) | grep -q .; then
+        echo "ERROR: compressed kernel modules found in ${modules_src}; disable module compression in the kernel config" >&2
+        rm -rf "${stage}"
+        return 1
+    fi
+
+    count=0
+    stripped=0
+    while IFS= read -r -d '' module; do
+        before_size=$(stat -c %s "${module}")
+        _strip_kernel_module_signature "${module}"
+        after_size=$(stat -c %s "${module}")
+        if [ "${after_size}" -lt "${before_size}" ]; then
+            stripped=$((stripped + 1))
+        fi
+        _sign_kernel_module "${sign_file}" "${sec_dir}/db.key" "${sec_dir}/db.crt" "${module}"
+        count=$((count + 1))
+    done < <(find "${stage}" -type f -name '*.ko' -print0)
+
+    if [ "${stripped}" -gt 0 ]; then
+        echo "  Stripped existing signatures from ${stripped} kernel modules"
+    fi
+    echo "  Signed ${count} kernel modules with db.key"
+    _print_module_signing_key_info "${sec_dir}/db.crt" "${stage}"
+    mkfs.erofs -zlz4 "${img_dir}/${modules_name}.erofs" "${stage}"
+    rm -rf "${stage}"
+}
+
 # Sign a Nix artifact tree produced by .#initos-signer.
 # Usage: artifacts [artifact_dir] <output_dir> [secrets_dir]
 # If artifact_dir is omitted, it is auto-detected from the script's location.
@@ -265,10 +401,23 @@ artifacts() {
     chmod u+w "${output_dir}/img/initos.erofs"
     image "${output_dir}/img" "initos.erofs"
 
-    # Copy modules and firmware from kernel_dir to output
-    for m in "${kernel_dir}"/modules-*.erofs; do
-        [ -f "$m" ] && cp "$m" "${output_dir}/img/"
+    # Build signed module images from unpacked kernel modules when available.
+    # Fall back to copying prebuilt EROFS images for older kernel artifacts.
+    shopt -s nullglob
+    local module_dirs=()
+    local module_candidate module_dir
+    for module_candidate in "${kernel_dir}"/modules-*; do
+        [ -d "${module_candidate}" ] && module_dirs+=("${module_candidate}")
     done
+    for module_dir in "${module_dirs[@]}"; do
+        _build_signed_modules_image "${module_dir}" "${kernel_dir}" "${output_dir}/img" "${sec_dir}"
+    done
+    if [ "${#module_dirs[@]}" -eq 0 ]; then
+        for m in "${kernel_dir}"/modules-*.erofs; do
+            [ -f "$m" ] && cp "$m" "${output_dir}/img/"
+        done
+    fi
+    shopt -u nullglob
     if [ -f "${kernel_dir}/firmware.erofs" ]; then
         cp "${kernel_dir}/firmware.erofs" "${output_dir}/img/"
     fi

@@ -15,6 +15,9 @@
 #   INITOS_BIN    — path to pre-built initos binary
 #   EFI_BIN       — path to pre-built efi.efi binary
 #   USE_BUSYBOX   — path to static busybox binary
+#   LIMINE_EFI    — path to Limine BOOTX64.EFI
+#   KERNEL_BZIMAGE — path to a kernel bzImage
+#   KERNEL_DIR     — directory containing bzImage
 
 set -euo pipefail
 
@@ -32,8 +35,6 @@ fi
 
 PROFILE="release"
 MUSL_TARGET="x86_64-unknown-linux-musl"
-PREBUILT_BIN="${PROJECT_ROOT}/prebuilt/bin"
-PREBUILT_BOOT="${PROJECT_ROOT}/prebuilt/boot"
 TMPDIR="${TMPDIR:-/tmp}"
 
 cd "${src}"
@@ -67,18 +68,114 @@ _resolve_efi_bin() {
     fi
 }
 
-# Resolve busybox: env var > prebuilt > system
+# Resolve busybox: env var > system
 _resolve_busybox() {
     if [ -n "${USE_BUSYBOX:-}" ] && [ -f "${USE_BUSYBOX}" ]; then
         echo "${USE_BUSYBOX}"
-    elif [ -f "${PREBUILT_BIN}/busybox" ]; then
-        echo "${PREBUILT_BIN}/busybox"
     elif command -v busybox >/dev/null 2>&1; then
         command -v busybox
     else
         echo "ERROR: busybox not found. Set USE_BUSYBOX." >&2
         return 1
     fi
+}
+
+# Resolve Limine EFI binary: env var > limine package next to CLI
+_resolve_limine_efi() {
+    if [ -n "${LIMINE_EFI:-}" ] && [ -f "${LIMINE_EFI}" ]; then
+        echo "${LIMINE_EFI}"
+        return 0
+    fi
+
+    if command -v limine >/dev/null 2>&1; then
+        local limine_bin limine_root limine_efi
+        limine_bin="$(command -v limine)"
+        limine_root="$(cd "$(dirname "${limine_bin}")/.." && pwd)"
+        limine_efi="${limine_root}/share/limine/BOOTX64.EFI"
+        if [ -f "${limine_efi}" ]; then
+            echo "${limine_efi}"
+            return 0
+        fi
+    fi
+
+    echo "ERROR: Limine BOOTX64.EFI not found. Set LIMINE_EFI." >&2
+    return 1
+}
+
+_resolve_kernel_bzimage() {
+    if [ -n "${KERNEL_BZIMAGE:-}" ] && [ -f "${KERNEL_BZIMAGE}" ]; then
+        echo "${KERNEL_BZIMAGE}"
+        return 0
+    fi
+
+    if [ -n "${KERNEL_DIR:-}" ] && [ -f "${KERNEL_DIR}/bzImage" ]; then
+        echo "${KERNEL_DIR}/bzImage"
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "${out}/opt/kernel-image/bzImage" \
+        "${out}/img/bzImage" \
+        "${out}/linux/arch/x86/boot/bzImage" \
+        "${out}/linux/arch/x86_64/boot/bzImage" \
+        "${src}/target/nix/profiles/opt/kernel-image/bzImage" \
+        "${src}/result-kernel/opt/kernel-image/bzImage" \
+        "${src}/result-kernel/bzImage"; do
+        if [ -f "${candidate}" ]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    echo "ERROR: kernel bzImage not found. Run './scripts/build.sh kernel' first, or set KERNEL_BZIMAGE/KERNEL_DIR." >&2
+    return 1
+}
+
+_resolve_kernel_dir() {
+    if [ -n "${KERNEL_DIR:-}" ] && [ -f "${KERNEL_DIR}/bzImage" ]; then
+        echo "${KERNEL_DIR}"
+        return 0
+    fi
+
+    if [ -n "${KERNEL_BZIMAGE:-}" ] && [ -f "${KERNEL_BZIMAGE}" ]; then
+        dirname "${KERNEL_BZIMAGE}"
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "${out}/opt/kernel-image" \
+        "${src}/target/nix/profiles/opt/kernel-image" \
+        "${src}/result-kernel/opt/kernel-image" \
+        "${src}/result-kernel"; do
+        if [ -f "${candidate}/bzImage" ]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+_resolve_qemu_kernel_release() {
+    if [ -n "${INITOS_QEMU_KERNEL_RELEASE:-}" ]; then
+        echo "${INITOS_QEMU_KERNEL_RELEASE}"
+        return 0
+    fi
+
+    local kernel_dir
+    if kernel_dir=$(_resolve_kernel_dir); then
+        local module_dir
+        for module_dir in "${kernel_dir}"/modules-*; do
+            if [ -d "${module_dir}" ]; then
+                basename "${module_dir}" | sed 's/^modules-//'
+                return 0
+            fi
+        done
+    fi
+
+    echo "6.18.34"
 }
 
 # 1. Rust binaries: EFI loader and the helper binary.
@@ -100,10 +197,11 @@ _populate_staging() {
     busybox=$(_resolve_busybox)
 
     # Base rootfs and busybox in /opt/busybox
-    if [ ! -f "${staging_dir}/opt/busybox/bin/busybox" ]; then
+    if [ ! -f "${staging_dir}/opt/busybox/bin/busybox" ] || [ -L "${staging_dir}/opt/busybox/bin/busybox" ]; then
         mkdir -p "${staging_dir}"/{dev,dev/shm,proc,sys,sysroot,home,mnt,media/cdrom,media/usb,run,etc,tmp,x,data,z,a,nix,src,initos,boot/efi,var/cache,var/log,opt/initos/bin,opt/busybox/bin,usr/bin,usr/sbin,usr/lib,usr/lib64}
         mkdir -p "${staging_dir}"/usr/lib/modules "${staging_dir}"/usr/lib/firmware
 
+        rm -f "${staging_dir}/opt/busybox/bin/busybox"
         cp "${busybox}" "${staging_dir}/opt/busybox/bin/busybox"
         chmod 755 "${staging_dir}/opt/busybox/bin/busybox"
 
@@ -117,6 +215,7 @@ _populate_staging() {
         (
             cd "${staging_dir}/opt/busybox/bin"
             for applet in $(./busybox --list); do
+                [ "${applet}" = busybox ] && continue
                 ln -sf /opt/busybox/bin/busybox "$applet"
             done
         )
@@ -170,7 +269,9 @@ build_boot() {
     mkdir -p "${boot_path}/EFI/BOOT"
 
     # Copy Limine BOOTX64.EFI
-    cp "${src}/prebuilt/boot/EFI/BOOT/BOOTX64.EFI" "${boot_path}/EFI/BOOT/"
+    local limine_efi
+    limine_efi=$(_resolve_limine_efi)
+    cp "${limine_efi}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
 
     # Copy limine.conf
     cp "${src}/prebuilt/boot/EFI/BOOT/limine.conf" "${boot_path}/EFI/BOOT/"
@@ -179,6 +280,10 @@ build_boot() {
     local efi_bin
     efi_bin=$(_resolve_efi_bin)
     cp "${efi_bin}" "${boot_path}/EFI/BOOT/initos.EFI"
+
+    local kernel_bzimage
+    kernel_bzimage=$(_resolve_kernel_bzimage)
+    cp "${kernel_bzimage}" "${boot_path}/EFI/BOOT/bzImage"
 }
 
 # 3.2 Copy sidecar scripts and initos binary to artifacts/bin
@@ -231,7 +336,8 @@ build_qemu_test() {
 build_qemu_mount_fixtures() {
     local keys="${1:?Usage: build_qemu_mount_fixtures <keys-dir>}"
     local fixture_root="${out}/staging/qemu-mount-fixtures"
-    local kernel_release="${INITOS_QEMU_KERNEL_RELEASE:-6.18.34}"
+    local kernel_release
+    kernel_release=$(_resolve_qemu_kernel_release)
 
     mkdir -p "${ARTIFACTS}/img"
     rm -rf "${fixture_root}"
@@ -322,72 +428,6 @@ sign_qemu_efi() {
     "${src}/sidecar/bin/sign.sh" efi "${keys}" "${esp_dir}/"
 }
 
-install_limine_cli() {
-   
-    echo "=== Building limine CLI tool ==="
-
-    local limine_ver="12.3.1"
-    local work="${TMPDIR}/initos-deps-limine"
-    rm -rf "${work}"
-    mkdir -p "${work}"
-
-    cd "${work}"
-    echo "  Downloading limine ${limine_ver}..."
-    curl -sLO "https://github.com/limine-bootloader/limine/releases/download/v${limine_ver}/limine-${limine_ver}.tar.xz"
-    tar xf "limine-${limine_ver}.tar.xz"
-
-    cd "limine-${limine_ver}"
-    echo "  Configuring..."
-    OBJCOPY_FOR_TARGET=objcopy \
-    OBJDUMP_FOR_TARGET=objdump \
-    READELF_FOR_TARGET=readelf \
-        ./configure --prefix="${work}/install" \
-            CC_FOR_TARGET=gcc LD_FOR_TARGET=ld \
-            > /dev/null 2>&1
-
-    echo "  Building..."
-    make -j"$(nproc)" > /dev/null 2>&1
-
-    cp "bin/limine" "${PREBUILT_BIN}/"
-    chmod 755 "${PREBUILT_BIN}/limine"
-    echo "  Installed: limine ($("${PREBUILT_BIN}/limine" --version 2>&1 | head -1))"
-
-    rm -rf "${work}"
-    echo "  Done."
-}
-
-# ── limine bootloader EFI binaries ────────────────────────────────────
-
-install_limine_efi() {
-    local efi_file="${PREBUILT_BOOT}/EFI/BOOT/BOOTX64.EFI"
-    if ! $FORCE && [ -f "${efi_file}" ]; then
-        echo "  [SKIP] limine EFI already installed (use --force to re-download)"
-        return 0
-    fi
-
-    echo "=== Downloading limine bootloader EFI binaries ==="
-
-    local limine_ver="12.3.1"
-    local work="${TMPDIR}/initos-deps-limine-efi"
-    rm -rf "${work}"
-    mkdir -p "${work}"
-
-    cd "${work}"
-    curl -sLO "https://github.com/limine-bootloader/limine/releases/download/v${limine_ver}/limine-binary.tar.xz"
-    tar xf limine-binary.tar.xz
-
-    # Only copy the x86_64 EFI binary (we use UEFI boot).
-    cp limine-binary/BOOTX64.EFI "${PREBUILT_BOOT}/EFI/BOOT/BOOTX64.EFI"
-    chmod 644 "${PREBUILT_BOOT}/EFI/BOOT/BOOTX64.EFI"
-    echo "  Installed: limine BOOTX64.EFI (v${limine_ver})"
-
-    # Also keep a copy of limine.c for reference.
-    cp limine-binary/limine.c "${PREBUILT_BOOT}/EFI/BOOT/limine.h"
-
-    rm -rf "${work}"
-    echo "  Done."
-}
-
 ### Kernel and firmware targets.
 # These run in the current environment. Use scripts/container_build.sh for
 # container orchestration.
@@ -450,14 +490,9 @@ test() {
 if [[ $# -gt 0 ]]; then
     "$@"
 else
-    keys="${src}/prebuilt/testdata/uefi-keys"
-    pub_key=$(_read_image_pub_key "${keys}")
     build_rust
     build_initos
     build_boot
     build_bin
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
     build_qemu_test
 fi

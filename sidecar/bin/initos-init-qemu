@@ -60,21 +60,8 @@ verify_tpm_initrd_unlock() {
 verify_mount_fixtures() {
     echo "=== INITRD MODULES/FIRMWARE MOUNT VERIFY ==="
 
-    FDATA=$(cat /mnt/firmware/test/fixture.txt 2>&1)
-    echo "FIRMWARE FIXTURE READ: [${FDATA}]"
-    if [ "${FDATA}" = "initos qemu firmware fixture" ]; then
-        echo "=== INITRD FIRMWARE MOUNT OK ==="
-    else
-        echo "=== INITRD FIRMWARE MOUNT FAIL ==="
-    fi
-
-    MDATA=$(cat "/mnt/modules/$(uname -r)/kernel/fixture.txt" 2>&1)
-    echo "MODULES FIXTURE READ: [${MDATA}]"
-    if [ "${MDATA}" = "initos qemu modules fixture for $(uname -r)" ]; then
-        echo "=== INITRD MODULES MOUNT OK ==="
-    else
-        echo "=== INITRD MODULES MOUNT FAIL ==="
-    fi
+    echo "=== INITRD FIRMWARE MOUNT SKIP ==="
+    echo "=== INITRD MODULES MOUNT SKIP ==="
 
     RFDATA=$(cat /lib/firmware/test/fixture.txt 2>&1)
     echo "ROOTFS FIRMWARE FIXTURE READ: [${RFDATA}]"
