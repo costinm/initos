@@ -124,17 +124,84 @@ pub fn cmd_encrypt() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Decrypt stdin using age with scrypt passphrase from KEY env var, or x25519 from ID env var, KEY_FILE.
+/// Decrypt stdin or file using age with scrypt passphrase from KEY env var, or x25519 from ID env var, KEY_FILE, CLI argument, or password prompt.
 pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Read;
     use std::str::FromStr;
 
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut identities_files = Vec::new();
+    let mut output_file = Option::<String>::None;
+    let mut input_file = Option::<String>::None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" => {
+                if i + 1 < args.len() {
+                    identities_files.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err("missing argument for -i".into());
+                }
+            }
+            "-o" => {
+                if i + 1 < args.len() {
+                    output_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err("missing argument for -o".into());
+                }
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("unknown option: {}", other).into());
+                }
+                if input_file.is_some() {
+                    return Err("multiple input files specified".into());
+                }
+                input_file = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
     let mut identities: Vec<Box<dyn age::Identity>> = Vec::new();
 
+    // Try identities from command line -i arguments
+    for id_path in &identities_files {
+        if let Ok(content) = fs::read_to_string(id_path) {
+            let mut found = false;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Ok(identity) = age::x25519::Identity::from_str(line) {
+                    identities.push(Box::new(identity));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(format!("no valid identities found in file '{}'", id_path).into());
+            }
+        } else {
+            // Try parsing string directly as x25519 identity
+            if let Ok(identity) = age::x25519::Identity::from_str(id_path) {
+                identities.push(Box::new(identity));
+            } else {
+                return Err(format!("failed to read identity file or parse identity from '{}'", id_path).into());
+            }
+        }
+    }
+
     // Try scrypt passphrase from KEY environment variable
-    if let Ok(pass) = env::var("KEY") {
-        if !pass.is_empty() {
-            identities.push(Box::new(age::scrypt::Identity::new(pass.into())));
+    if identities.is_empty() {
+        if let Ok(pass) = env::var("KEY") {
+            if !pass.is_empty() {
+                identities.push(Box::new(age::scrypt::Identity::new(pass.into())));
+            }
         }
     }
 
@@ -169,11 +236,15 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Read all data from stdin
+    // Read ciphertext from file or stdin
     let mut cipher = Vec::new();
-    io::stdin().read_to_end(&mut cipher)?;
+    if let Some(ref path) = input_file {
+        cipher = fs::read(path).map_err(|e| format!("failed to read input file '{}': {}", path, e))?;
+    } else {
+        io::stdin().read_to_end(&mut cipher)?;
+    }
 
-    // If no identity from env vars, try parsing first line of stdin as x25519 identity
+    // If no identity resolved yet, try parsing first line of ciphertext as x25519 identity
     if identities.is_empty() {
         if let Some(nl_pos) = cipher.iter().position(|&b| b == b'\n') {
             let first_line = &cipher[..nl_pos];
@@ -183,6 +254,17 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
                 // Use remaining data after the newline as ciphertext
                 cipher.drain(..=nl_pos);
             }
+        }
+    }
+
+    // If still empty and an input file is specified, prompt for a password
+    if identities.is_empty() {
+        if input_file.is_some() {
+            let pass = read_secret("Enter passphrase: ")?;
+            if pass.is_empty() {
+                return Err("passphrase is empty".into());
+            }
+            identities.push(Box::new(age::scrypt::Identity::new(pass.into())));
         }
     }
 
@@ -203,9 +285,15 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
     reader
         .read_to_end(&mut result)
         .map_err(|e| format!("read: {}", e))?;
-    io::stdout()
-        .write_all(&result)
-        .map_err(|e| format!("write: {}, bytes={}", e, result.len()))?;
+
+    if let Some(ref path) = output_file {
+        fs::write(path, &result)
+            .map_err(|e| format!("failed to write output file '{}': {}", path, e))?;
+    } else {
+        io::stdout()
+            .write_all(&result)
+            .map_err(|e| format!("write: {}, bytes={}", e, result.len()))?;
+    }
     Ok(())
 }
 
@@ -303,7 +391,10 @@ pub fn print_help() {
     eprintln!("  fscrypt <PATH>                Add encryption key to filesystem keyring (unlock)");
     eprintln!("  fscrypt-setup <DIR>           Add key to keyring + set encryption policy");
     eprintln!("  encrypt [RECIPIENT...]        Encrypt stdin using age to x25519 recipients");
-    eprintln!("  decrypt                       Decrypt stdin using age with identity from KEY_FILE or KEY");
+    eprintln!("  decrypt [FILE] [-i KEY] [-o OUT]");
+    eprintln!(
+        "                                Decrypt file or stdin using age with identity from KEY_FILE, KEY, or CLI"
+    );
     eprintln!("  recovery-encrypt <SECRET> [PUB_KEY]");
     eprintln!(
         "                                Encrypt a secret for recovery using an Ed25519 public key"

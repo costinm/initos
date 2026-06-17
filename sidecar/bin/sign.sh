@@ -336,6 +336,111 @@ _build_signed_modules_image() {
     rm -rf "${stage}"
 }
 
+_kernel_cert_der() {
+    local sec_dir="${1:?Usage: _kernel_cert_der <secrets-dir> <out-cert>}"
+    local out_cert="${2:?Usage: _kernel_cert_der <secrets-dir> <out-cert>}"
+
+    if [ -f "${sec_dir}/db.cer" ]; then
+        cp "${sec_dir}/db.cer" "${out_cert}"
+    elif [ -f "${sec_dir}/db.crt" ]; then
+        openssl x509 -in "${sec_dir}/db.crt" -outform DER -out "${out_cert}"
+    else
+        echo "ERROR: db.cer or db.crt not found in ${sec_dir}" >&2
+        return 1
+    fi
+}
+
+_build_personalized_kernel_bzimage() {
+    local kernel_dir="${1:?Usage: _build_personalized_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
+    local sec_dir="${2:?Usage: _build_personalized_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
+    local output_bzimage="${3:?Usage: _build_personalized_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
+
+    if [ ! -x "${kernel_dir}/insert-sys-cert" ] || [ ! -f "${kernel_dir}/vmlinux" ]; then
+        echo "ERROR: kernel_dir must contain insert-sys-cert and vmlinux for cert personalization" >&2
+        return 1
+    fi
+    if [ ! -d "${kernel_dir}/build" ]; then
+        echo "ERROR: kernel_dir must contain build tree for personalized bzImage generation" >&2
+        return 1
+    fi
+    if [ ! -d "${kernel_dir}/source" ]; then
+        echo "ERROR: kernel_dir must contain kernel source tree for personalized bzImage generation" >&2
+        return 1
+    fi
+
+    local stage cert
+    stage=$(mktemp -d)
+    mkdir -p "$(dirname "${output_bzimage}")"
+    cert="${stage}/db.cer"
+    _kernel_cert_der "${sec_dir}" "${cert}"
+
+    echo "  Personalizing kernel trusted cert with ${cert}" >&2
+    local build_tree source_tree
+    build_tree=$(readlink -f "${kernel_dir}/build")
+    cp -a "${build_tree}/." "${stage}/build/"
+    chmod -R u+w "${stage}/build"
+    if [ -e "${stage}/build/source" ]; then
+        source_tree="${stage}/build/source"
+    else
+        ln -s "${kernel_dir}/source" "${stage}/build/source"
+        source_tree="${stage}/build/source"
+    fi
+    cp "${kernel_dir}/vmlinux" "${stage}/build/vmlinux"
+    chmod u+w "${stage}/build/vmlinux"
+
+    local srctree objtree
+    srctree=$(cd "${source_tree}" && pwd -P)
+    objtree="${stage}/build"
+
+    "${kernel_dir}/insert-sys-cert" -b "${objtree}/vmlinux" -c "${cert}" >&2
+    make -C "${objtree}" \
+        -f "${srctree}/scripts/Makefile.build" \
+        srctree="${srctree}" \
+        objtree="${objtree}" \
+        src="${srctree}/arch/x86/boot" \
+        VPATH="${srctree}" \
+        KBUILD_SRC="${srctree}" \
+        ARCH=x86 \
+        KBUILD_NOCMDDEP=1 \
+        obj=arch/x86/boot \
+        arch/x86/boot/bzImage >&2
+    cp "${stage}/build/arch/x86/boot/bzImage" "${output_bzimage}"
+    rm -rf "${stage}"
+}
+
+_copy_kernel_bzimage() {
+    local kernel_dir="${1:?Usage: _copy_kernel_bzimage <kernel-dir> <output-bzimage>}"
+    local output_bzimage="${2:?Usage: _copy_kernel_bzimage <kernel-dir> <output-bzimage>}"
+
+    if [ ! -f "${kernel_dir}/bzImage" ]; then
+        echo "ERROR: kernel_dir must contain bzImage" >&2
+        return 1
+    fi
+
+    mkdir -p "$(dirname "${output_bzimage}")"
+    cp "${kernel_dir}/bzImage" "${output_bzimage}"
+}
+
+_prepare_kernel_bzimage() {
+    local kernel_dir="${1:?Usage: _prepare_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
+    local sec_dir="${2:?Usage: _prepare_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
+    local output_bzimage="${3:?Usage: _prepare_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
+    local mode="${KERNEL_BZIMAGE_MODE:-prebuilt}"
+
+    case "${mode}" in
+        prebuilt|copy|bzImage)
+            _copy_kernel_bzimage "${kernel_dir}" "${output_bzimage}"
+            ;;
+        insert-sys-cert|personalized)
+            _build_personalized_kernel_bzimage "${kernel_dir}" "${sec_dir}" "${output_bzimage}"
+            ;;
+        *)
+            echo "ERROR: unknown KERNEL_BZIMAGE_MODE=${mode}; expected prebuilt or insert-sys-cert" >&2
+            return 1
+            ;;
+    esac
+}
+
 # Sign a Nix artifact tree produced by .#initos-signer.
 # Usage: artifacts [artifact_dir] <output_dir> [secrets_dir]
 # If artifact_dir is omitted, it is auto-detected from the script's location.
@@ -395,6 +500,9 @@ artifacts() {
     fi
 
     sign_init
+    local personalized_bzimage
+    personalized_bzimage="${output_dir}/kernel/bzImage"
+    _prepare_kernel_bzimage "${kernel_dir}" "${sec_dir}" "${personalized_bzimage}"
 
     # Copy initos.erofs to output
     cp "${artifact_dir}/img/initos.erofs" "${output_dir}/img/"
@@ -445,10 +553,7 @@ artifacts() {
     fi
     chmod -R u+w "${boot_stage}"
 
-    # Resolve and copy kernel bzImage
-    if [ -f "${kernel_dir}/bzImage" ]; then
-        cp "${kernel_dir}/bzImage" "${boot_stage}/EFI/BOOT/bzImage"
-    fi
+    cp "${personalized_bzimage}" "${boot_stage}/EFI/BOOT/bzImage"
 
     local pub_key
     pub_key=$(_require_image_pub_key "${sec_dir}")

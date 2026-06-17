@@ -79,19 +79,26 @@
       # ── Runtime deps for signing ────────────────────────────────────────
       signRuntimeDeps = with pkgs; [
         coreutils
+        bc
+        binutils
+        bison
+        flex
         gnused
         efitools
         findutils
         fsverity-utils
         gnugrep
         gawk
+        gnumake
         kmod
         mtools
         minisign
         limine
         openssh
         openssl
+        perl
         sbsigntool
+        stdenv.cc
         tinyxxd
         util-linux
       ];

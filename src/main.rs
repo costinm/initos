@@ -15,7 +15,8 @@
 //!   verify <IMG>           Verify fsverity digest + .sig signature of an image
 //!   efi                    Read EFI variables (SecureBoot, BootCurrent, db)
 //!   encrypt [ARGS]         Encrypt stdin using age to x25519 recipients (args).
-//!   decrypt                Decrypt stdin using age with x25519 identity from KEY_FILE or KEY
+//!   decrypt [FILE] [-i KEY] [-o OUT]
+//!                          Decrypt file or stdin using age with identity from KEY_FILE, KEY, or CLI
 //!   recovery-encrypt <SECRET> [PUB_KEY]
 //!                          Encrypt a secret for recovery using an Ed25519 public key.
 //!
@@ -726,6 +727,167 @@ mod tests {
             output
         );
         assert_eq!(&output.stdout[..], plaintext);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_input_file_with_env_key() -> Result<(), Box<dyn std::error::Error>> {
+        let plaintext = b"decrypt input file with env key test";
+        let pass = "envkeytestpassphrase";
+
+        let recip = age::scrypt::Recipient::new(pass.into());
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recip as &dyn age::Recipient))?;
+        let mut encrypted = Vec::new();
+        let mut w = encryptor.wrap_output(&mut encrypted)?;
+        w.write_all(plaintext)?;
+        w.finish()?;
+
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+
+        let status = Command::new(initos_binary()?)
+            .env("KEY", pass)
+            .args(["decrypt", cipher_file.path().to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let output = status.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "initos decrypt with input file + KEY failed: {:?}",
+            output
+        );
+        assert_eq!(&output.stdout[..], plaintext);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_with_flags_i_and_o() -> Result<(), Box<dyn std::error::Error>> {
+        let (identity_str, recipient) = gen_keypair();
+        let plaintext = b"test decrypt with -i and -o flags";
+        let encrypted = encrypt_for_test(&recipient, plaintext)?;
+
+        // Create identity temp file
+        let mut key_file = NamedTempFile::new()?;
+        key_file.write_all(identity_str.as_bytes())?;
+        key_file.flush()?;
+
+        // Create input cipher temp file
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+
+        // Output temp file path
+        let output_file = NamedTempFile::new()?;
+        let output_path = output_file.path().to_path_buf();
+        drop(output_file); // delete it so we can verify initos creates it
+
+        let status = Command::new(initos_binary()?)
+            .args([
+                "decrypt",
+                "-i",
+                key_file.path().to_str().unwrap(),
+                "-o",
+                output_path.to_str().unwrap(),
+                cipher_file.path().to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let output = status.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "initos decrypt with -i and -o failed: {:?}",
+            output
+        );
+
+        let decrypted = std::fs::read(&output_path)?;
+        assert_eq!(&decrypted[..], plaintext);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_with_i_key_string() -> Result<(), Box<dyn std::error::Error>> {
+        let (identity_str, recipient) = gen_keypair();
+        let plaintext = b"test decrypt with direct -i key string";
+        let encrypted = encrypt_for_test(&recipient, plaintext)?;
+
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+
+        let status = Command::new(initos_binary()?)
+            .args([
+                "decrypt",
+                "-i",
+                &identity_str,
+                cipher_file.path().to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let output = status.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "initos decrypt with direct key string failed: {:?}",
+            output
+        );
+        assert_eq!(&output.stdout[..], plaintext);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires initos binary to be in PATH or set INITOS_BINARY"]
+    fn test_decrypt_file_prompt_for_password() -> Result<(), Box<dyn std::error::Error>> {
+        let pass = "promptpass123";
+        let plaintext = b"prompt compatible test for decrypt";
+
+        let recip = age::scrypt::Recipient::new(pass.into());
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recip as &dyn age::Recipient))?;
+        let mut encrypted = Vec::new();
+        let mut w = encryptor.wrap_output(&mut encrypted)?;
+        w.write_all(plaintext)?;
+        w.finish()?;
+
+        let mut cipher_file = NamedTempFile::new()?;
+        cipher_file.write_all(&encrypted)?;
+        cipher_file.flush()?;
+
+        let output_file = NamedTempFile::new()?;
+        let output_path = output_file.path().to_path_buf();
+        drop(output_file);
+
+        let cmd = format!(
+            "{} decrypt -o {} {}",
+            initos_binary()?.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            cipher_file.path().to_str().unwrap()
+        );
+
+        let mut p = rexpect::spawn(&cmd, Some(2000))
+            .unwrap_or_else(|e| panic!("Failed to run initos via rexpect: {}", e));
+
+        p.exp_regex("Enter passphrase.*")
+            .unwrap_or_else(|e| panic!("Failed to match passphrase prompt: {}", e));
+        p.send_line(pass).unwrap();
+
+        p.exp_eof()
+            .unwrap_or_else(|e| panic!("Failed expecting EOF: {}", e));
+
+        let decrypted = std::fs::read(&output_path)?;
+        assert_eq!(&decrypted[..], plaintext);
         Ok(())
     }
 }

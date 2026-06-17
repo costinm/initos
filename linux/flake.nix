@@ -19,6 +19,12 @@
       baseKernel = pkgs.linuxKernel.kernels.linux_6_18;
       src = ./.;
       branch = "6.18";
+      kernelPatchFiles = [
+        ./patches/module-signing-use-platform-keyring.patch
+      ];
+      applyKernelPatchCommands = lib.concatMapStringsSep "\n" (patchFile: ''
+        patch -p1 < ${patchFile}
+      '') kernelPatchFiles;
 
       configFragments = [
         "builtins.fragment"
@@ -74,12 +80,27 @@
         cp "$buildRoot/.config" "$out"
       '';
 
-      kernel = pkgs.linuxKernel.manualConfig {
+      kernelBase = pkgs.linuxKernel.manualConfig {
         pname = "initos-kernel-host";
         inherit (baseKernel) version src modDirVersion;
         configfile = mergedConfig;
         allowImportFromDerivation = true;
       };
+      kernel = kernelBase.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ kernelPatchFiles;
+        postInstall = (old.postInstall or "") + ''
+          bootBuild="$dev/lib/modules/${baseKernel.modDirVersion}/build"
+          mkdir -p "$bootBuild/arch/x86" "$bootBuild/drivers/firmware/efi"
+          if [ -d "$buildRoot/arch/x86/boot" ]; then
+            rm -rf "$bootBuild/arch/x86/boot"
+            cp -a "$buildRoot/arch/x86/boot" "$bootBuild/arch/x86/boot"
+          fi
+          if [ -d "$buildRoot/drivers/firmware/efi/libstub" ]; then
+            rm -rf "$bootBuild/drivers/firmware/efi/libstub"
+            cp -a "$buildRoot/drivers/firmware/efi/libstub" "$bootBuild/drivers/firmware/efi/libstub"
+          fi
+        '';
+      });
 
       nvidiaOpen = (pkgs.linuxPackagesFor kernel).nvidiaPackages.stable.open.overrideAttrs (old: {
         nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.removeReferencesTo ];
@@ -102,7 +123,7 @@
       '') firmwarePackages;
 
       kernel-host = pkgs.runCommand "initos-kernel-host" {
-        nativeBuildInputs = [ pkgs.erofs-utils ];
+        nativeBuildInputs = [ pkgs.erofs-utils pkgs.patch pkgs.stdenv.cc ];
         passthru = {
           inherit kernel mergedConfig nvidiaOpen firmwarePackages;
         };
@@ -121,6 +142,24 @@
 
         cp ${mergedConfig} "$out/opt/kernel-image/config"
         cp ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build/scripts/sign-file "$out/opt/kernel-image/sign-file"
+        if [ -f ${kernel.dev}/vmlinux ]; then
+          cp ${kernel.dev}/vmlinux "$out/opt/kernel-image/vmlinux"
+        else
+          echo "ERROR: kernel dev output does not contain vmlinux" >&2
+          exit 1
+        fi
+
+        insertSrc="$TMPDIR/insert-sys-cert-src"
+        mkdir -p "$insertSrc"
+        tar -xf ${baseKernel.src} -C "$insertSrc" \
+          linux-${baseKernel.version}/scripts/insert-sys-cert.c
+        cc -O2 \
+          "$insertSrc/linux-${baseKernel.version}/scripts/insert-sys-cert.c" \
+          -o "$out/opt/kernel-image/insert-sys-cert"
+        mkdir -p "$out/opt/kernel-image/source"
+        tar -xf ${baseKernel.src} -C "$out/opt/kernel-image/source" --strip-components=1
+        (cd "$out/opt/kernel-image/source" && ${applyKernelPatchCommands})
+        ln -s ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build "$out/opt/kernel-image/build"
 
         moduleDir=${kernel.modules}/lib/modules/${kernel.modDirVersion}
         nvidiaModuleDir=${nvidiaOpen}/lib/modules/${kernel.modDirVersion}
