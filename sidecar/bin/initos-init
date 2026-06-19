@@ -30,6 +30,16 @@ lfatal() {
   reboot -f
 }
 
+secure_boot_enabled() {
+  for f in /sys/firmware/efi/efivars/SecureBoot-*; do
+    [ -e "$f" ] || return 1
+    val=$(dd if="$f" bs=1 skip=4 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+    [ "$val" = "1" ]
+    return
+  done
+  return 1
+}
+
 # ovl mounts an image named $1 from /z/img/$n.erofs to /z/a/$n 
 # as overlayfs. RW data will be in /z/initos/rw/$n
 # 
@@ -449,7 +459,7 @@ export TPM_DIR=/z/initos/tpm
 #### Entry point
 
 if [ "$$" = "1" ] && [ $# -eq 0 ]; then
-  if [ -z "$INITOS_PUB_KEY" ]; then
+  if ! secure_boot_enabled; then
     echo "Unlocked boot (debugging post-pivot init)"
     
     # Temp: shell to verify the setup done in rust.

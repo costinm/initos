@@ -147,6 +147,16 @@ sign_hex_digest() {
 
 # --- Full pipeline ---
 
+db_key_id() {
+    local cert="${1:?Usage: db_key_id <cert>}"
+
+    openssl x509 -in "${cert}" -pubkey -noout 2>/dev/null | \
+        openssl pkey -pubin -pubout -outform DER 2>/dev/null | \
+        openssl dgst -sha256 | \
+        sed 's/.*= //' | \
+        cut -c 1-16
+}
+
 
 
 # Sign artifacts without natively enabling fs-verity (computes digest offline).
@@ -173,6 +183,15 @@ image() {
     sign_digest "${digest_bin}" \
       "${SECRETS}/image_key.pem" \
       "${img_name}.sig"
+
+    if [ -f "${SECRETS}/db.key" ]; then
+        local key_id
+        key_id=$(db_key_id "${SECRETS}/db.crt")
+        openssl dgst -sha256 -sign "${SECRETS}/db.key" \
+            -out "${img_name}.${key_id}.db.sig" \
+            "${digest_bin}"
+        echo "  DB signature: ${img_name}.${key_id}.db.sig"
+    fi
     rm -f "${digest_bin}"
 }
 
@@ -555,13 +574,10 @@ artifacts() {
 
     cp "${personalized_bzimage}" "${boot_stage}/EFI/BOOT/bzImage"
 
-    local pub_key
-    pub_key=$(_require_image_pub_key "${sec_dir}")
-
     # Build the three boot variants from the staging area
     build_boot_limine_unsigned "${boot_stage}" "${output_dir}" "${sec_dir}"
-    build_boot_initos_signed "${boot_stage}" "${output_dir}" "${sec_dir}" "${pub_key}"
-    build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}" "${pub_key}"
+    build_boot_initos_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
+    build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
 
     rm -rf "${boot_stage}"
 }
@@ -606,18 +622,6 @@ _safe_cp() {
             cp "$src_file" "$dest_file"
         fi
     fi
-}
-
-_require_image_pub_key() {
-    local sec_dir="${1:?Usage: _require_image_pub_key <secrets_dir>}"
-    local pub_key_file="${sec_dir}/image_key.pub.b64"
-
-    if [ ! -s "${pub_key_file}" ]; then
-        echo "ERROR: ${pub_key_file} is not present or empty (required for INITOS_PUB_KEY)" >&2
-        exit 1
-    fi
-
-    tr -d '\r\n' < "${pub_key_file}"
 }
 
 _copy_uefi_public_keys() {
@@ -680,16 +684,10 @@ build_boot_limine_unsigned() {
 }
 
 build_boot_limine_signed() {
-    local artifact_dir="${1:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
-    local output_dir="${2:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
+    local artifact_dir="${1:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir]}"
+    local output_dir="${2:?Usage: build_boot_limine_signed <artifact_dir> <output_dir> [secrets_dir]}"
     local sec_dir="${3:-${SECRETS:-/var/run/secrets/uefi-keys}}"
-    local pub_key="${4:-}"
     local SECRETS="${sec_dir}"
-
-    if [ -z "${pub_key}" ]; then
-        echo "ERROR: INITOS_PUB_KEY is not present (required for build_boot_limine_signed)" >&2
-        exit 1
-    fi
 
     local boot_path=$(mktemp -d)
     echo "=== Building limine-signed boot ==="
@@ -709,7 +707,7 @@ build_boot_limine_signed() {
     sha_kernel=$(b2sum "${boot_path}/EFI/BOOT/bzImage" | awk '{print $1}')
     sha_initrd=$(b2sum "${boot_path}/EFI/BOOT/initrd.img" | awk '{print $1}')
 
-    local cmdline="${INITOS_CMDLINE:-console=ttyS0,115200 console=tty1 net.ifnames=0 panic=5 loglevel=6} INITOS_PUB_KEY=${pub_key}"
+    local cmdline="${INITOS_CMDLINE:-rdinit=/init console=tty1 console=ttyS0,115200 console=hvc0 net.ifnames=0 panic=5 loglevel=6}"
     cat > "${boot_path}/EFI/BOOT/limine.conf" <<LIMINECFG
 timeout: 2
 serial: yes
@@ -750,17 +748,11 @@ LIMINECFG
 }
 
 build_boot_initos_signed() {
-    local artifact_dir="${1:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
-    local output_dir="${2:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir] <pub_key>}"
+    local artifact_dir="${1:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir]}"
+    local output_dir="${2:?Usage: build_boot_initos_signed <artifact_dir> <output_dir> [secrets_dir]}"
     local sec_dir="${3:-${SECRETS:-/var/run/secrets/uefi-keys}}"
-    local pub_key="${4:-}"
     
     local SECRETS="${sec_dir}"
-
-    if [ -z "${pub_key}" ]; then
-        echo "ERROR: INITOS_PUB_KEY is not present (required for build_boot_initos_signed)" >&2
-        exit 1
-    fi
 
     local boot_path=$(mktemp -d)
     
@@ -779,7 +771,7 @@ build_boot_initos_signed() {
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
     
-    local cmdline="${INITOS_CMDLINE:-console=tty1 loglevel=6 net.ifnames=0 panic=5} INITOS_PUB_KEY=${pub_key}"
+    local cmdline="${INITOS_CMDLINE:-rdinit=/init console=tty1 console=ttyS0,115200 console=hvc0 loglevel=6 net.ifnames=0 panic=5}"
 
     printf '%s\n' "${cmdline}" > "${boot_path}/EFI/BOOT/config"
 
@@ -790,11 +782,8 @@ build_boot_initos_signed() {
            --output "${signed}" \
            "${boot_path}/EFI/BOOT/initos.EFI"
     
-    local key_id=$(openssl x509 -in "${sec_dir}/db.crt" -pubkey -noout 2>/dev/null | \
-            openssl rsa -pubin -outform DER 2>/dev/null |  \
-            openssl dgst -sha256 | \
-            sed 's/.*= //' | \
-            cut -c 1-16)
+    local key_id
+    key_id=$(db_key_id "${sec_dir}/db.crt")
 
     echo "  Signing with db.key (KEY_ID: ${key_id})..."
 
@@ -834,9 +823,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "  artifacts <out_dir> [artifact_dir] Sign a Nix artifact tree"
         echo "  build_dmverity_boot               Build dm-verity boot config"
         echo "  build_boot_limine_unsigned <artifact_dir> <output_dir> [keys]"
-        echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys] [pub_key]"
+        echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys]"
         echo "  build_boot_initos_unsigned <artifact_dir> <output_dir>"
-        echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys] [pub_key]"
+        echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys]"
         exit 0
     fi
     "$@"

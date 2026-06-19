@@ -27,8 +27,12 @@ const EFI_CERT_X509_GUID: [u8; 16] = [
 /// An X.509 certificate extracted from an EFI Signature List.
 #[derive(Debug)]
 pub struct EfiCert {
+    /// First 16 lowercase hex chars of SHA-256(SubjectPublicKeyInfo DER).
+    pub key_id: String,
     /// Base64-encoded SubjectPublicKeyInfo (DER).
     pub public_key_b64: String,
+    /// Base64-encoded RSA public key (PKCS#1 DER) from SubjectPublicKeyInfo.
+    pub rsa_public_key_b64: String,
     /// Subject Common Name.
     pub cn: String,
     /// Subject Alternative Names (formatted strings like "DNS:example.com").
@@ -193,6 +197,7 @@ fn parse_x509_cert(der_bytes: &[u8]) -> io::Result<EfiCert> {
         .to_der()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("SPKI DER: {}", e)))?;
     let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(&spki_der);
+    let key_id = public_key_id(&spki_der);
 
     // Extract Subject CN
     let cn = extract_cn(&tbs.subject);
@@ -200,11 +205,33 @@ fn parse_x509_cert(der_bytes: &[u8]) -> io::Result<EfiCert> {
     // Extract SANs from extensions
     let sans = extract_sans(tbs);
 
+    let rsa_public_key_b64 = tbs
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+        .unwrap_or_default();
+
     Ok(EfiCert {
+        key_id,
         public_key_b64,
+        rsa_public_key_b64,
         cn,
         sans,
     })
+}
+
+fn public_key_id(spki_der: &[u8]) -> String {
+    use std::fmt::Write;
+
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(spki_der);
+    let mut key_id = String::with_capacity(16);
+    for b in &digest[..8] {
+        let _ = write!(&mut key_id, "{:02x}", b);
+    }
+    key_id
 }
 
 /// Extract the Common Name from an X.509 Name (RDN sequence).

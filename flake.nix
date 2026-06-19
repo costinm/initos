@@ -131,6 +131,45 @@
         rmdir $out/artifacts
       '';
 
+      directBootInitrd = pkgs.runCommand "initos-direct-boot-initrd" {
+        src = ./.;
+        nativeBuildInputs = with pkgs; [
+          cpio gzip erofs-utils mtools makeWrapper
+        ] ++ [ initos efi pkgs.limine ];
+      } ''
+        finalOut="$out"
+        buildOut="$TMPDIR/initos-direct-boot-initrd-build"
+        export out="$buildOut"
+        export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
+        export LIMINE_EFI="${pkgs.limine}/share/limine/BOOTX64.EFI"
+        export INITOS_BIN="${initos}/bin/initos"
+        export EFI_BIN="${efi}/bin/efi.efi"
+        export KERNEL_DIR="${linuxFlake.packages.${system}.kernel-host}/opt/kernel-image"
+
+        bash $src/scripts/build.sh build_initrd
+
+        mkdir -p "$finalOut"
+        cp "$buildOut/artifacts/boot/EFI/BOOT/initrd.img" "$finalOut/initrd.cpio.gz"
+      '';
+
+      directBootCmdline =
+        "rdinit=/init console=tty1 console=ttyS0,115200 console=hvc0 loglevel=6 net.ifnames=0 panic=5";
+
+      linux-direct-efi =
+        linuxFlake.packages.${system}.kernel-host.passthru.mkKernelHostWithExtraConfig {
+          packageName = "initos-linux-direct-efi";
+          outputDir = "linux-direct-efi";
+          extraConfigText = ''
+            CONFIG_INITRAMFS_SOURCE="${directBootInitrd}/initrd.cpio.gz"
+            CONFIG_INITRAMFS_COMPRESSION_NONE=y
+            # CONFIG_INITRAMFS_COMPRESSION_GZIP is not set
+            CONFIG_CMDLINE_BOOL=y
+            CONFIG_CMDLINE="${directBootCmdline}"
+            CONFIG_CMDLINE_OVERRIDE=y
+          '';
+        };
+      kernel-host-direct-efi = linux-direct-efi;
+
       usrBinEnv = pkgs.runCommand "usr-bin-env" {} ''
         mkdir -p $out/usr/bin
         ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
@@ -157,7 +196,7 @@
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer docker-image;
+        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image;
         default = initos-signer;
       };
     };

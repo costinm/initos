@@ -21,7 +21,6 @@
 //!                          Encrypt a secret for recovery using an Ed25519 public key.
 //!
 //! Environment for initrd boot:
-//!   INITOS_PUB_KEY   base64 ed25519 public key (empty = skip verification)
 //!   INITOS_IMG       image path (default: /img/initos.erofs, boot mode)
 //!   INITOS_DATA      partition label (default: STATE, boot mode)
 
@@ -319,19 +318,11 @@ fn detect_seal_mode() -> SealMode {
             SealMode::Dev
         }
         Err(e) => {
-            let pub_key_set = env::var("INITOS_PUB_KEY").is_ok_and(|key| !key.is_empty());
-            let mode = if pub_key_set {
-                SealMode::Secure
-            } else {
-                SealMode::Dev
-            };
             eprintln!(
-                "initos: failed to read EFI SecureBoot from {}, using {} TPM handle from INITOS_PUB_KEY fallback: {}",
-                base_path,
-                mode.name(),
-                e
+                "initos: failed to read EFI SecureBoot from {}, using dev TPM handle: {}",
+                base_path, e
             );
-            mode
+            SealMode::Dev
         }
     }
 }
@@ -386,7 +377,8 @@ fn cmd_seal(
 /// Verify and loop-mount an erofs image.
 fn cmd_mount(img: &str, mount_point: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    initos::boot::verify_image_if_key(img, &pub_key)?;
+    let verified_boot = initos::boot::detect_verified_boot();
+    initos::boot::verify_image_trusted(img, &pub_key, verified_boot)?;
 
     eprintln!("initos: mounting image {} at {}", img, mount_point);
     initos::mount::mount_loop(img, mount_point)?;
@@ -397,14 +389,14 @@ fn cmd_mount(img: &str, mount_point: &str) -> Result<(), Box<dyn std::error::Err
 /// Verify the fsverity digest + signature of an image.
 fn cmd_verify(img: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    if pub_key.is_empty() {
-        eprintln!("initos: INITOS_PUB_KEY not set, nothing to verify");
+    let verified_boot = initos::boot::detect_verified_boot();
+    if pub_key.is_empty() && !verified_boot {
+        eprintln!(
+            "initos: INITOS_PUB_KEY not set and EFI SecureBoot not enabled, nothing to verify"
+        );
         return Ok(());
     }
-    let valid = initos::verify::verify_image(img, &pub_key)?;
-    if !valid {
-        return Err("image signature verification FAILED".into());
-    }
+    initos::boot::verify_image_trusted(img, &pub_key, verified_boot)?;
     eprintln!("initos: VERIFIED OK: {}", img);
     Ok(())
 }

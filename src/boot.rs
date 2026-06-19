@@ -54,8 +54,8 @@ pub fn unseal_key_from_handle(
 /// Full initrd boot sequence (PID 1): mount pseudo-fs, find STATE, verify images,
 /// loop-mount, preserve host images under /mnt, and switch_root.
 pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
-    let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    let verified_boot_mode = std::cell::Cell::new(!pub_key.is_empty());
+    let pub_key = String::new();
+    let verified_boot_mode = std::cell::Cell::new(false);
 
     let boot_run = || -> Result<(), Box<dyn std::error::Error>> {
         let img = env::var("INITOS_IMG").unwrap_or_else(|_| "/img/initos.erofs".to_string());
@@ -80,7 +80,7 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
             };
         }
-        let verified_boot = detect_verified_boot(!pub_key.is_empty());
+        let verified_boot = detect_verified_boot();
         verified_boot_mode.set(verified_boot);
 
         let dev = find_data_device(&data)?;
@@ -92,11 +92,11 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         unlock_state_c(state_mount, verified_boot)?;
 
         let root_mount = "/sysroot";
-        mount_rootfs(state_mount, root_mount, &img, &pub_key)?;
+        mount_rootfs(state_mount, root_mount, &img, &pub_key, verified_boot)?;
 
         let new_state_mount = format!("{}/z", root_mount);
         crate::mount::bind_mount(state_mount, &new_state_mount)?;
-        mount_host_images(state_mount, root_mount, &pub_key)?;
+        mount_host_images(state_mount, root_mount, &pub_key, verified_boot)?;
         bind_encrypted_state_paths(state_mount, root_mount)?;
         mount_system_filesystems(root_mount)?;
 
@@ -139,12 +139,8 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn find_data_device(label: &str) -> io::Result<PathBuf> {
-    if label != "USTATE" {
-        return crate::mount::find_partition_by_label(label);
-    }
-
     let deadline = Instant::now() + Duration::from_secs(20);
-    eprintln!("initos: waiting for USTATE data device");
+    eprintln!("initos: waiting for {} data device", label);
     loop {
         match crate::mount::find_partition_by_label(label) {
             Ok(dev) => return Ok(dev),
@@ -165,6 +161,7 @@ fn mount_rootfs(
     root_mount: &str,
     img: &str,
     pub_key: &str,
+    verified_boot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_name = env::var("INITOS_ROOT").unwrap_or_else(|_| "ROOTA".to_string());
     let encrypted_root = Path::new(state_mount).join("c/roots").join(&root_name);
@@ -183,7 +180,7 @@ fn mount_rootfs(
     }
 
     let img_path = format!("{}/{}", state_mount, img.trim_start_matches('/'));
-    verify_image_if_key(&img_path, pub_key)?;
+    verify_image_trusted(&img_path, pub_key, verified_boot)?;
     crate::mount::mount_loop(&img_path, root_mount)?;
     eprintln!("initos: mounted root image at {}", root_mount);
     Ok(())
@@ -394,7 +391,7 @@ fn strip_tpm_prefix(
         .ok_or_else(|| format!("TPM {} secret has wrong prefix", mode).into())
 }
 
-fn detect_verified_boot(pub_key_set: bool) -> bool {
+pub fn detect_verified_boot() -> bool {
     let base_path =
         env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
     match crate::efi::read_secure_boot(&base_path) {
@@ -405,10 +402,10 @@ fn detect_verified_boot(pub_key_set: bool) -> bool {
         }
         Err(e) => {
             eprintln!(
-                "initos: failed to read EFI SecureBoot from {}, using INITOS_PUB_KEY fallback: {}",
+                "initos: failed to read EFI SecureBoot from {}, verified_boot=false: {}",
                 base_path, e
             );
-            pub_key_set
+            false
         }
     }
 }
@@ -417,6 +414,7 @@ fn mount_host_images(
     state_mount: &str,
     root_mount: &str,
     pub_key: &str,
+    verified_boot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_mnt = Path::new(root_mount).join("mnt");
     let root_mnt_str = root_mnt
@@ -430,12 +428,20 @@ fn mount_host_images(
         "firmware.erofs",
         "mnt/firmware",
         pub_key,
+        verified_boot,
     )?;
 
     let kernel = kernel_release()?;
     let modules = format!("modules-{}.erofs", kernel);
     let modules_target = format!("mnt/modules/{}", kernel);
-    mount_host_image(state_mount, root_mount, &modules, &modules_target, pub_key)?;
+    mount_host_image(
+        state_mount,
+        root_mount,
+        &modules,
+        &modules_target,
+        pub_key,
+        verified_boot,
+    )?;
     bind_host_image_mounts(root_mount)?;
     Ok(())
 }
@@ -647,6 +653,7 @@ fn mount_host_image(
     image_name: &str,
     target_rel: &str,
     pub_key: &str,
+    verified_boot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(image_path) = find_host_image(state_mount, image_name) else {
         eprintln!("initos: {} not found, skipping mount", image_name);
@@ -656,7 +663,7 @@ fn mount_host_image(
     let image_path_str = image_path
         .to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", image_path.display()))?;
-    verify_image_if_key(image_path_str, pub_key)?;
+    verify_image_trusted(image_path_str, pub_key, verified_boot)?;
 
     let target = Path::new(root_mount).join(target_rel);
     let target_str = target
@@ -706,17 +713,41 @@ fn kernel_release() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-/// Verify an image using verify_image if INITOS_PUB_KEY is set.
+/// Verify an image using Ed25519 if INITOS_PUB_KEY is set.
 pub fn verify_image_if_key(img: &str, pub_key: &str) -> Result<(), Box<dyn std::error::Error>> {
     if pub_key.is_empty() {
         return Ok(());
     }
 
-    eprintln!("initos: verifying image {}", img);
+    eprintln!("initos: verifying image {} with INITOS_PUB_KEY", img);
     let valid = crate::verify::verify_image(img, pub_key)?;
     if !valid {
         return Err("image signature verification FAILED".into());
     }
     eprintln!("initos: image signature verified OK");
+    Ok(())
+}
+
+pub fn verify_image_trusted(
+    img: &str,
+    pub_key: &str,
+    verified_boot: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !pub_key.is_empty() {
+        return verify_image_if_key(img, pub_key);
+    }
+
+    if verified_boot {
+        let efi_base_path =
+            env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+        eprintln!("initos: verifying image {} with UEFI db", img);
+        let valid = crate::verify::verify_image_db(img, &efi_base_path)?;
+        if !valid {
+            return Err("image db signature verification FAILED".into());
+        }
+        eprintln!("initos: image db signature verified OK");
+        return Ok(());
+    }
+
     Ok(())
 }

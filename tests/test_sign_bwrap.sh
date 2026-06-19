@@ -7,11 +7,11 @@
 #
 # Usage:
 #   nix build .#initos-signer -o result-signer
-#   bash scripts/test_sign_bwrap.sh [signer-path] [kernel-path]
+#   bash tests/test_sign_bwrap.sh [signer-path] [kernel-path]
 #
 # Or with kernel:
 #   nix build ./linux -o result-kernel
-#   bash scripts/test_sign_bwrap.sh result-signer result-kernel
+#   bash tests/test_sign_bwrap.sh result-signer result-kernel
 
 set -euo pipefail
 
@@ -146,7 +146,7 @@ echo "--- Entering bubblewrap sandbox ---"
 echo ""
 
 bwrap "${BWRAP_ARGS[@]}" \
-    --ro-bind "${PROJECT_ROOT}/scripts/test_sign_sandbox_inner.sh" /out/test.sh \
+    --ro-bind "${PROJECT_ROOT}/tests/test_sign_sandbox_inner.sh" /out/test.sh \
     /bin/sh /out/test.sh "${SIGNER_REAL}" "${KERNEL_TYPE}" "${COREUTILS_BIN}"
 
 echo ""

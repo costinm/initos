@@ -402,7 +402,7 @@ pub fn print_help() {
     eprintln!("  help                          Show this help message");
     eprintln!();
     eprintln!("Environment:");
-    eprintln!("  INITOS_PUB_KEY   base64 ed25519 public key (empty = skip verification)");
+    eprintln!("  INITOS_PUB_KEY   base64 ed25519 public key (set = use Ed25519 verification)");
     eprintln!("  INITOS_IMG       image path (default: /img/initos.erofs, boot mode)");
     eprintln!("  INITOS_DATA      partition label (default: STATE, boot mode)");
     eprintln!("  INITOS_INIT      init path (default: /opt/initos/bin/initos-init)");

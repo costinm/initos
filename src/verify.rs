@@ -5,6 +5,8 @@
 //! (compatible with wireguard/libsodium format).
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use rsa::{pkcs1::DecodeRsaPublicKey, Pkcs1v15Sign, RsaPublicKey};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -96,8 +98,82 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Resul
     let img = img_path.as_ref();
 
     // Get verity digest from the kernel
-    let (_alg, digest) = match crate::verity::measure_verity(img) {
-        Ok(v) => v,
+    let (_alg, digest) = measure_or_enable_verity(img)?;
+
+    // Read signature file
+    let sig_path = signature_path(img, "sig");
+    let signature_bytes = fs::read(&sig_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to read signature file {:?}: {}", sig_path, e),
+        )
+    })?;
+
+    verify_signature(&digest, &signature_bytes, pub_key_b64)
+}
+
+/// Verify a file's fs-verity digest signature against RSA X.509 certs in UEFI db.
+///
+/// Signatures are read from `{path}.<key-id>.db.sig`, where `<key-id>` is the
+/// first 16 hex chars of SHA-256(SubjectPublicKeyInfo DER) for the matching
+/// UEFI db certificate. The signature is expected to be a PKCS#1 v1.5
+/// RSA/SHA256 signature over the fs-verity digest bytes.
+pub fn verify_image_db<P: AsRef<Path>>(img_path: P, efi_base_path: &str) -> io::Result<bool> {
+    let img = img_path.as_ref();
+    let (_alg, digest) = measure_or_enable_verity(img)?;
+    let certs = crate::efi::read_db(efi_base_path)?;
+    let mut digest_hasher = Sha256::new();
+    digest_hasher.update(&digest);
+    let signed_digest = digest_hasher.finalize();
+
+    for cert in certs {
+        if cert.rsa_public_key_b64.is_empty() {
+            continue;
+        }
+        let sig_path = signature_path(img, &format!("{}.db.sig", cert.key_id));
+        let signature_bytes = match fs::read(&sig_path) {
+            Ok(sig) => sig,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("failed to read db signature file {:?}: {}", sig_path, e),
+                ));
+            }
+        };
+        use base64::Engine;
+        let key_der = base64::engine::general_purpose::STANDARD
+            .decode(cert.rsa_public_key_b64.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("db key: {}", e)))?;
+        let Ok(rsa_pub) = RsaPublicKey::from_pkcs1_der(&key_der) else {
+            continue;
+        };
+        if rsa_pub
+            .verify(
+                Pkcs1v15Sign::new::<Sha256>(),
+                &signed_digest,
+                &signature_bytes,
+            )
+            .is_ok()
+        {
+            eprintln!(
+                "initos: db signature verified with key_id={} CN={}",
+                cert.key_id, cert.cn
+            );
+            return Ok(true);
+        }
+        eprintln!(
+            "initos: db signature mismatch for key_id={} CN={}",
+            cert.key_id, cert.cn
+        );
+    }
+
+    Ok(false)
+}
+
+fn measure_or_enable_verity(img: &Path) -> io::Result<(u16, Vec<u8>)> {
+    match crate::verity::measure_verity(img) {
+        Ok(v) => Ok(v),
         Err(e) => {
             // Try enabling fs-verity by opening RO and calling the enable ioctl.
             // (Linux requires O_RDONLY, because any writable FD causes ETXTBSY)
@@ -108,12 +184,12 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Resul
                             "initos: dynamically enabling fs-verity failed: {}",
                             enable_err
                         );
-                        return Err(io::Error::new(
+                        Err(io::Error::new(
                             e.kind(),
                             format!("Measure failed: {}, Enable failed: {}", e, enable_err),
-                        ));
+                        ))
                     } else {
-                        crate::verity::measure_verity(img)?
+                        crate::verity::measure_verity(img)
                     }
                 }
                 Err(open_err) => {
@@ -121,26 +197,19 @@ pub fn verify_image<P: AsRef<Path>>(img_path: P, pub_key_b64: &str) -> io::Resul
                         "initos: failed to open image for verity enable: {}",
                         open_err
                     );
-                    return Err(e);
+                    Err(e)
                 }
             }
         }
-    };
+    }
+}
 
-    // Read signature file
-    let sig_path = img.with_extension(
+fn signature_path(img: &Path, suffix: &str) -> std::path::PathBuf {
+    img.with_extension(
         img.extension()
-            .map(|e| format!("{}.sig", e.to_string_lossy()))
-            .unwrap_or_else(|| "sig".to_string()),
-    );
-    let signature_bytes = fs::read(&sig_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("failed to read signature file {:?}: {}", sig_path, e),
-        )
-    })?;
-
-    verify_signature(&digest, &signature_bytes, pub_key_b64)
+            .map(|e| format!("{}.{}", e.to_string_lossy(), suffix))
+            .unwrap_or_else(|| suffix.to_string()),
+    )
 }
 
 /// Verify a pre-computed digest against a signature file.

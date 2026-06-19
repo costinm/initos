@@ -18,8 +18,8 @@
 #
 # The boot sequence is:
 # - EFI - based on the minimal rust EFI
-#   - custom bzImage and cmdline configuring qemu init script
-#   - the script will mount 9p with extra images and test scripts
+#   - initos.erofs contains the qemu test init script
+#   - optional 9p can still override the test script with /x/test.sh
 #   - the ext4 will be loaded with LABEL=STATE.
 
 set -euo pipefail
@@ -35,8 +35,6 @@ PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 # The EFI dir - will be exported as vfat in qemu, no need to create an img.
 ESP_DIR="${out}/test_efi"
-INITOS_INIT=${INITOS_INIT:-/opt/initos/bin/initos-init-qemu}
-
 set_out() {
     out="${1:?Usage: set_out <out-dir>}"
     ESP_DIR="${out}/test_efi"
@@ -86,10 +84,20 @@ nix() {
 }
 
 build_qemu_state() {
+    local mode="${1:-basic}"
     local rootfs_img="${out}/disks/state/img/initos.erofs"
-    local genimage_dir="${out}/test"
+    local genimage_dir="${out}/qemu"
     local data_img="state.ext4"
     local img_size_bytes img_size_mb state_size_mb
+
+    rm -rf "${out}/disks/state"
+    mkdir -p "${out}/disks/state/img"
+    cp "${out}/artifacts/img/initos.erofs" "${rootfs_img}"
+    for f in "${out}"/artifacts/img/modules-*.erofs "${out}"/artifacts/img/firmware.erofs \
+             "${out}"/artifacts/img/*.sig; do
+        [ -f "$f" ] && cp "$f" "${out}/disks/state/img/"
+    done
+    echo "${mode}" > "${out}/disks/state/qemu-test-mode"
 
     img_size_bytes=$(stat -c%s "${rootfs_img}")
     img_size_mb=$(( (img_size_bytes + 1048575) / 1048576 ))
@@ -145,16 +153,19 @@ run() {
     OVMF_VARS="$(dirname "${OVMF}")/OVMF_VARS.fd"
     QEMU_ARGS+=(-drive "if=pflash,format=raw,file=${OVMF_VARS}")
 
-    TPM_DIR="${QEMU_TPM_DIR:-${out}/tmp/mytpm1}"
-    if [[ "${RESET_TPM:-1}" != 0 ]]; then
-        rm -rf "${TPM_DIR}"
+    local swtpm_pid=""
+    if [[ "${QEMU_ENABLE_TPM:-1}" != 0 ]]; then
+        TPM_DIR="${QEMU_TPM_DIR:-${out}/tmp/mytpm1}"
+        if [[ "${RESET_TPM:-1}" != 0 ]]; then
+            rm -rf "${TPM_DIR}"
+        fi
+        mkdir -p "${TPM_DIR}"
+        rm -f "${TPM_DIR}/swtpm-sock"
+        swtpm socket --tpmstate dir="${TPM_DIR}" --ctrl type=unixio,path="${TPM_DIR}/swtpm-sock" --tpm2 &
+        swtpm_pid=$!
+        tpm="-chardev socket,id=chrtpm,path=${TPM_DIR}/swtpm-sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0"
+        QEMU_ARGS+=(${tpm})
     fi
-    mkdir -p "${TPM_DIR}"
-    rm -f "${TPM_DIR}/swtpm-sock"
-    swtpm socket --tpmstate dir="${TPM_DIR}" --ctrl type=unixio,path="${TPM_DIR}/swtpm-sock" --tpm2 &
-    local swtpm_pid=$!
-    tpm="-chardev socket,id=chrtpm,path=${TPM_DIR}/swtpm-sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0"
-    QEMU_ARGS+=(${tpm})
 
     QEMU_ARGS+=(
         -fsdev "local,security_model=mapped,id=fsdev0,path=${out}/qemu"
@@ -166,7 +177,7 @@ run() {
 
 	# -display none or -nographic ?
     QEMU_ARGS+=(
-        -m 512M
+        -m "${QEMU_MEM:-1024M}"
         -smp 2
         -no-reboot
         -nographic
@@ -192,8 +203,10 @@ run() {
         set +e
         timeout --foreground "${timeout_s}s" qemu-system-x86_64 "${QEMU_ARGS[@]}"             -chardev "file,mux=on,id=char0,path=${log_file}"             -serial chardev:char0             -device virtconsole,chardev=char0             -no-reboot
    		rc=$?
-        kill "${swtpm_pid}" 2>/dev/null || true
-        wait "${swtpm_pid}" 2>/dev/null || true
+        if [[ -n "${swtpm_pid}" ]]; then
+            kill "${swtpm_pid}" 2>/dev/null || true
+            wait "${swtpm_pid}" 2>/dev/null || true
+        fi
         set -e
 		if [[ $rc -eq 124 ]]; then
 			echo ""
@@ -207,6 +220,76 @@ run() {
     fi
 }
 
+resolve_direct_kernel() {
+    if [[ -n "${DIRECT_KERNEL_BZIMAGE:-}" ]]; then
+        echo "${DIRECT_KERNEL_BZIMAGE}"
+        return 0
+    fi
+
+    for candidate in \
+        "${out}/direct-kernel/bzImage" \
+        "${src}/result-direct/opt/linux-direct-efi/bzImage" \
+        "${src}/result-linux-direct-efi/opt/linux-direct-efi/bzImage" \
+        "${src}/target/result-linux-direct-efi/opt/linux-direct-efi/bzImage" \
+        "${src}/result-direct/opt/kernel-image/bzImage" \
+        "${src}/result-kernel-host-direct-efi/opt/kernel-image/bzImage" \
+        "${src}/target/result-kernel-host-direct-efi/opt/kernel-image/bzImage"; do
+        if [[ -f "${candidate}" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+run_direct_kernel() {
+    local kernel_bzimage="${1:?Usage: run_direct_kernel <bzImage> [timeout]}"
+    local timeout_s="${2:-${TIMEOUT:-30}}"
+    local log_file="${LOG_FILE:-${out}/qemu_direct_kernel.log}"
+    rm -f "$log_file"
+
+    QEMU_ARGS=(
+        -kernel "${kernel_bzimage}"
+        -drive "file=${out}/qemu/state.ext4,format=raw,if=none,id=initos_state"
+        -device "nvme,drive=initos_state,serial=initos-state"
+        -fsdev "local,security_model=mapped,id=fsdev0,path=${out}/qemu"
+        -device "virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=src"
+        -device "virtio-serial-pci"
+        -chardev "socket,id=mesh,path=${out}/qemu/mesh.sock,server=on,wait=off"
+        -device "virtserialport,chardev=mesh,name=org.ssh-mesh.control"
+        -m "${QEMU_MEM:-1024M}"
+        -smp 2
+        -no-reboot
+        -nographic
+        -nodefaults
+    )
+    if [[ -w /dev/kvm ]]; then
+        QEMU_ARGS+=(-enable-kvm -cpu host)
+    else
+        echo "WARNING: KVM not available, using emulation (slower)"
+        QEMU_ARGS+=(-cpu qemu64)
+    fi
+
+    echo "=== Starting direct kernel QEMU (timeout ${timeout_s}s) ==="
+    set +e
+    timeout --foreground "${timeout_s}s" qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+        -chardev "file,mux=on,id=char0,path=${log_file}" \
+        -serial chardev:char0 \
+        -device virtconsole,chardev=char0 \
+        -no-reboot
+    rc=$?
+    set -e
+    if [[ $rc -eq 124 ]]; then
+        echo ""
+        echo "=== QEMU timed out after ${timeout_s}s ==="
+    elif [[ $rc -ne 0 ]]; then
+        echo ""
+        echo "=== QEMU exited with status ${rc} ==="
+        exit "$rc"
+    fi
+}
+
 test_unsigned_negative() {
     echo "=== Running Negative Test (Unsigned bootloader) ==="
     rm -rf "${ESP_DIR}"
@@ -214,11 +297,6 @@ test_unsigned_negative() {
     
     mcopy -i "${out}/disks/img/boot-limine-unsigned.vfat" -s ::EFI "${ESP_DIR}/" || true
     mcopy -i "${out}/disks/img/boot-limine-unsigned.vfat" -s ::keys "${ESP_DIR}/" || true
-
-    # Write QEMU command line config
-    cat > "${ESP_DIR}/EFI/BOOT/config" <<EOF
-rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5
-EOF
 
     local log_file="${out}/qemu_efi_unsigned.log"
     LOG_FILE="${log_file}" run 6
@@ -238,23 +316,16 @@ test_limine_signed() {
     mkdir -p "${ESP_DIR}"
     local signed_timeout_s="${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
     
-    # We want to re-run sign.sh build_boot_limine_signed with the correct INITOS_CMDLINE for testing console=hvc0
-    local keys="${src}/prebuilt/testdata/uefi-keys"
-    local pub_key
-    pub_key=$(tr -d '\r\n' < "${keys}/image_key.pub.b64")
-    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} rw iommu=relaxed net.ifnames=0 panic=5" \
-        "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
-
-    mcopy -i "${out}/disks/tmp/img/boot-limine-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
-    mcopy -i "${out}/disks/tmp/img/boot-limine-signed.vfat" -s ::keys "${ESP_DIR}/" || true
+    build_qemu_state basic
+    mcopy -i "${out}/disks/img/boot-limine-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/img/boot-limine-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
     local log_file="${out}/qemu_efi_limine_signed.log"
     LOG_FILE="${log_file}" run "${signed_timeout_s}"
 
     echo "=== Analyzing Signed Limine Boot ==="
     
-    if grep -q "Run .* as init process" "${log_file}" && \
-        grep -q "initos: image signature verified OK" "${log_file}" && \
+    if grep -q "initos: image db signature verified OK" "${log_file}" && \
         grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
         echo "✅ SUCCESS: Signed Limine booted and completed all tests!"
     else
@@ -268,18 +339,13 @@ test_initos_signed() {
     rm -rf "${ESP_DIR}"
     mkdir -p "${ESP_DIR}"
 
-    local keys="${src}/prebuilt/testdata/uefi-keys"
-    local pub_key
-    pub_key=$(tr -d '\r\n' < "${keys}/image_key.pub.b64")
     local tpm_dir="${out}/tmp/initos-signed-tpm"
     local signed_timeout_s="${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
     rm -rf "${tpm_dir}"
 
-    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} INITOS_QEMU_PHASE=setup rw iommu=relaxed net.ifnames=0 panic=5" \
-        "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
-
-    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
-    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
+    build_qemu_state setup
+    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
     local setup_log_file="${out}/qemu_efi_initos_signed_setup.log"
     QEMU_TPM_DIR="${tpm_dir}" RESET_TPM=1 LOG_FILE="${setup_log_file}" run "${signed_timeout_s}"
@@ -295,11 +361,8 @@ test_initos_signed() {
     rm -rf "${ESP_DIR}"
     mkdir -p "${ESP_DIR}"
 
-    INITOS_CMDLINE="rdinit=/init loglevel=9 console=hvc0 INITOS_INIT=${INITOS_INIT} INITOS_QEMU_PHASE=verify rw iommu=relaxed net.ifnames=0 panic=5" \
-        "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${out}/artifacts/boot" "${out}/disks/tmp" "${keys}" "${pub_key}"
-
-    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
-    mcopy -i "${out}/disks/tmp/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
 
     local log_file="${out}/qemu_efi_initos_signed.log"
     QEMU_TPM_DIR="${tpm_dir}" RESET_TPM=0 LOG_FILE="${log_file}" run "${signed_timeout_s}"
@@ -307,10 +370,9 @@ test_initos_signed() {
     echo "=== Analyzing Signed InitOS Boot ==="
 
     if grep -q "console=hvc0" "${log_file}" && \
-        grep -q "INITOS_PUB_KEY=${pub_key}" "${log_file}" && \
         (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") && \
         (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") && \
-        grep -q "initos: image signature verified OK" "${log_file}" && \
+        grep -q "initos: image db signature verified OK" "${log_file}" && \
         grep -q "initos: unlocked /z/c using TPM" "${log_file}" && \
         grep -q "initos: verifying image /z/img/firmware.erofs" "${log_file}" && \
         grep -q "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
@@ -334,6 +396,69 @@ test_initos_signed() {
         exit 1
     fi
 }
+
+test_initos_signed_stateless() {
+    echo "=== Running Signed InitOS Stateless Verified Root Test ==="
+    rm -rf "${ESP_DIR}"
+    mkdir -p "${ESP_DIR}"
+    local signed_timeout_s="${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
+
+    build_qemu_state stateless
+    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
+    mcopy -i "${out}/disks/img/boot-initos-signed.vfat" -s ::keys "${ESP_DIR}/" || true
+
+    local log_file="${out}/qemu_efi_initos_signed_stateless.log"
+    QEMU_ENABLE_TPM=0 RESET_TPM=1 LOG_FILE="${log_file}" run "${signed_timeout_s}"
+
+    echo "=== Analyzing Signed InitOS Stateless Boot ==="
+    if grep -q "initos: image db signature verified OK" "${log_file}" && \
+        grep -q "initos: verifying image /z/img/firmware.erofs" "${log_file}" && \
+        grep -q "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS FIRMWARE BIND OK ===" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS MODULES BIND OK ===" "${log_file}" && \
+        grep -q "=== INITRD STATELESS ROOT OK ===" "${log_file}" && \
+        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+        echo "✅ SUCCESS: Signed InitOS booted verified images without /c or TPM."
+    else
+        echo "❌ FAILURE: Signed InitOS stateless boot verification failed."
+        exit 1
+    fi
+}
+
+test_direct_kernel_embedded() {
+    echo "=== Running Direct Embedded Initrd Kernel Test ==="
+    local kernel_bzimage
+    if ! kernel_bzimage=$(resolve_direct_kernel); then
+        echo "Missing direct embedded kernel. Build one with:"
+        echo "  nix build path:${src}#linux-direct-efi -o result-direct"
+        exit 1
+    fi
+
+    build_qemu_state direct
+    local log_file="${out}/qemu_direct_kernel.log"
+    LOG_FILE="${log_file}" run_direct_kernel "${kernel_bzimage}" "${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
+
+    echo "=== Analyzing Direct Embedded Initrd Kernel Boot ==="
+    if grep -q "initos: mounted root image at /sysroot" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS FIRMWARE BIND OK ===" "${log_file}" && \
+        grep -q "=== INITRD ROOTFS MODULES BIND OK ===" "${log_file}" && \
+        grep -q "=== INITRD STATELESS ROOT OK ===" "${log_file}" && \
+        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
+        echo "✅ SUCCESS: Direct embedded-initrd kernel booted without external cmdline/initrd."
+    else
+        echo "❌ FAILURE: Direct embedded-initrd kernel boot verification failed."
+        exit 1
+    fi
+}
+
+test_direct_kernel_embedded_if_present() {
+    if resolve_direct_kernel >/dev/null; then
+        test_direct_kernel_embedded
+    else
+        echo "=== Skipping Direct Embedded Initrd Kernel Test (no direct kernel artifact found) ==="
+    fi
+}
+
 test() {
     if [[ "${RESET_QEMU_STATE_FROM_ARTIFACTS:-1}" != 0 ]]; then
         "${src}/scripts/build.sh" build_qemu_state
@@ -342,6 +467,8 @@ test() {
     test_unsigned_negative
     test_limine_signed
     test_initos_signed
+    test_initos_signed_stateless
+    test_direct_kernel_embedded_if_present
 }
 
 if [[ "${1:-}" == "--nix-result" ]]; then

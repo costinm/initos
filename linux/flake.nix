@@ -88,18 +88,6 @@
       };
       kernel = kernelBase.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ kernelPatchFiles;
-        postInstall = (old.postInstall or "") + ''
-          bootBuild="$dev/lib/modules/${baseKernel.modDirVersion}/build"
-          mkdir -p "$bootBuild/arch/x86" "$bootBuild/drivers/firmware/efi"
-          if [ -d "$buildRoot/arch/x86/boot" ]; then
-            rm -rf "$bootBuild/arch/x86/boot"
-            cp -a "$buildRoot/arch/x86/boot" "$bootBuild/arch/x86/boot"
-          fi
-          if [ -d "$buildRoot/drivers/firmware/efi/libstub" ]; then
-            rm -rf "$bootBuild/drivers/firmware/efi/libstub"
-            cp -a "$buildRoot/drivers/firmware/efi/libstub" "$bootBuild/drivers/firmware/efi/libstub"
-          fi
-        '';
       });
 
       nvidiaOpen = (pkgs.linuxPackagesFor kernel).nvidiaPackages.stable.open.overrideAttrs (old: {
@@ -122,71 +110,136 @@
         fi
       '') firmwarePackages;
 
-      kernel-host = pkgs.runCommand "initos-kernel-host" {
-        nativeBuildInputs = [ pkgs.erofs-utils pkgs.patch pkgs.stdenv.cc ];
-        passthru = {
-          inherit kernel mergedConfig nvidiaOpen firmwarePackages;
-        };
-      } ''
-        mkdir -p "$out/opt/kernel-image"
+      mkMergedConfigWithExtra = { packageName, extraConfigText ? "" }:
+        let
+          extraConfigFile = pkgs.writeText "${packageName}-extra.config" extraConfigText;
+        in
+        pkgs.runCommand "${packageName}-config-${baseKernel.version}" {
+          nativeBuildInputs = with pkgs; [
+            bc
+            bison
+            flex
+            gnumake
+            openssl
+            perl
+            rust-bindgen-unwrapped
+            rustc-unwrapped
+            stdenv.cc
+            xz
+          ];
+          RUST_LIB_SRC = pkgs.rustPlatform.rustLibSrc;
+        } ''
+          tar -xf ${baseKernel.src}
+          kernelSrc="$PWD/linux-${baseKernel.version}"
+          buildRoot="$PWD/build"
+          mergeRoot="$PWD/merge"
+          mkdir -p "$buildRoot" "$mergeRoot"
 
-        if [ -f ${kernel}/bzImage ]; then
-          cp ${kernel}/bzImage "$out/opt/kernel-image/bzImage"
-        elif [ -f ${kernel}/vmlinuz ]; then
-          cp ${kernel}/vmlinuz "$out/opt/kernel-image/bzImage"
-        else
-          echo "ERROR: could not find built x86 kernel image in ${kernel}" >&2
-          find ${kernel} -maxdepth 2 -type f >&2
-          exit 1
-        fi
+          install -m 0644 ${src}/${branch}/config.amd64 "$buildRoot/.config"
+          cd "$mergeRoot"
+          "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${branch}/config
+          ${mergeFragmentCommands}
+          ${lib.optionalString (extraConfigText != "") ''
+            "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${extraConfigFile}
+          ''}
 
-        cp ${mergedConfig} "$out/opt/kernel-image/config"
-        cp ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build/scripts/sign-file "$out/opt/kernel-image/sign-file"
-        if [ -f ${kernel.dev}/vmlinux ]; then
-          cp ${kernel.dev}/vmlinux "$out/opt/kernel-image/vmlinux"
-        else
-          echo "ERROR: kernel dev output does not contain vmlinux" >&2
-          exit 1
-        fi
+          make -C "$kernelSrc" O="$buildRoot" ARCH=x86 olddefconfig
+          cp "$buildRoot/.config" "$out"
+        '';
 
-        insertSrc="$TMPDIR/insert-sys-cert-src"
-        mkdir -p "$insertSrc"
-        tar -xf ${baseKernel.src} -C "$insertSrc" \
-          linux-${baseKernel.version}/scripts/insert-sys-cert.c
-        cc -O2 \
-          "$insertSrc/linux-${baseKernel.version}/scripts/insert-sys-cert.c" \
-          -o "$out/opt/kernel-image/insert-sys-cert"
-        mkdir -p "$out/opt/kernel-image/source"
-        tar -xf ${baseKernel.src} -C "$out/opt/kernel-image/source" --strip-components=1
-        (cd "$out/opt/kernel-image/source" && ${applyKernelPatchCommands})
-        ln -s ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build "$out/opt/kernel-image/build"
+      mkPatchedKernel = { packageName, configfile }:
+        let
+          kernelBaseForConfig = pkgs.linuxKernel.manualConfig {
+            pname = packageName;
+            inherit (baseKernel) version src modDirVersion;
+            inherit configfile;
+            allowImportFromDerivation = true;
+          };
+        in
+        kernelBaseForConfig.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ kernelPatchFiles;
+        });
 
-        moduleDir=${kernel.modules}/lib/modules/${kernel.modDirVersion}
-        nvidiaModuleDir=${nvidiaOpen}/lib/modules/${kernel.modDirVersion}
-        if [ -d "$moduleDir" ]; then
-          combined="$TMPDIR/modules-${kernel.modDirVersion}"
-          mkdir -p "$combined"
-          cp -a "$moduleDir/." "$combined/"
-          chmod -R u+w "$combined"
-          if [ -d "$nvidiaModuleDir" ]; then
-            cp -a "$nvidiaModuleDir/." "$combined/"
+      mkNvidiaOpen = kernelForModules:
+        (pkgs.linuxPackagesFor kernelForModules).nvidiaPackages.stable.open.overrideAttrs (old: {
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.removeReferencesTo ];
+          postFixup = (old.postFixup or "") + ''
+            find "$out" -type f -name '*.ko' -exec remove-references-to -t ${kernelForModules.dev} '{}' +
+          '';
+        });
+
+      mkKernelHostPackage = { packageName, kernel, configfile, nvidiaOpen, outputDir ? "kernel-image" }:
+        pkgs.runCommand packageName {
+          nativeBuildInputs = [ pkgs.erofs-utils ];
+          passthru = {
+            mergedConfig = configfile;
+            inherit kernel nvidiaOpen firmwarePackages;
+          };
+        } ''
+          imageOut="$out/opt/${outputDir}"
+          mkdir -p "$imageOut"
+
+          if [ -f ${kernel}/bzImage ]; then
+            cp ${kernel}/bzImage "$imageOut/bzImage"
+          elif [ -f ${kernel}/vmlinuz ]; then
+            cp ${kernel}/vmlinuz "$imageOut/bzImage"
           else
-            echo "ERROR: NVIDIA open modules missing for ${kernel.modDirVersion}" >&2
-            find ${nvidiaOpen} -maxdepth 4 -type f >&2
+            echo "ERROR: could not find built x86 kernel image in ${kernel}" >&2
+            find ${kernel} -maxdepth 2 -type f >&2
             exit 1
           fi
-          cp -a "$combined" "$out/opt/kernel-image/modules-${kernel.modDirVersion}"
-        fi
 
-        firmwareRoot="$TMPDIR/firmware"
-        mkdir -p "$firmwareRoot"
-        ${firmwareCopyCommands}
-        chmod -R u+w "$firmwareRoot"
-        (cd "$firmwareRoot" && mkfs.erofs -zlz4 "$out/opt/kernel-image/firmware.erofs" .)
+          cp ${configfile} "$imageOut/config"
+          cp ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build/scripts/sign-file "$imageOut/sign-file"
 
-        echo "kernel-host:"
-        ls -lh "$out/opt/kernel-image"
-      '';
+          moduleDir=${kernel.modules}/lib/modules/${kernel.modDirVersion}
+          nvidiaModuleDir=${nvidiaOpen}/lib/modules/${kernel.modDirVersion}
+          if [ -d "$moduleDir" ]; then
+            combined="$TMPDIR/modules-${kernel.modDirVersion}"
+            mkdir -p "$combined"
+            cp -a "$moduleDir/." "$combined/"
+            chmod -R u+w "$combined"
+            if [ -d "$nvidiaModuleDir" ]; then
+              cp -a "$nvidiaModuleDir/." "$combined/"
+            else
+              echo "ERROR: NVIDIA open modules missing for ${kernel.modDirVersion}" >&2
+              find ${nvidiaOpen} -maxdepth 4 -type f >&2
+              exit 1
+            fi
+            cp -a "$combined" "$imageOut/modules-${kernel.modDirVersion}"
+          fi
+
+          firmwareRoot="$TMPDIR/firmware"
+          mkdir -p "$firmwareRoot"
+          ${firmwareCopyCommands}
+          chmod -R u+w "$firmwareRoot"
+          (cd "$firmwareRoot" && mkfs.erofs -zlz4 "$imageOut/firmware.erofs" .)
+
+          echo "${packageName}:"
+          ls -lh "$imageOut"
+        '';
+
+      mkKernelHostWithExtraConfig = { packageName ? "initos-kernel-host-extra", extraConfigText ? "", outputDir ? "kernel-image" }:
+        let
+          configfile = mkMergedConfigWithExtra { inherit packageName extraConfigText; };
+          kernelForConfig = mkPatchedKernel { inherit packageName configfile; };
+          nvidiaOpenForConfig = mkNvidiaOpen kernelForConfig;
+        in
+        mkKernelHostPackage {
+          inherit packageName configfile outputDir;
+          kernel = kernelForConfig;
+          nvidiaOpen = nvidiaOpenForConfig;
+        };
+
+      kernel-host = (mkKernelHostPackage {
+        packageName = "initos-kernel-host";
+        configfile = mergedConfig;
+        inherit kernel nvidiaOpen;
+      }).overrideAttrs (old: {
+        passthru = (old.passthru or { }) // {
+          inherit mkKernelHostWithExtraConfig;
+        };
+      });
 
       # This is a 'pure data' image - no app inside, just the artifacts.
       # Same as a tar

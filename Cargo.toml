@@ -25,8 +25,9 @@ rand_core = { version = "0.6", features = ["std"] }
 chacha20poly1305 = "0.10"
 curve25519-dalek = "4"
 base64 = { version = "0.22", features = ["std"] }
-sha2 = { version = "0.10", features = ["std"] }
+sha2 = { version = "0.10", features = ["std", "oid"] }
 x509-cert = { version = "0.2.5", features = ["std"] }
+rsa = { version = "0.9.6", default-features = false, features = ["hazmat"] }
 
 [target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.35.0", features = ["logger", "alloc", "panic_handler", "global_allocator"] }

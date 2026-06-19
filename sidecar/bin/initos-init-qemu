@@ -11,6 +11,11 @@ set -x
 TPM_TEST_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 TPM_UNLOCK_FILE=/z/c/qemu-tpm-unlock.txt
 TPM_UNLOCK_TEXT="tpm-initrd-unlock-ok"
+QEMU_MODE_FILE=/z/qemu-test-mode
+
+qemu_mode() {
+    cat "${QEMU_MODE_FILE}" 2>/dev/null || echo basic
+}
 
 run_tpm_setup() {
     echo "=== INITRD TPM UNLOCK SETUP ==="
@@ -36,6 +41,7 @@ run_tpm_setup() {
 
     if [ "$(cat "${TPM_UNLOCK_FILE}" 2>/dev/null)" = "${TPM_UNLOCK_TEXT}" ]; then
         echo "=== INITRD TPM UNLOCK SETUP OK ==="
+        echo verify > "${QEMU_MODE_FILE}"
     else
         echo "=== INITRD TPM UNLOCK SETUP FAIL ==="
     fi
@@ -58,6 +64,8 @@ verify_tpm_initrd_unlock() {
 }
 
 verify_mount_fixtures() {
+    local check_state_binds="${1:-1}"
+
     echo "=== INITRD MODULES/FIRMWARE MOUNT VERIFY ==="
 
     echo "=== INITRD FIRMWARE MOUNT SKIP ==="
@@ -77,6 +85,13 @@ verify_mount_fixtures() {
         echo "=== INITRD ROOTFS MODULES BIND OK ==="
     else
         echo "=== INITRD ROOTFS MODULES BIND FAIL ==="
+    fi
+
+    if [ "${check_state_binds}" = 0 ]; then
+        echo "=== INITRD ROOTFS HOME BIND SKIP ==="
+        echo "=== INITRD ROOTFS ROOT BIND SKIP ==="
+        echo "=== INITRD ROOTFS NIX BIND SKIP ==="
+        return
     fi
 
     HDATA=$(cat /home/root/bind-check.txt 2>&1)
@@ -115,10 +130,19 @@ run_tests() {
     env
     set -x
 
-    if [ "${INITOS_QEMU_PHASE:-basic}" = "verify" ]; then
+    case "$(qemu_mode)" in
+        verify)
         verify_tpm_initrd_unlock
-        verify_mount_fixtures
-    fi
+        verify_mount_fixtures 1
+            ;;
+        stateless|direct)
+            verify_mount_fixtures 0
+            echo "=== INITRD STATELESS ROOT OK ==="
+            echo "=== ALL TESTS COMPLETE ==="
+            sleep 2
+            reboot -f
+            ;;
+    esac
 
     echo "=== TPM2 TEST ==="
 
@@ -128,7 +152,6 @@ run_tests() {
     echo "primary exit=$?"
     echo "primary handle=0x81000000"
 
-    export INITOS_PUB_KEY="GOmR9GEy3xbI/4ybZDnv9coSOuD4kMkEkQcGGsbfkus="
     initos seal "${TPM_TEST_KEY}"
     echo "seal exit=$?"
     echo "sealed handles dev=0x81001002 secure=0x81001003"
@@ -192,9 +215,9 @@ run_tests() {
     reboot -f
 }
 
-initos-init mount_sys
+initos-init-base mount_sys
 
-case "${INITOS_QEMU_PHASE:-basic}" in
+case "$(qemu_mode)" in
     setup)
         run_tpm_setup
         ;;

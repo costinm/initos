@@ -242,6 +242,22 @@ build_initos() {
     echo "  Created: ${ARTIFACTS}/img/initos.erofs ($(du -h "${ARTIFACTS}/img/initos.erofs" | cut -f1))"
 }
 
+build_qemu_initos() {
+    STAGING=${out}/staging/initos-qemu
+    mkdir -p "${ARTIFACTS}/img"
+    rm -rf "${STAGING}"
+
+    _populate_staging "${STAGING}"
+    cp "${STAGING}/opt/initos/bin/initos-init" "${STAGING}/opt/initos/bin/initos-init-base"
+    cp "${src}/sidecar/bin/initos-init-qemu" "${STAGING}/opt/initos/bin/initos-init"
+    chmod 755 "${STAGING}/opt/initos/bin/initos-init"
+    chmod 755 "${STAGING}/opt/initos/bin/initos-init-base"
+
+    mkfs.erofs --all-root --force-uid=0 -T0 -zlz4 "${ARTIFACTS}/img/initos.erofs" "${STAGING}"
+
+    echo "  Created QEMU test rootfs: ${ARTIFACTS}/img/initos.erofs ($(du -h "${ARTIFACTS}/img/initos.erofs" | cut -f1))"
+}
+
 # 3. initrd.img - using initos layout and cpio
 # Output: artifacts/boot/EFI/BOOT/initrd.img
 build_initrd() {
@@ -299,36 +315,19 @@ build_bin() {
 
 # --- Boot functions are now in sidecar/bin/sign.sh ---
 
-_read_image_pub_key() {
-    local keys="${1:?Usage: _read_image_pub_key <keys_dir>}"
-    local pub_key_file="${keys}/image_key.pub.b64"
-
-    if [ ! -s "${pub_key_file}" ]; then
-        echo "ERROR: ${pub_key_file} is not present or empty (required for INITOS_PUB_KEY)" >&2
-        return 1
-    fi
-
-    tr -d '\r\n' < "${pub_key_file}"
-}
-
 # 4. Build a test env for qemu validation.
 build_qemu_test() {
     local keys="${src}/prebuilt/testdata/uefi-keys"
-    local pub_key
-    pub_key=$(_read_image_pub_key "${keys}")
 
-    [ -f "${ARTIFACTS}/img/initos.erofs" ] || {
-        echo "Missing ${ARTIFACTS}/img/initos.erofs; run build_initos first" >&2
-        return 1
-    }
+    build_qemu_initos
 
     SECRETS="${keys}" "${src}/sidecar/bin/sign.sh" image "${ARTIFACTS}/img" "initos.erofs"
     build_qemu_mount_fixtures "${keys}"
 
     # Build the three boot variants — sign.sh reads from artifacts/
     "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
-    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}" "${pub_key}"
+    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
 
     build_qemu_state
 }
