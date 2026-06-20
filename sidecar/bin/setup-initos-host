@@ -589,20 +589,6 @@ swapNext() {
 
 
 
-# Mokutil requires a corresponding EFI.
-# /usr/share/efitools contains a set of EFI programs.
-# efi-readvar shows the keys in the system.
-mok() {
-  mokutil --sb-state
-  mokutil --list-enrolled
-  mokutil --pk /boot/efi/initos/KEYS/PK.cer
-  mokutil --kek
-  mokutil --db
-  # Looks for /var/lib/sbctl/keys/db/db.key
-  # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
-}
-
-
 efibackup() {
   for i in PK KEK db dbx; do efi-readvar -v $i -o $i.esl; done
 
