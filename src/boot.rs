@@ -83,6 +83,22 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         let verified_boot = detect_verified_boot();
         verified_boot_mode.set(verified_boot);
 
+        let efi_base_path = env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+        let boot_partition_id = match crate::efi::extract_boot_partition_id(&efi_base_path) {
+            Ok(Some(part_id)) => {
+                eprintln!("initos: extracted boot partition ID: {}", part_id);
+                Some(part_id)
+            }
+            Ok(None) => {
+                eprintln!("initos: no boot partition ID could be extracted from EFI variables");
+                None
+            }
+            Err(e) => {
+                eprintln!("initos: error extracting boot partition ID: {}", e);
+                None
+            }
+        };
+
         let dev = find_data_device(&data)?;
         eprintln!("initos: found data device: {:?}", dev);
 
@@ -92,11 +108,11 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         unlock_state_c(state_mount, verified_boot)?;
 
         let root_mount = "/sysroot";
-        mount_rootfs(state_mount, root_mount, &img, &pub_key, verified_boot)?;
+        mount_rootfs(state_mount, root_mount, &img, &pub_key, verified_boot, boot_partition_id)?;
 
         let new_state_mount = format!("{}/z", root_mount);
         crate::mount::bind_mount(state_mount, &new_state_mount)?;
-        mount_host_images(state_mount, root_mount, &pub_key, verified_boot)?;
+        mount_host_images(state_mount, root_mount, &pub_key, verified_boot, boot_partition_id)?;
         bind_encrypted_state_paths(state_mount, root_mount)?;
         mount_system_filesystems(root_mount)?;
 
@@ -162,26 +178,60 @@ fn mount_rootfs(
     img: &str,
     pub_key: &str,
     verified_boot: bool,
+    boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_name = env::var("INITOS_ROOT").unwrap_or_else(|_| "ROOTA".to_string());
-    let encrypted_root = Path::new(state_mount).join("c/roots").join(&root_name);
+    
+    let mut encrypted_root = None;
+    if let Some(part_id) = boot_partition_id {
+        let part_root = Path::new(state_mount).join("c/roots").join(part_id.to_string()).join(&root_name);
+        if part_root.exists() {
+            encrypted_root = Some(part_root);
+        } else {
+            let part_root_alt = Path::new(state_mount).join("roots").join(part_id.to_string()).join(&root_name);
+            if part_root_alt.exists() {
+                encrypted_root = Some(part_root_alt);
+            }
+        }
+    }
 
-    if encrypted_root.exists() {
-        let encrypted_root_str = encrypted_root
+    if encrypted_root.is_none() {
+        let default_root = Path::new(state_mount).join("c/roots").join(&root_name);
+        if default_root.exists() {
+            encrypted_root = Some(default_root);
+        }
+    }
+
+    if let Some(root_path) = encrypted_root {
+        let encrypted_root_str = root_path
             .to_str()
-            .ok_or_else(|| format!("path is not valid UTF-8: {}", encrypted_root.display()))?;
+            .ok_or_else(|| format!("path is not valid UTF-8: {}", root_path.display()))?;
         eprintln!(
             "initos: mounting encrypted root {} at {}",
-            encrypted_root.display(),
+            root_path.display(),
             root_mount
         );
         recursive_bind_mount(encrypted_root_str, root_mount)?;
         return Ok(());
     }
 
-    let img_path = format!("{}/{}", state_mount, img.trim_start_matches('/'));
-    verify_image_trusted(&img_path, pub_key, verified_boot)?;
-    crate::mount::mount_loop(&img_path, root_mount)?;
+    let default_img_path = Path::new(state_mount).join(img.trim_start_matches('/'));
+    let img_path = if let Some(part_id) = boot_partition_id {
+        if let Some(part_path) = check_partitioned_image(&default_img_path, part_id) {
+            part_path
+        } else {
+            default_img_path
+        }
+    } else {
+        default_img_path
+    };
+
+    let img_path_str = img_path
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", img_path.display()))?;
+
+    verify_image_trusted(img_path_str, pub_key, verified_boot)?;
+    crate::mount::mount_loop(img_path_str, root_mount)?;
     eprintln!("initos: mounted root image at {}", root_mount);
     Ok(())
 }
@@ -415,6 +465,7 @@ fn mount_host_images(
     root_mount: &str,
     pub_key: &str,
     verified_boot: bool,
+    boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_mnt = Path::new(root_mount).join("mnt");
     let root_mnt_str = root_mnt
@@ -429,6 +480,7 @@ fn mount_host_images(
         "mnt/firmware",
         pub_key,
         verified_boot,
+        boot_partition_id,
     )?;
 
     let kernel = kernel_release()?;
@@ -441,6 +493,7 @@ fn mount_host_images(
         &modules_target,
         pub_key,
         verified_boot,
+        boot_partition_id,
     )?;
     bind_host_image_mounts(root_mount)?;
     Ok(())
@@ -654,8 +707,9 @@ fn mount_host_image(
     target_rel: &str,
     pub_key: &str,
     verified_boot: bool,
+    boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(image_path) = find_host_image(state_mount, image_name) else {
+    let Some(image_path) = find_host_image(state_mount, image_name, boot_partition_id) else {
         eprintln!("initos: {} not found, skipping mount", image_name);
         return Ok(());
     };
@@ -683,7 +737,63 @@ fn mount_host_image(
     Ok(())
 }
 
-fn find_host_image(state_mount: &str, image_name: &str) -> Option<PathBuf> {
+fn partitioned_image_path(path: &Path, part_id: u32) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let file_name = path.file_name()?;
+    Some(parent.join(part_id.to_string()).join(file_name))
+}
+
+fn check_partitioned_image(orig_path: &Path, part_id: u32) -> Option<PathBuf> {
+    if let Some(part_path) = partitioned_image_path(orig_path, part_id) {
+        let mut sig_exists = false;
+        
+        let sig_path1 = part_path.with_extension(
+            part_path.extension()
+                .map(|e| format!("{}.sig", e.to_string_lossy()))
+                .unwrap_or_else(|| "sig".to_string())
+        );
+        if sig_path1.exists() {
+            sig_exists = true;
+        } else if let Some(parent) = part_path.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                let file_name_str = part_path.file_name().unwrap().to_string_lossy();
+                let sig_suffix = format!("{}.", file_name_str);
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&sig_suffix) && name.ends_with(".sig") {
+                        sig_exists = true;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if part_path.exists() && sig_exists {
+            eprintln!("initos: partitioned image and signature found at {}", part_path.display());
+            return Some(part_path);
+        }
+    }
+    None
+}
+
+fn find_host_image(
+    state_mount: &str,
+    image_name: &str,
+    boot_partition_id: Option<u32>,
+) -> Option<PathBuf> {
+    if let Some(part_id) = boot_partition_id {
+        let candidates = [
+            Path::new(state_mount).join("img").join(image_name),
+            Path::new("/img").join(image_name),
+            Path::new("/data/img").join(image_name),
+        ];
+        for cand in &candidates {
+            if let Some(part_path) = check_partitioned_image(cand, part_id) {
+                return Some(part_path);
+            }
+        }
+    }
+
     [
         Path::new(state_mount).join("img").join(image_name),
         Path::new("/img").join(image_name),
@@ -751,3 +861,79 @@ pub fn verify_image_trusted(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_partitioned_image_path() {
+        let path = Path::new("/foo/bar/image.erofs");
+        let result = partitioned_image_path(path, 101).unwrap();
+        assert_eq!(result, Path::new("/foo/bar/101/image.erofs"));
+    }
+
+    #[test]
+    fn test_check_partitioned_image_exists_and_signed() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path();
+        
+        let orig_img = base_path.join("firmware.erofs");
+        
+        // 1. Create a partitioned directory, image, and signature
+        let part_dir = base_path.join("101");
+        fs::create_dir(&part_dir).unwrap();
+        
+        let part_img = part_dir.join("firmware.erofs");
+        fs::write(&part_img, b"test image").unwrap();
+        
+        let part_sig = part_dir.join("firmware.erofs.sig");
+        fs::write(&part_sig, b"test signature").unwrap();
+        
+        // 2. Check check_partitioned_image
+        let result = check_partitioned_image(&orig_img, 101).unwrap();
+        assert_eq!(result, part_img);
+        
+        // 3. Without signature, it should return None
+        fs::remove_file(&part_sig).unwrap();
+        assert!(check_partitioned_image(&orig_img, 101).is_none());
+        
+        // 4. Without image, it should return None
+        fs::write(&part_sig, b"test signature").unwrap();
+        fs::remove_file(&part_img).unwrap();
+        assert!(check_partitioned_image(&orig_img, 101).is_none());
+    }
+
+    #[test]
+    fn test_find_host_image_partitioned_first() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path();
+        
+        // Setup default path: state_mount/img/firmware.erofs
+        let img_dir = base_path.join("img");
+        fs::create_dir(&img_dir).unwrap();
+        let default_img = img_dir.join("firmware.erofs");
+        fs::write(&default_img, b"default image").unwrap();
+        
+        // Setup partitioned path: state_mount/img/101/firmware.erofs
+        let part_dir = img_dir.join("101");
+        fs::create_dir(&part_dir).unwrap();
+        let part_img = part_dir.join("firmware.erofs");
+        fs::write(&part_img, b"partitioned image").unwrap();
+        let part_sig = part_dir.join("firmware.erofs.sig");
+        fs::write(&part_sig, b"sig").unwrap();
+        
+        let state_mount = base_path.to_str().unwrap();
+        
+        // With partition ID 101, it should find the partitioned one
+        let found = find_host_image(state_mount, "firmware.erofs", Some(101)).unwrap();
+        assert_eq!(found, part_img);
+        
+        // Without partition ID, it should fall back to default
+        let found_default = find_host_image(state_mount, "firmware.erofs", None).unwrap();
+        assert_eq!(found_default, default_img);
+    }
+}
+
