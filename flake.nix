@@ -99,6 +99,7 @@
         perl
         sbsigntool
         stdenv.cc
+        swtpm
         tinyxxd
         util-linux
       ];
@@ -193,10 +194,15 @@
         };
       };
 
+      deps = pkgs.symlinkJoin {
+        name = "initos-deps";
+        paths = signRuntimeDeps;
+      };
+
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image;
+        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image deps;
         default = initos-signer;
       };
     };

@@ -86,8 +86,8 @@ sign_init() {
 
     # SSL and SSH key is the real public - minisign is using the sha.
 
-    minisign -GW -s ${SECRETS}/minisign.key -p ${SECRETS}/minisign.pub
-    PUB=$(sed -n '2p' ${SECRETS}/minisign.pub)
+    #minisign -GW -s ${SECRETS}/minisign.key -p ${SECRETS}/minisign.pub
+    #PUB=$(sed -n '2p' ${SECRETS}/minisign.pub)
 
     echo $PUB
     #cat ${SECRETS}/minisign.pub
@@ -461,8 +461,6 @@ _prepare_kernel_bzimage() {
 }
 
 # Sign a Nix artifact tree produced by .#initos-signer.
-# Usage: artifacts [artifact_dir] <output_dir> [secrets_dir]
-# If artifact_dir is omitted, it is auto-detected from the script's location.
 artifacts() {
     local output_dir="${1:?Usage: artifacts <output_dir> [kernel_dir] [artifact_dir]}"
     mkdir -p "${output_dir}/img"
@@ -471,20 +469,20 @@ artifacts() {
     local kernel_dir="${2:-}"
     local artifact_dir="${3:-}"
     local sec_dir="${SECRETS:-/var/run/secrets/uefi-keys}"
-
-    # Auto-detect kernel_dir
-    if [ -z "${kernel_dir}" ]; then
+    local PROFILE_DIR
         local SCRIPT_DIR
         SCRIPT_DIR=$(dirname "$0")
         if [ "$SCRIPT_DIR" = "." ] && command -v "$0" >/dev/null 2>&1; then
             SCRIPT_DIR=$(dirname "$(command -v "$0")")
         fi
+    PROFILE_DIR=$(dirname "$SCRIPT_DIR")
         
-        local PROFILE_DIR
-        PROFILE_DIR=$(dirname "$SCRIPT_DIR")
+
+    # Auto-detect kernel_dir
+    if [ -z "${kernel_dir}" ]; then
         
         if [ -f "/opt/kernel-image/bzImage" ]; then
-            # Nix
+            # docker image
             kernel_dir="/opt/kernel-image"
         elif [ -f "${PROFILE_DIR}/opt/kernel-image/bzImage" ]; then
             # Nix profile (e.g., .../result/opt/kernel-image/)
@@ -492,9 +490,6 @@ artifacts() {
         elif [ -f "/mnt/kernel-image/opt/kernel-image/bzImage" ]; then
             # Mounted from a docker image
             kernel_dir="/mnt/kernel-image/opt/kernel-image"
-        elif [ -f "${PWD}/target/opt/kernel-image/bzImage" ]; then
-            # In source tree
-            kernel_dir="${PWD}/target/opt/kernel-image"
         fi
     fi
 
@@ -504,10 +499,13 @@ artifacts() {
         exit 1
     fi
 
-    # Auto-detect alrtifact_dir
+    # Auto-detect artifact_dir
     if [ -z "${artifact_dir}" ]; then
         if [ -f "/img/initos.erofs" ]; then
-            artifact_dir="/"
+            # Docker image
+	    artifact_dir="/"
+        elif [ -f "${PROFILE_DIR}/img/initos.erofs" ]; then
+            artifact_dir="${PROFILE_DIR}"
         elif [ -f "${PWD}/target/artifacts/img/initos.erofs" ]; then
             artifact_dir="${PWD}/target/artifacts"
         fi
@@ -636,7 +634,7 @@ _copy_uefi_public_keys() {
 
     echo "Installing UEFI public keys into ${dst_dir}..."
     mkdir -p "${dst_dir}"
-    for f in PK.cer PK.crt PK.esl PK.auth KEK.cer KEK.crt KEK.auth KEK.esl db.cer db.esl db.crt db.auth image_key_pub.pem image_key.pub.b64 root.pem minisign.pub; do
+    for f in PK.cer PK.crt PK.esl PK.auth KEK.cer KEK.crt KEK.auth KEK.esl db.cer db.esl db.crt db.auth image_key_pub.pem image_key.pub.b64 root.pem ; do
         if [ -f "${SECRETS}/${f}" ]; then
             cp "${SECRETS}/${f}" "${dst_dir}/"
         else

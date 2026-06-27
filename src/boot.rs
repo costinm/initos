@@ -41,6 +41,12 @@ pub fn unseal_key_from_handle(
     let mut dev = crate::tpm2::open()?;
     let session = crate::tpm2::start_policy_session(&mut dev)?;
     crate::tpm2::policy_pcr(&mut dev, session)?;
+    let digest = crate::tpm2::policy_get_digest(&mut dev, session)?;
+    eprintln!(
+        "initos: unseal policy digest ({} bytes): {}",
+        digest.len(),
+        crate::tpm2::hex(&digest)
+    );
     let secret = strip_tpm_prefix(
         crate::tpm2::unseal(&mut dev, handle, session)?,
         prefix,
@@ -936,4 +942,3 @@ mod tests {
         assert_eq!(found_default, default_img);
     }
 }
-

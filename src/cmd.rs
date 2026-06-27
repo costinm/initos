@@ -191,7 +191,11 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(identity) = age::x25519::Identity::from_str(id_path) {
                 identities.push(Box::new(identity));
             } else {
-                return Err(format!("failed to read identity file or parse identity from '{}'", id_path).into());
+                return Err(format!(
+                    "failed to read identity file or parse identity from '{}'",
+                    id_path
+                )
+                .into());
             }
         }
     }
@@ -239,7 +243,8 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
     // Read ciphertext from file or stdin
     let mut cipher = Vec::new();
     if let Some(ref path) = input_file {
-        cipher = fs::read(path).map_err(|e| format!("failed to read input file '{}': {}", path, e))?;
+        cipher =
+            fs::read(path).map_err(|e| format!("failed to read input file '{}': {}", path, e))?;
     } else {
         io::stdin().read_to_end(&mut cipher)?;
     }

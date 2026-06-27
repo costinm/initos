@@ -338,12 +338,16 @@ fn cmd_seal(
 
     let mut dev = initos::tpm2::open()?;
 
-    // 1. Get the PCR policy digest via a trial session
-    let trial = initos::tpm2::start_trial_session(&mut dev)?;
-    initos::tpm2::policy_pcr(&mut dev, trial)?;
-    let digest = initos::tpm2::policy_get_digest(&mut dev, trial)?;
-    initos::tpm2::flush_context(&mut dev, trial)?;
-    eprintln!("initos: policy digest ({} bytes)", digest.len());
+    // 1. Get the PCR policy digest using the same policy session shape as unseal.
+    let policy = initos::tpm2::start_policy_session(&mut dev)?;
+    initos::tpm2::policy_pcr(&mut dev, policy)?;
+    let digest = initos::tpm2::policy_get_digest(&mut dev, policy)?;
+    initos::tpm2::flush_context(&mut dev, policy)?;
+    eprintln!(
+        "initos: policy digest ({} bytes): {}",
+        digest.len(),
+        initos::tpm2::hex(&digest)
+    );
 
     // 2. Create sealed object under the primary
     let mut sealed_secret = Vec::with_capacity(mode.prefix().len() + secret.len());

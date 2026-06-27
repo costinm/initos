@@ -112,7 +112,10 @@ pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
     let payload = match read_efi_var(&boot_var_name, base_path) {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("initos: failed to read EFI variable {}: {}", boot_var_name, e);
+            eprintln!(
+                "initos: failed to read EFI variable {}: {}",
+                boot_var_name, e
+            );
             return Ok(None);
         }
     };
@@ -120,7 +123,11 @@ pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
     if payload.len() < 6 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Boot variable {} payload too short: {} bytes", boot_var_name, payload.len()),
+            format!(
+                "Boot variable {} payload too short: {} bytes",
+                boot_var_name,
+                payload.len()
+            ),
         ));
     }
 
@@ -141,7 +148,10 @@ pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
     if !found_null {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Boot variable {} Description is not null-terminated", boot_var_name),
+            format!(
+                "Boot variable {} Description is not null-terminated",
+                boot_var_name
+            ),
         ));
     }
 
@@ -152,7 +162,9 @@ pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
             io::ErrorKind::InvalidData,
             format!(
                 "Boot variable {} FilePathList extends beyond payload ({} > {})",
-                boot_var_name, file_path_list_end, payload.len()
+                boot_var_name,
+                file_path_list_end,
+                payload.len()
             ),
         ));
     }
@@ -189,7 +201,6 @@ pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
 
     Ok(None)
 }
-
 
 /// Parse an EFI Signature List and extract X.509 certificates.
 ///
@@ -517,13 +528,14 @@ mod tests {
 
         // 2. Write Boot0003
         let mut boot_var_data = vec![0x06, 0x00, 0x00, 0x00]; // attributes
-        // Payload of EFI_LOAD_OPTION starts:
-        // Attributes (4 bytes):
+                                                              // Payload of EFI_LOAD_OPTION starts:
+                                                              // Attributes (4 bytes):
         boot_var_data.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         // FilePathListLength (2 bytes): 42 bytes (length of Hard Drive device path)
         boot_var_data.extend_from_slice(&42u16.to_le_bytes());
         // Description (null-terminated UTF-16): e.g. "B" (0x42 0x00), "o" (0x6F 0x00), "o" (0x6F 0x00), "t" (0x74 0x00), null (0x00 0x00)
-        boot_var_data.extend_from_slice(&[0x42, 0x00, 0x6F, 0x00, 0x6F, 0x00, 0x74, 0x00, 0x00, 0x00]);
+        boot_var_data
+            .extend_from_slice(&[0x42, 0x00, 0x6F, 0x00, 0x6F, 0x00, 0x74, 0x00, 0x00, 0x00]);
         // FilePathList (42 bytes of Hard Drive device path):
         // Type: 4, SubType: 1
         boot_var_data.push(0x04);
