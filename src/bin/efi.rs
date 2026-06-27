@@ -429,7 +429,10 @@ mod uefi_bin {
             Err(_) => false,
         };
 
-        // 3. Read db (Signature Database) to get certs for config/initrd verification
+        // 3. Read db (Signature Database) to get certs for config/initrd verification.
+        // When Secure Boot is enabled, a missing/unreadable/empty db is a hard
+        // failure: we refuse to boot an unsigned kernel/initrd rather than
+        // silently skipping verification.
         let mut db_buf = [0u8; 4096];
         let db_slice: &[u8] = if secure_boot {
             println!("Secure Boot is ENABLED. Reading db variable...");
@@ -439,10 +442,14 @@ mod uefi_bin {
             // db uses the Image Security Database GUID, not the global GUID
             let db_vendor = VariableVendor(uefi::guid!("d719b2cb-3d3a-4596-a3bc-dad00e67656f"));
             match uefi::runtime::get_variable(db_name, &db_vendor, &mut db_buf) {
-                Ok((data, _)) => data,
+                Ok((data, _)) if !data.is_empty() => data,
+                Ok(_) => {
+                    println!("❌ db variable is empty — refusing to boot without a usable signature database");
+                    loop {}
+                }
                 Err(e) => {
-                    println!("Failed to read db variable: {:?}", e);
-                    &[]
+                    println!("❌ Failed to read db variable: {:?} — refusing to boot without a usable signature database", e);
+                    loop {}
                 }
             }
         } else {
@@ -451,7 +458,7 @@ mod uefi_bin {
         };
 
         // 4. Verify config signature using db certs
-        if secure_boot && !db_slice.is_empty() {
+        if secure_boot {
             println!("Verifying config signature...");
             if verify_data_signature(&config_data, db_slice, "\\EFI\\BOOT\\{}.sig", "config") {
                 println!("✅ CONFIG VERIFIED OK");
@@ -477,7 +484,7 @@ mod uefi_bin {
         );
 
         // Verify kernel signature if secure boot is enabled
-        if secure_boot && !db_slice.is_empty() {
+        if secure_boot {
             println!("Verifying kernel signature...");
             let kernel_data =
                 unsafe { core::slice::from_raw_parts(kernel_addr as *const u8, kernel_size) };

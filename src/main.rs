@@ -6,8 +6,9 @@
 //!                          Unseal TPM2 key via PCR SHA256:7 policy
 //!   lock_tpm               Extend PCR 7 to prevent further unsealing
 //!   primary                Create a TPM2 primary key and persist it, required for seal.
-//!   seal [--dev|--secure] [--handle HANDLE] <SECRET>
-//!                          Seal a key to TPM2 with PCR SHA256:7 policy
+//!   seal [--dev|--secure] [--handle HANDLE] [--secret-file PATH]
+//!                          Seal a key to TPM2 with PCR SHA256:7 policy.
+//!                          Secret read from --secret-file PATH, INITOS_SECRET env, or stdin.
 //!   fscrypt <PATH>         Check FSCRYPT_KEY env or prompt for key + add to filesystem keyring (unlock)
 //!   fscrypt-setup <DIR>    Check FSCRYPT_KEY env or prompt for key + add to keyring + set encryption policy
 //!   boot                   Full initrd boot sequence (mount, verify, switch_root)
@@ -17,15 +18,16 @@
 //!   encrypt [ARGS]         Encrypt stdin using age to x25519 recipients (args).
 //!   decrypt [FILE] [-i KEY] [-o OUT]
 //!                          Decrypt file or stdin using age with identity from KEY_FILE, KEY, or CLI
-//!   recovery-encrypt <SECRET> [PUB_KEY]
+//!   recovery-encrypt [PUB_KEY] [--secret-file PATH]
 //!                          Encrypt a secret for recovery using an Ed25519 public key.
+//!                          Secret read from --secret-file PATH, INITOS_SECRET env, or stdin.
 //!
 //! Environment for initrd boot:
 //!   INITOS_IMG       image path (default: /img/initos.erofs, boot mode)
 //!   INITOS_DATA      partition label (default: STATE, boot mode)
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 fn main() {
@@ -50,15 +52,25 @@ fn main() {
             "lock_tpm" => cmd_lock_tpm(),
             "primary" => cmd_primary(),
             "seal" => {
-                let (mode, handle, secret) = match parse_seal_args(&args[2..]) {
+                let (mode, handle, secret_file) = match parse_seal_args(&args[2..]) {
                     Ok(parsed) => parsed,
                     Err(e) => {
                         eprintln!("{}", e);
-                        eprintln!("Usage: initos seal [--dev|--secure] [--handle HANDLE] <SECRET>");
+                        eprintln!("Usage: initos seal [--dev|--secure] [--handle HANDLE] [--secret-file PATH]");
                         process::exit(1);
                     }
                 };
-                cmd_seal(&secret, mode, handle)
+                match read_secret_input(secret_file.as_deref()) {
+                    Ok(secret) if !secret.is_empty() => cmd_seal(&secret, mode, handle),
+                    Ok(_) => {
+                        eprintln!("initos: seal secret is empty (provide via --secret-file PATH, INITOS_SECRET env, or stdin)");
+                        process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("initos: failed to read secret: {}", e);
+                        process::exit(1);
+                    }
+                }
             }
             "fscrypt" => {
                 if args.len() < 3 {
@@ -93,22 +105,25 @@ fn main() {
             "encrypt" => initos::cmd::cmd_encrypt(),
             "decrypt" => initos::cmd::cmd_decrypt(),
             "recovery-encrypt" => {
-                if args.len() < 3 {
-                    eprintln!("Usage: initos recovery-encrypt <SECRET> [PUB_KEY_B64]");
-                    process::exit(1);
-                }
-                let pub_key = if args.len() >= 4 {
-                    args[3].clone()
-                } else {
-                    match env::var("INITOS_PUB_KEY") {
-                        Ok(key) => key,
-                        Err(_) => {
-                            eprintln!("PUB_KEY_B64 argument or INITOS_PUB_KEY is required");
-                            process::exit(1);
-                        }
+                let (pub_key, secret_file) = match parse_recovery_encrypt_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        eprintln!("Usage: initos recovery-encrypt [PUB_KEY_B64] [--secret-file PATH]");
+                        process::exit(1);
                     }
                 };
-                initos::cmd::cmd_recovery_encrypt(&args[2], &pub_key)
+                match read_secret_input(secret_file.as_deref()) {
+                    Ok(secret) if !secret.is_empty() => initos::cmd::cmd_recovery_encrypt(&secret, &pub_key),
+                    Ok(_) => {
+                        eprintln!("initos: recovery secret is empty (provide via --secret-file PATH, INITOS_SECRET env, or stdin)");
+                        process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("initos: failed to read secret: {}", e);
+                        process::exit(1);
+                    }
+                }
             }
             "help" | "--help" | "-h" => {
                 initos::cmd::print_help();
@@ -242,10 +257,10 @@ fn parse_unseal_args(args: &[String]) -> Result<(SealMode, Option<u32>), String>
     Ok((mode.unwrap_or_else(detect_seal_mode), handle))
 }
 
-fn parse_seal_args(args: &[String]) -> Result<(SealMode, Option<u32>, String), String> {
+fn parse_seal_args(args: &[String]) -> Result<(SealMode, Option<u32>, Option<String>), String> {
     let mut mode = None;
     let mut handle = None;
-    let mut secret = None;
+    let mut secret_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -258,21 +273,48 @@ fn parse_seal_args(args: &[String]) -> Result<(SealMode, Option<u32>, String), S
                     .ok_or_else(|| "--handle requires a value".to_string())?;
                 handle = Some(parse_tpm_handle(value)?);
             }
+            "--secret-file" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--secret-file requires a value".to_string())?;
+                secret_file = Some(value.to_string());
+            }
             value if value.starts_with("--") => {
                 return Err(format!("unexpected seal argument: {}", value));
             }
             value => {
-                if secret.is_some() {
-                    return Err("seal accepts exactly one SECRET argument".to_string());
-                }
-                secret = Some(value.to_string());
+                return Err(format!(
+                    "seal no longer accepts SECRET as a positional argument (visible in /proc/cmdline and shell history); use --secret-file PATH, INITOS_SECRET env, or stdin: got '{}'",
+                    value
+                ));
             }
         }
         i += 1;
     }
 
-    let secret = secret.ok_or_else(|| "seal requires SECRET".to_string())?;
-    Ok((mode.unwrap_or_else(detect_seal_mode), handle, secret))
+    Ok((mode.unwrap_or_else(detect_seal_mode), handle, secret_file))
+}
+
+/// Read secret material from --secret-file PATH, INITOS_SECRET env, or stdin.
+/// Never from argv — secrets on the command line are visible via /proc and shell history.
+fn read_secret_input(secret_file: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = secret_file {
+        if path == "-" {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf)?;
+            return Ok(buf.trim_end().to_string());
+        }
+        return Ok(std::fs::read_to_string(path).map(|s| s.trim_end().to_string())?);
+    }
+    if let Ok(secret) = env::var("INITOS_SECRET") {
+        if !secret.is_empty() {
+            return Ok(secret);
+        }
+    }
+    let mut buf = String::new();
+    io::stdin().read_to_string(&mut buf)?;
+    Ok(buf.trim_end().to_string())
 }
 
 fn parse_tpm_handle(value: &str) -> Result<u32, String> {
@@ -303,6 +345,43 @@ fn parse_tpm_handle(value: &str) -> Result<u32, String> {
         ));
     }
     Ok(handle)
+}
+
+/// Parse recovery-encrypt args: optional PUB_KEY_B64 (positional) + --secret-file.
+/// The secret itself is never taken from argv.
+fn parse_recovery_encrypt_args(args: &[String]) -> Result<(String, Option<String>), String> {
+    let mut pub_key: Option<String> = None;
+    let mut secret_file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--secret-file" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--secret-file requires a value".to_string())?;
+                secret_file = Some(value.to_string());
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("unexpected recovery-encrypt argument: {}", value));
+            }
+            value => {
+                if pub_key.is_some() {
+                    return Err("recovery-encrypt accepts at most one PUB_KEY_B64 argument".to_string());
+                }
+                pub_key = Some(value.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let pub_key = pub_key.unwrap_or_else(|| {
+        env::var("INITOS_PUB_KEY").unwrap_or_else(|_| {
+            eprintln!("PUB_KEY_B64 argument or INITOS_PUB_KEY is required");
+            process::exit(1);
+        })
+    });
+    Ok((pub_key, secret_file))
 }
 
 fn detect_seal_mode() -> SealMode {

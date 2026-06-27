@@ -6,14 +6,6 @@ image verification rules, unlock behavior, or init selection logic changes.
 
 ## Environment Variables on kernel command line
 
-`INITOS_PUB_KEY`
-
-- Base64 Ed25519 public key used for verified boot checks.
-- Empty or unset means development mode.
-- When set, `initos.erofs`, `firmware.erofs`, and `modules-<kernel>.erofs` are verified before mounting.
-- When set, an already-unlocked `/z/c` is treated as a boot failure because unlock must happen in the initrd.
-- Passed through to the final process at `switch_root`.
-
 `INITOS_IMG`
 
 - Root EROFS image path relative to the mounted state filesystem when no encrypted root directory is selected.
@@ -51,7 +43,7 @@ image verification rules, unlock behavior, or init selection logic changes.
 - Optional efivarfs base path.
 - Default: `/sys/firmware/efi/efivars`.
 - Used to read the EFI `SecureBoot` variable for verified-mode detection.
-- If the EFI `SecureBoot` variable cannot be read, boot falls back to treating a non-empty `INITOS_PUB_KEY` as verified mode.
+- Verified mode is determined solely from EFI SecureBoot; if the variable cannot be read, boot runs in development (unverified) mode.
 - Passed through to the final process at `switch_root`.
 - Temp - may be removed.
 
@@ -140,28 +132,26 @@ Auto-detected init paths:
 
 ## Boot Steps
 
-1. Read `INITOS_PUB_KEY`.
-2. Treat an empty key as development mode and a non-empty key as verified mode.
-3. Read `INITOS_IMG`, defaulting to `/img/initos.erofs`.
-4. Read `INITOS_DATA`, defaulting to `STATE`.
-5. Read the running kernel release from `/proc/sys/kernel/osrelease`; if that fails, use `uname`. TODO: uname may not be present.
-6. Mount initrd pseudo-filesystems:
+1. Read `INITOS_IMG`, defaulting to `/img/initos.erofs`.
+2. Read `INITOS_DATA`, defaulting to `STATE`.
+3. Read the running kernel release from `/proc/sys/kernel/osrelease`; if that fails, use `uname`. TODO: uname may not be present.
+4. Mount initrd pseudo-filesystems:
    - `proc` at `/proc`
    - `sysfs` at `/sys`
    - `efivarfs` at `/sys/firmware/efi/efivars`
    - `devtmpfs` at `/dev`
-7. Detect verified mode from EFI SecureBoot, falling back to `INITOS_PUB_KEY` if EFI state is unavailable.
-8. Resolve the state block device selected by `INITOS_DATA`.
-9. Mount the state device as ext4 at `/z`.
-10. Unlock `/z/c` if needed.
-11. Mount the root filesystem at `/sysroot`.
-12. Bind `/z` to `/sysroot/z`.
-13. Mount host firmware and module images under `/sysroot/mnt`.
-14. Bind host firmware and module mounts into rootfs library directories when those directories exist.
-15. Bind selected encrypted state directories into the new root when both source and target directories exist.
-16. Mount system filesystems under `/sysroot`.
-17. Select the final init.
-18. Move `/sysroot` to `/`, chroot into it, and execute the selected init with all current environment variables.
+5. Detect verified mode from EFI SecureBoot. If the `SecureBoot` variable cannot be read, boot runs in development (unverified) mode.
+6. Resolve the state block device selected by `INITOS_DATA`.
+7. Mount the state device as ext4 at `/z`.
+8. Unlock `/z/c` if needed.
+9. Mount the root filesystem at `/sysroot`.
+10. Bind `/z` to `/sysroot/z`.
+11. Mount host firmware and module images under `/sysroot/mnt`.
+12. Bind host firmware and module mounts into rootfs library directories when those directories exist.
+13. Bind selected encrypted state directories into the new root when both source and target directories exist.
+14. Mount system filesystems under `/sysroot`.
+15. Select the final init.
+16. Move `/sysroot` to `/`, chroot into it, and execute the selected init with all current environment variables.
 
 ## State Device Selection
 
@@ -227,7 +217,7 @@ TPM setup commands:
   `initos seal --dev --handle 0x81001002 <SECRET>`
   `initos seal --secure --handle 0x81001003 <SECRET>`
 - Without `--handle`, `initos seal --dev <SECRET>` uses `0x81001002` and `initos seal --secure <SECRET>` uses `0x81001003`.
-- Without `--dev` or `--secure`, `initos seal <SECRET>` reads EFI SecureBoot and chooses the matching handle and prefix. If EFI SecureBoot cannot be read, it falls back to `INITOS_PUB_KEY`: non-empty uses the Secure Boot handle and empty/unset uses the development/unverified handle.
+- Without `--dev` or `--secure`, `initos seal <SECRET>` reads EFI SecureBoot and chooses the matching handle and prefix. If EFI SecureBoot cannot be read, it uses the development/unverified handle.
 - `initos unseal` follows the same auto-detection rule.
 - `initos unseal --dev --handle 1002` and `initos unseal --secure --handle 1003` can be used to test explicit handles.
 
@@ -260,7 +250,9 @@ The encrypted root check happens before the root EROFS image is used.
 
 ## Image Verification
 
-Image verification runs only when `INITOS_PUB_KEY` is non-empty.
+Image verification runs only in verified mode (EFI SecureBoot enabled). It uses
+the UEFI `db` certificates to verify per-image signatures (see `verify_image_db`
+in `src/verify.rs`).
 
 The following images are verified before mounting:
 
@@ -273,6 +265,20 @@ measurement/signature flow used by the image verifier.
 
 If an image is absent, firmware and modules mounting is skipped for that image.
 Missing host firmware or modules images are not fatal by themselves.
+
+### Missing Signatures In Verified Mode
+
+In verified mode, a missing signature file is a hard boot failure. This applies
+to both the standard image path and the partitioned image path: when a boot
+partition ID is extracted from EFI variables and the corresponding partitioned
+image file exists on STATE but has no matching `.sig`, the boot fails rather
+than silently falling back to the unpartitioned default image. This prevents an
+attacker with write access to STATE from forcing the use of a different
+(possibly older) image by deleting a partitioned signature.
+
+In development mode (Secure Boot disabled), missing signatures are not fatal —
+the image is still mounted without verification. This is acceptable because
+development mode is already unverified by definition.
 
 ## Firmware And Modules Mounting
 
@@ -355,8 +361,8 @@ The handoff sequence is:
 for systemd, where `--system` is appended.
 
 `envp` is built from every current process environment variable. This preserves
-kernel-command-line variables such as `INITOS_PUB_KEY`, `INITOS_DATA`,
-`INITOS_ROOT`, `INITOS_IMG`, and `INITOS_INIT` for the final process.
+kernel-command-line variables such as `INITOS_DATA`, `INITOS_ROOT`,
+`INITOS_IMG`, and `INITOS_INIT` for the final process.
 
 ## Error Handling
 
@@ -373,3 +379,49 @@ Verified mode:
 - Log the boot failure.
 - Wait 10 seconds.
 - Exit with status 1.
+
+## Anti-Rollback And Key Rotation
+
+initos does not implement TPM-based monotonic counters or version binding:
+an older signed image plus its matching `.sig` (still validly signed by the
+owner key) can be copied onto STATE and booted, because PCR 7 only reflects
+Secure Boot state, not the image identity. A/B boot partitions (BOOTA/BOOTB)
+amplify the impact of a rollback mistake.
+
+The plan is to mitigate this by **periodically rotating the signing keys**:
+
+- The UEFI `db` key and the image Ed25519/RSA signing key are regenerated on a
+  schedule (nominally every N months).
+- New images are signed only with the current key; the previous key is retired
+  and no longer used to sign new images.
+- A retired key prevents new images from being booted after the firmware/db is
+  updated to the new key — old images signed with the retired key will no longer
+  verify.
+- This bounds the window during which a stolen/leaked signing key can produce
+  bootable images.
+
+Revocation does **not** rely on the UEFI `dbx` (forbidden signature database):
+initos does not read or consult `dbx`. Key rotation is the sole revocation
+mechanism. Operators are expected to retire old keys by updating `db` on the
+host rather than by maintaining a `dbx` denylist.
+
+## STATE Filesystem Writable Surface
+
+The STATE ext4 partition is mounted read-write during early boot so that the
+fscrypt key can be added to the filesystem keyring (which requires a writable
+mount). The partition holds signed EROFS images, their `.sig` files, and the
+encrypted `c.age` key material.
+
+Risk analysis:
+
+- **Verified mode:** an attacker with write access to STATE can delete
+  `.sig` files, causing the boot to **fail hard** (see "Missing Signatures In
+  Verified Mode" above). This is a denial-of-service, not a trust bypass: the
+  boot refuses to proceed without a valid signature. Reinstalling the missing
+  `.sig` from a signed artifact restores normal operation.
+- **Development mode:** STATE is writable and images are not verified, so a
+  writable STATE is not an additional risk — development mode is already
+  unverified by definition.
+- fs-verity protects verified files' contents at the block level; only file
+  *presence* and *metadata* (which `.sig` files exist) are influenced by a
+  writable STATE, and missing signatures are fatal in verified mode.

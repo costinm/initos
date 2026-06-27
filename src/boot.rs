@@ -60,8 +60,10 @@ pub fn unseal_key_from_handle(
 /// Full initrd boot sequence (PID 1): mount pseudo-fs, find STATE, verify images,
 /// loop-mount, preserve host images under /mnt, and switch_root.
 pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
-    let pub_key = String::new();
-    let verified_boot_mode = std::cell::Cell::new(false);
+    // None  = EFI SecureBoot state could not be read (hard fail, no dev fallback)
+    // Some(false) = SecureBoot explicitly disabled (dev initrd fallback applies)
+    // Some(true)  = SecureBoot enabled (verified mode, hard fail on errors)
+    let verified_boot_mode: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
 
     let boot_run = || -> Result<(), Box<dyn std::error::Error>> {
         let img = env::var("INITOS_IMG").unwrap_or_else(|_| "/img/initos.erofs".to_string());
@@ -86,8 +88,8 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("initos: failed to mount {} at {}: {}", fs, mp, e),
             };
         }
-        let verified_boot = detect_verified_boot();
-        verified_boot_mode.set(verified_boot);
+        let verified_boot = detect_verified_boot_strict()?;
+        verified_boot_mode.set(Some(verified_boot));
 
         let efi_base_path = env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
         let boot_partition_id = match crate::efi::extract_boot_partition_id(&efi_base_path) {
@@ -114,11 +116,11 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         unlock_state_c(state_mount, verified_boot)?;
 
         let root_mount = "/sysroot";
-        mount_rootfs(state_mount, root_mount, &img, &pub_key, verified_boot, boot_partition_id)?;
+        mount_rootfs(state_mount, root_mount, &img, verified_boot, boot_partition_id)?;
 
         let new_state_mount = format!("{}/z", root_mount);
         crate::mount::bind_mount(state_mount, &new_state_mount)?;
-        mount_host_images(state_mount, root_mount, &pub_key, verified_boot, boot_partition_id)?;
+        mount_host_images(state_mount, root_mount, verified_boot, boot_partition_id)?;
         bind_encrypted_state_paths(state_mount, root_mount)?;
         mount_system_filesystems(root_mount)?;
 
@@ -133,7 +135,8 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = boot_run() {
         eprintln!("initos: boot failed: {}", e);
-        if !verified_boot_mode.get() {
+        let allow_dev_fallback = matches!(verified_boot_mode.get(), Some(false));
+        if allow_dev_fallback {
             let dev_init_path = "/opt/initos/bin/initos-initrd";
             let boot_error = e.to_string().replace('\0', "\\0");
             env::set_var("INITOS_BOOT_ERROR", &boot_error);
@@ -151,7 +154,10 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
             );
             process::exit(1);
         } else {
-            eprintln!("initos: waiting 10 seconds before exit");
+            eprintln!(
+                "initos: verified_boot={:?}, refusing dev initrd fallback; waiting 10 seconds before exit",
+                verified_boot_mode.get()
+            );
             std::thread::sleep(std::time::Duration::from_secs(10));
             process::exit(1);
         }
@@ -182,7 +188,6 @@ fn mount_rootfs(
     state_mount: &str,
     root_mount: &str,
     img: &str,
-    pub_key: &str,
     verified_boot: bool,
     boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -223,10 +228,9 @@ fn mount_rootfs(
 
     let default_img_path = Path::new(state_mount).join(img.trim_start_matches('/'));
     let img_path = if let Some(part_id) = boot_partition_id {
-        if let Some(part_path) = check_partitioned_image(&default_img_path, part_id) {
-            part_path
-        } else {
-            default_img_path
+        match check_partitioned_image(&default_img_path, part_id, verified_boot)? {
+            Some(part_path) => part_path,
+            None => default_img_path,
         }
     } else {
         default_img_path
@@ -236,7 +240,7 @@ fn mount_rootfs(
         .to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", img_path.display()))?;
 
-    verify_image_trusted(img_path_str, pub_key, verified_boot)?;
+    verify_image_trusted(img_path_str, "", verified_boot)?;
     crate::mount::mount_loop(img_path_str, root_mount)?;
     eprintln!("initos: mounted root image at {}", root_mount);
     Ok(())
@@ -332,6 +336,19 @@ fn unlock_c_with_tpm(c_dir: &Path, verified_boot: bool) -> Result<(), Box<dyn st
         return Err(format!("{} did not unlock with TPM", c_dir.display()).into());
     }
     eprintln!("initos: unlocked {} using TPM", c_dir.display());
+
+    // Anti-replay: extend PCR 7 so the sealed secret cannot be unsealed again
+    // in this boot session. Errors are non-fatal — the secret is already in
+    // the fscrypt keyring and a failed extend only means a second unseal might
+    // still succeed this boot.
+    match crate::tpm2::open() {
+        Ok(mut dev) => match crate::tpm2::pcr_extend(&mut dev, 7) {
+            Ok(()) => eprintln!("initos: PCR 7 extended (sealed against further unseal)"),
+            Err(e) => eprintln!("initos: PCR 7 extend failed (non-fatal): {}", e),
+        },
+        Err(e) => eprintln!("initos: cannot reopen TPM for PCR extend (non-fatal): {}", e),
+    }
+
     Ok(())
 }
 
@@ -379,6 +396,9 @@ fn unlock_c_with_password(c_dir: &Path, c_age: &Path) -> Result<(), Box<dyn std:
 }
 
 fn add_fscrypt_key(dir: &Path, raw_key: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    // NOTE: repeat-padding caps entropy at the shortest input (see cmd::get_fscrypt_key).
+    // Acceptable because the primary path is a TPM-sealed installer-generated key,
+    // not a user-typed passphrase.
     if raw_key.is_empty() {
         return Err("fscrypt key is empty".into());
     }
@@ -466,10 +486,28 @@ pub fn detect_verified_boot() -> bool {
     }
 }
 
+/// Like `detect_verified_boot`, but fails hard if the EFI SecureBoot variable
+/// cannot be read. Used by the PID 1 boot path: a missing/unreadable SecureBoot
+/// variable is treated as a configuration error rather than silently falling
+/// back to development mode. When the variable is present and reports SecureBoot
+/// disabled, development mode is used (with the existing dev-initrd fallback).
+pub fn detect_verified_boot_strict() -> Result<bool, Box<dyn std::error::Error>> {
+    let base_path =
+        env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+    let value = crate::efi::read_secure_boot(&base_path).map_err(|e| {
+        format!(
+            "failed to read EFI SecureBoot from {}: {} (refusing to boot without a verified-mode decision; enable Secure Boot or fix efivarfs)",
+            base_path, e
+        )
+    })?;
+    let enabled = value != 0;
+    eprintln!("initos: EFI SecureBoot={} verified_boot={}", value, enabled);
+    Ok(enabled)
+}
+
 fn mount_host_images(
     state_mount: &str,
     root_mount: &str,
-    pub_key: &str,
     verified_boot: bool,
     boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -484,7 +522,6 @@ fn mount_host_images(
         root_mount,
         "firmware.erofs",
         "mnt/firmware",
-        pub_key,
         verified_boot,
         boot_partition_id,
     )?;
@@ -497,7 +534,6 @@ fn mount_host_images(
         root_mount,
         &modules,
         &modules_target,
-        pub_key,
         verified_boot,
         boot_partition_id,
     )?;
@@ -711,11 +747,10 @@ fn mount_host_image(
     root_mount: &str,
     image_name: &str,
     target_rel: &str,
-    pub_key: &str,
     verified_boot: bool,
     boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(image_path) = find_host_image(state_mount, image_name, boot_partition_id) else {
+    let Some(image_path) = find_host_image(state_mount, image_name, boot_partition_id, verified_boot)? else {
         eprintln!("initos: {} not found, skipping mount", image_name);
         return Ok(());
     };
@@ -723,7 +758,7 @@ fn mount_host_image(
     let image_path_str = image_path
         .to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", image_path.display()))?;
-    verify_image_trusted(image_path_str, pub_key, verified_boot)?;
+    verify_image_trusted(image_path_str, "", verified_boot)?;
 
     let target = Path::new(root_mount).join(target_rel);
     let target_str = target
@@ -749,10 +784,14 @@ fn partitioned_image_path(path: &Path, part_id: u32) -> Option<PathBuf> {
     Some(parent.join(part_id.to_string()).join(file_name))
 }
 
-fn check_partitioned_image(orig_path: &Path, part_id: u32) -> Option<PathBuf> {
+fn check_partitioned_image(
+    orig_path: &Path,
+    part_id: u32,
+    verified_boot: bool,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     if let Some(part_path) = partitioned_image_path(orig_path, part_id) {
         let mut sig_exists = false;
-        
+
         let sig_path1 = part_path.with_extension(
             part_path.extension()
                 .map(|e| format!("{}.sig", e.to_string_lossy()))
@@ -773,20 +812,29 @@ fn check_partitioned_image(orig_path: &Path, part_id: u32) -> Option<PathBuf> {
                 }
             }
         }
-        
-        if part_path.exists() && sig_exists {
-            eprintln!("initos: partitioned image and signature found at {}", part_path.display());
-            return Some(part_path);
+
+        if part_path.exists() {
+            if sig_exists {
+                eprintln!("initos: partitioned image and signature found at {}", part_path.display());
+                return Ok(Some(part_path));
+            }
+            if verified_boot {
+                return Err(format!(
+                    "partitioned image {} exists but has no signature (Secure Boot requires signatures)",
+                    part_path.display()
+                ).into());
+            }
         }
     }
-    None
+    Ok(None)
 }
 
 fn find_host_image(
     state_mount: &str,
     image_name: &str,
     boot_partition_id: Option<u32>,
-) -> Option<PathBuf> {
+    verified_boot: bool,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     if let Some(part_id) = boot_partition_id {
         let candidates = [
             Path::new(state_mount).join("img").join(image_name),
@@ -794,19 +842,19 @@ fn find_host_image(
             Path::new("/data/img").join(image_name),
         ];
         for cand in &candidates {
-            if let Some(part_path) = check_partitioned_image(cand, part_id) {
-                return Some(part_path);
+            if let Some(part_path) = check_partitioned_image(cand, part_id, verified_boot)? {
+                return Ok(Some(part_path));
             }
         }
     }
 
-    [
+    Ok([
         Path::new(state_mount).join("img").join(image_name),
         Path::new("/img").join(image_name),
         Path::new("/data/img").join(image_name),
     ]
     .into_iter()
-    .find(|path| path.exists())
+    .find(|path| path.exists()))
 }
 
 fn kernel_release() -> Result<String, Box<dyn std::error::Error>> {
@@ -829,13 +877,13 @@ fn kernel_release() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-/// Verify an image using Ed25519 if INITOS_PUB_KEY is set.
+/// Verify an image using Ed25519 if a public key is provided.
 pub fn verify_image_if_key(img: &str, pub_key: &str) -> Result<(), Box<dyn std::error::Error>> {
     if pub_key.is_empty() {
         return Ok(());
     }
 
-    eprintln!("initos: verifying image {} with INITOS_PUB_KEY", img);
+    eprintln!("initos: verifying image {} with Ed25519 pub key", img);
     let valid = crate::verify::verify_image(img, pub_key)?;
     if !valid {
         return Err("image signature verification FAILED".into());
@@ -898,18 +946,21 @@ mod tests {
         let part_sig = part_dir.join("firmware.erofs.sig");
         fs::write(&part_sig, b"test signature").unwrap();
         
-        // 2. Check check_partitioned_image
-        let result = check_partitioned_image(&orig_img, 101).unwrap();
-        assert_eq!(result, part_img);
+        // 2. Check check_partitioned_image (dev mode: no sig requirement)
+        let result = check_partitioned_image(&orig_img, 101, false).unwrap();
+        assert_eq!(result, Some(part_img.clone()));
         
-        // 3. Without signature, it should return None
+        // 3. Without signature in dev mode, it should return None (fall back)
         fs::remove_file(&part_sig).unwrap();
-        assert!(check_partitioned_image(&orig_img, 101).is_none());
+        assert!(check_partitioned_image(&orig_img, 101, false).unwrap().is_none());
+
+        // 3b. Without signature in verified mode, it should error
+        assert!(check_partitioned_image(&orig_img, 101, true).is_err());
         
         // 4. Without image, it should return None
         fs::write(&part_sig, b"test signature").unwrap();
         fs::remove_file(&part_img).unwrap();
-        assert!(check_partitioned_image(&orig_img, 101).is_none());
+        assert!(check_partitioned_image(&orig_img, 101, false).unwrap().is_none());
     }
 
     #[test]
@@ -933,12 +984,12 @@ mod tests {
         
         let state_mount = base_path.to_str().unwrap();
         
-        // With partition ID 101, it should find the partitioned one
-        let found = find_host_image(state_mount, "firmware.erofs", Some(101)).unwrap();
+        // With partition ID 101, it should find the partitioned one (dev mode)
+        let found = find_host_image(state_mount, "firmware.erofs", Some(101), false).unwrap().unwrap();
         assert_eq!(found, part_img);
         
         // Without partition ID, it should fall back to default
-        let found_default = find_host_image(state_mount, "firmware.erofs", None).unwrap();
+        let found_default = find_host_image(state_mount, "firmware.erofs", None, false).unwrap().unwrap();
         assert_eq!(found_default, default_img);
     }
 }

@@ -86,7 +86,7 @@ Initrd is using partition or disk label - and signatures on the binaries - to lo
 1. **Firmware Stage**: The UEFI firmware executes `initos.EFI` (built from `src/bin/efi.rs`). The loader reads the kernel command line from `\EFI\BOOT\config` and verifies its signature (`config.sig`) against the Secure Boot `db` certificate. It then verifies and executes the kernel (`bzImage` and `initrd.img`).
 2. **Mounting Pseudo Filesystems**: Upon initrd start, `initos` is executed as PID 1. It mounts `/proc`, `/sys`, and `/dev`.
 3. **Partition Discovery**: `initos` scans block devices in sysfs for a partition or EXT4 volume labeled `STATE` and mounts it as /z.
-4. **fs-verity Verification**: Once mounted, it measures the EROFS system image (`img/initos.erofs`) and validates its cryptographic hash against the signature file (`initos.erofs.sig`) using a public key passed via kernel command line `INITOS_PUB_KEY`.
+4. **fs-verity Verification**: Once mounted, it measures the EROFS system image (`img/initos.erofs`) and validates its cryptographic hash against the signature file (`initos.erofs.sig`) using the UEFI Secure Boot `db` certificate.
 5. **Switch Root**: The image is loop-mounted, the `STATE` partition is bind-mounted at `/z` inside the new rootfs, and `initos` performs a `switch_root` to run the OS init (defaults `/opt/initos/bin/initos-init-ver` - `INITOS_INIT` command line override).
 
 ---
@@ -116,7 +116,7 @@ A standard installation expects the following drive partitions:
 ### Subcommands
 
 Run `initos help` to list all subcommands:
-- `initos verify <IMG>`: Verify an image against its signature using `INITOS_PUB_KEY`.
+- `initos verify <IMG>`: Verify an image against its signature using the `INITOS_PUB_KEY` environment variable (Ed25519) or the UEFI `db` certificates when Secure Boot is enabled.
 - `initos mount <IMG> <DIR>`: Cryptographically verify and loop-mount an EROFS image.
 - `initos primary`: Create an RSA-2048 primary storage key in the TPM owner hierarchy.
 - `initos seal <SECRET>`: Seal a key to the TPM under PCR SHA256:7.
