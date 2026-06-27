@@ -14,13 +14,14 @@
 #   - Generating boot configs and sigining EFI.
 #
 # Usage (function dispatch):
-#   setup_signed.sh sign_init
-#   setup_signed.sh artifacts <output_dir> [kernel-dir] [artifacts-dir]
+#   sign.sh sign_init
+#   sign.sh artifacts <output_dir> [kernel-dir] [artifacts-dir]
 
 set -euo pipefail
 PATH="/usr/sbin:/sbin:${PATH}"
 
 SECRETS=${SECRETS:-/var/run/secrets/uefi-keys}
+NIX_PROFILE=${NIX_PROFILE:-${PWD}/target/nix/profiles/profile}
 
 # --- Key generation ---
 
@@ -89,27 +90,42 @@ sign_init() {
     #minisign -GW -s ${SECRETS}/minisign.key -p ${SECRETS}/minisign.pub
     #PUB=$(sed -n '2p' ${SECRETS}/minisign.pub)
 
-    echo $PUB
+    #echo $PUB
     #cat ${SECRETS}/minisign.pub
 
     #cat ${SECRETS}/authorized_keys
 
+    echo "Keys generated successfully"
+}
+
+generate_ed25519_keypair() {
+    local secrets_dir="${1:?Usage: generate_ed25519_keypair <secrets_dir>}"
+
     echo "Generating Ed25519 keypair..."
-    openssl genpkey -algorithm ed25519 -out "${SECRETS}/image_key.pem" 2>/dev/null
-    openssl pkey -in "${SECRETS}/image_key.pem" -pubout -out "${SECRETS}/image_key_pub.pem" 2>/dev/null
+    if ! openssl genpkey -algorithm ed25519 -out "${secrets_dir}/image_key.pem" 2>/dev/null; then
+        echo "ERROR: Failed to generate Ed25519 private key in ${secrets_dir}/image_key.pem" >&2
+        return 1
+    fi
+    if ! openssl pkey -in "${secrets_dir}/image_key.pem" -pubout -out "${secrets_dir}/image_key_pub.pem" 2>/dev/null; then
+        echo "ERROR: Failed to extract Ed25519 public key from ${secrets_dir}/image_key.pem" >&2
+        return 1
+    fi
 
-    # Extract raw 32-byte public key (last 32 bytes of DER encoding) as base64
     local pub_key_b64
-    pub_key_b64=$(openssl pkey -in "${SECRETS}/image_key.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)
-    echo -n "${pub_key_b64}" > "${SECRETS}/image_key.pub.b64"
+    if ! pub_key_b64=$(openssl pkey -in "${secrets_dir}/image_key.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64); then
+        echo "ERROR: Failed to extract raw Ed25519 public key bytes from ${secrets_dir}/image_key.pem" >&2
+        return 1
+    fi
+    echo -n "${pub_key_b64}" > "${secrets_dir}/image_key.pub.b64"
 
-    # Extract raw 32-byte private key seed (last 32 bytes of DER private key)
-    # This is the Ed25519 seed, compatible with wireguard/libsodium raw key format
-    openssl pkey -in "${SECRETS}/image_key.pem" -outform DER 2>/dev/null | tail -c 32 > "${SECRETS}/image_key.raw"
+    if ! openssl pkey -in "${secrets_dir}/image_key.pem" -outform DER 2>/dev/null | tail -c 32 > "${secrets_dir}/image_key.raw"; then
+        echo "ERROR: Failed to extract raw Ed25519 private key seed from ${secrets_dir}/image_key.pem" >&2
+        return 1
+    fi
 
-    echo "  Private key: ${SECRETS}/image_key.pem"
-    echo "  Raw privkey: ${SECRETS}/image_key.raw (32 bytes)"
-    echo "  Public key:  ${SECRETS}/image_key_pub.pem"
+    echo "  Private key: ${secrets_dir}/image_key.pem"
+    echo "  Raw privkey: ${secrets_dir}/image_key.raw (32 bytes)"
+    echo "  Public key:  ${secrets_dir}/image_key_pub.pem"
     echo "  Pub base64:  ${pub_key_b64}"
 }
 
@@ -121,11 +137,23 @@ sign_digest() {
     local private_key="${2:?Usage: sign_digest <digest_file> <private_key_pem> <output_sig>}"
     local output_sig="${3:?Usage: sign_digest <digest_file> <private_key_pem> <output_sig>}"
 
+    if [ ! -f "${digest_file}" ]; then
+        echo "ERROR: Digest file not found: ${digest_file}" >&2
+        return 1
+    fi
+    if [ ! -f "${private_key}" ]; then
+        echo "ERROR: Private key not found: ${private_key}" >&2
+        return 1
+    fi
+
     echo "Signing digest..."
-    openssl pkeyutl -sign -rawin \
+    if ! openssl pkeyutl -sign -rawin \
         -inkey "${private_key}" \
         -in "${digest_file}" \
-        -out "${output_sig}" 2>/dev/null
+        -out "${output_sig}" 2>/dev/null; then
+        echo "ERROR: openssl pkeyutl failed to sign digest" >&2
+        return 1
+    fi
 
     echo "  Signature: ${output_sig} ($(wc -c < "${output_sig}") bytes)"
 }
@@ -162,35 +190,56 @@ db_key_id() {
 # Sign artifacts without natively enabling fs-verity (computes digest offline).
 # Usage: image <image_dir> <file_name>
 image() {
-    local image_dir="${1:?Usage: create_signed_offline <image_path> <output_dir>}"
-    local filen="${2:?Usage: create_signed_offline <image_path> <output_dir>}"
+    local image_dir="${1:?Usage: image <image_dir> <file_name>}"
+    local filen="${2:?Usage: image <image_dir> <file_name>}"
     
     local img_name
     img_name="${image_dir}/${filen}"
 
-    # Generate keypair if not already created, 
-    # Using SECRETS env
-    sign_init "${SECRETS:-${out}/test/secrets}"
+    if [ ! -f "${img_name}" ]; then
+        echo "ERROR: Image file not found: ${img_name}" >&2
+        return 1
+    fi
 
-    # Compute the fsverity digest offline (does not require root/mounting)
-    local digest_hex
-    digest_hex=$(fsverity digest "${img_name}" | awk '{print $1}' | sed 's/^sha256://')
-    local digest_bin
+    sign_init
+
+    local digest_hex digest_bin
+    if ! digest_hex=$(fsverity digest "${img_name}" | awk '{print $1}' | sed 's/^sha256://'); then
+        echo "ERROR: Failed to compute fsverity digest for ${img_name}" >&2
+        return 1
+    fi
     digest_bin="$(mktemp)"
     echo -n "${digest_hex}" | xxd -r -p > "${digest_bin}"
 
-    # Sign the digest
-    sign_digest "${digest_bin}" \
-      "${SECRETS}/image_key.pem" \
-      "${img_name}.sig"
+    if [ -f "${SECRETS}/image_key.pem" ]; then
+        if ! sign_digest "${digest_bin}" \
+          "${SECRETS}/image_key.pem" \
+          "${img_name}.sig"; then
+            echo "ERROR: Failed to sign digest with Ed25519 key for ${img_name}" >&2
+            rm -f "${digest_bin}"
+            return 1
+        fi
+    fi
 
     if [ -f "${SECRETS}/db.key" ]; then
         local key_id
-        key_id=$(db_key_id "${SECRETS}/db.crt")
-        openssl dgst -sha256 -sign "${SECRETS}/db.key" \
+        if ! key_id=$(db_key_id "${SECRETS}/db.crt"); then
+            echo "ERROR: Failed to compute db key ID from ${SECRETS}/db.crt" >&2
+            rm -f "${digest_bin}"
+            return 1
+        fi
+        if ! openssl dgst -sha256 -sign "${SECRETS}/db.key" \
             -out "${img_name}.${key_id}.db.sig" \
-            "${digest_bin}"
+            "${digest_bin}"; then
+            echo "ERROR: Failed to sign digest with db.key for ${img_name}" >&2
+            rm -f "${digest_bin}"
+            return 1
+        fi
         echo "  DB signature: ${img_name}.${key_id}.db.sig"
+    else
+        echo "ERROR: db.key not found in ${SECRETS}" >&2
+        rm -f "${digest_bin}"
+        return 1
     fi
     rm -f "${digest_bin}"
 }
@@ -355,78 +404,6 @@ _build_signed_modules_image() {
     rm -rf "${stage}"
 }
 
-_kernel_cert_der() {
-    local sec_dir="${1:?Usage: _kernel_cert_der <secrets-dir> <out-cert>}"
-    local out_cert="${2:?Usage: _kernel_cert_der <secrets-dir> <out-cert>}"
-
-    if [ -f "${sec_dir}/db.cer" ]; then
-        cp "${sec_dir}/db.cer" "${out_cert}"
-    elif [ -f "${sec_dir}/db.crt" ]; then
-        openssl x509 -in "${sec_dir}/db.crt" -outform DER -out "${out_cert}"
-    else
-        echo "ERROR: db.cer or db.crt not found in ${sec_dir}" >&2
-        return 1
-    fi
-}
-
-_build_personalized_kernel_bzimage() {
-    local kernel_dir="${1:?Usage: _build_personalized_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
-    local sec_dir="${2:?Usage: _build_personalized_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
-    local output_bzimage="${3:?Usage: _build_personalized_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
-
-    if [ ! -x "${kernel_dir}/insert-sys-cert" ] || [ ! -f "${kernel_dir}/vmlinux" ]; then
-        echo "ERROR: kernel_dir must contain insert-sys-cert and vmlinux for cert personalization" >&2
-        return 1
-    fi
-    if [ ! -d "${kernel_dir}/build" ]; then
-        echo "ERROR: kernel_dir must contain build tree for personalized bzImage generation" >&2
-        return 1
-    fi
-    if [ ! -d "${kernel_dir}/source" ]; then
-        echo "ERROR: kernel_dir must contain kernel source tree for personalized bzImage generation" >&2
-        return 1
-    fi
-
-    local stage cert
-    stage=$(mktemp -d)
-    mkdir -p "$(dirname "${output_bzimage}")"
-    cert="${stage}/db.cer"
-    _kernel_cert_der "${sec_dir}" "${cert}"
-
-    echo "  Personalizing kernel trusted cert with ${cert}" >&2
-    local build_tree source_tree
-    build_tree=$(readlink -f "${kernel_dir}/build")
-    cp -a "${build_tree}/." "${stage}/build/"
-    chmod -R u+w "${stage}/build"
-    if [ -e "${stage}/build/source" ]; then
-        source_tree="${stage}/build/source"
-    else
-        ln -s "${kernel_dir}/source" "${stage}/build/source"
-        source_tree="${stage}/build/source"
-    fi
-    cp "${kernel_dir}/vmlinux" "${stage}/build/vmlinux"
-    chmod u+w "${stage}/build/vmlinux"
-
-    local srctree objtree
-    srctree=$(cd "${source_tree}" && pwd -P)
-    objtree="${stage}/build"
-
-    "${kernel_dir}/insert-sys-cert" -b "${objtree}/vmlinux" -c "${cert}" >&2
-    make -C "${objtree}" \
-        -f "${srctree}/scripts/Makefile.build" \
-        srctree="${srctree}" \
-        objtree="${objtree}" \
-        src="${srctree}/arch/x86/boot" \
-        VPATH="${srctree}" \
-        KBUILD_SRC="${srctree}" \
-        ARCH=x86 \
-        KBUILD_NOCMDDEP=1 \
-        obj=arch/x86/boot \
-        arch/x86/boot/bzImage >&2
-    cp "${stage}/build/arch/x86/boot/bzImage" "${output_bzimage}"
-    rm -rf "${stage}"
-}
-
 _copy_kernel_bzimage() {
     local kernel_dir="${1:?Usage: _copy_kernel_bzimage <kernel-dir> <output-bzimage>}"
     local output_bzimage="${2:?Usage: _copy_kernel_bzimage <kernel-dir> <output-bzimage>}"
@@ -437,27 +414,10 @@ _copy_kernel_bzimage() {
     fi
 
     mkdir -p "$(dirname "${output_bzimage}")"
+    if [ -f "${output_bzimage}" ]; then
+        chmod u+w "${output_bzimage}"
+    fi
     cp "${kernel_dir}/bzImage" "${output_bzimage}"
-}
-
-_prepare_kernel_bzimage() {
-    local kernel_dir="${1:?Usage: _prepare_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
-    local sec_dir="${2:?Usage: _prepare_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
-    local output_bzimage="${3:?Usage: _prepare_kernel_bzimage <kernel-dir> <secrets-dir> <output-bzimage>}"
-    local mode="${KERNEL_BZIMAGE_MODE:-prebuilt}"
-
-    case "${mode}" in
-        prebuilt|copy|bzImage)
-            _copy_kernel_bzimage "${kernel_dir}" "${output_bzimage}"
-            ;;
-        insert-sys-cert|personalized)
-            _build_personalized_kernel_bzimage "${kernel_dir}" "${sec_dir}" "${output_bzimage}"
-            ;;
-        *)
-            echo "ERROR: unknown KERNEL_BZIMAGE_MODE=${mode}; expected prebuilt or insert-sys-cert" >&2
-            return 1
-            ;;
-    esac
 }
 
 # Sign a Nix artifact tree produced by .#initos-signer.
@@ -469,14 +429,7 @@ artifacts() {
     local kernel_dir="${2:-}"
     local artifact_dir="${3:-}"
     local sec_dir="${SECRETS:-/var/run/secrets/uefi-keys}"
-    local PROFILE_DIR
-        local SCRIPT_DIR
-        SCRIPT_DIR=$(dirname "$0")
-        if [ "$SCRIPT_DIR" = "." ] && command -v "$0" >/dev/null 2>&1; then
-            SCRIPT_DIR=$(dirname "$(command -v "$0")")
-        fi
-    PROFILE_DIR=$(dirname "$SCRIPT_DIR")
-        
+    local profile_dir="${NIX_PROFILE:-${PWD}/target/nix/profiles/profile}"
 
     # Auto-detect kernel_dir
     if [ -z "${kernel_dir}" ]; then
@@ -484,9 +437,9 @@ artifacts() {
         if [ -f "/opt/kernel-image/bzImage" ]; then
             # docker image
             kernel_dir="/opt/kernel-image"
-        elif [ -f "${PROFILE_DIR}/opt/kernel-image/bzImage" ]; then
+        elif [ -f "${profile_dir}/opt/kernel-image/bzImage" ]; then
             # Nix profile (e.g., .../result/opt/kernel-image/)
-            kernel_dir="$(cd "${PROFILE_DIR}/opt/kernel-image" && pwd)"
+            kernel_dir="$(cd "${profile_dir}/opt/kernel-image" && pwd)"
         elif [ -f "/mnt/kernel-image/opt/kernel-image/bzImage" ]; then
             # Mounted from a docker image
             kernel_dir="/mnt/kernel-image/opt/kernel-image"
@@ -504,8 +457,8 @@ artifacts() {
         if [ -f "/img/initos.erofs" ]; then
             # Docker image
 	    artifact_dir="/"
-        elif [ -f "${PROFILE_DIR}/img/initos.erofs" ]; then
-            artifact_dir="${PROFILE_DIR}"
+        elif [ -f "${profile_dir}/img/initos.erofs" ]; then
+            artifact_dir="${profile_dir}"
         elif [ -f "${PWD}/target/artifacts/img/initos.erofs" ]; then
             artifact_dir="${PWD}/target/artifacts"
         fi
@@ -517,11 +470,14 @@ artifacts() {
     fi
 
     sign_init
-    local personalized_bzimage
-    personalized_bzimage="${output_dir}/kernel/bzImage"
-    _prepare_kernel_bzimage "${kernel_dir}" "${sec_dir}" "${personalized_bzimage}"
+    local bzimage
+    bzimage="${output_dir}/kernel/bzImage"
+    _copy_kernel_bzimage "${kernel_dir}" "${bzimage}"
 
     # Copy initos.erofs to output
+    if [ -f "${output_dir}/img/initos.erofs" ]; then
+        chmod u+w "${output_dir}/img/initos.erofs"
+    fi
     cp "${artifact_dir}/img/initos.erofs" "${output_dir}/img/"
     chmod u+w "${output_dir}/img/initos.erofs"
     image "${output_dir}/img" "initos.erofs"
@@ -539,11 +495,20 @@ artifacts() {
     done
     if [ "${#module_dirs[@]}" -eq 0 ]; then
         for m in "${kernel_dir}"/modules-*.erofs; do
-            [ -f "$m" ] && cp "$m" "${output_dir}/img/"
+            if [ -f "$m" ]; then
+                local dest="${output_dir}/img/$(basename "$m")"
+                if [ -f "${dest}" ]; then
+                    chmod u+w "${dest}"
+                fi
+                cp "$m" "${output_dir}/img/"
+            fi
         done
     fi
     shopt -u nullglob
     if [ -f "${kernel_dir}/firmware.erofs" ]; then
+        if [ -f "${output_dir}/img/firmware.erofs" ]; then
+            chmod u+w "${output_dir}/img/firmware.erofs"
+        fi
         cp "${kernel_dir}/firmware.erofs" "${output_dir}/img/"
     fi
 
@@ -570,7 +535,7 @@ artifacts() {
     fi
     chmod -R u+w "${boot_stage}"
 
-    cp "${personalized_bzimage}" "${boot_stage}/EFI/BOOT/bzImage"
+    cp "${bzimage}" "${boot_stage}/EFI/BOOT/bzImage"
 
     # Build the three boot variants from the staging area
     build_boot_limine_unsigned "${boot_stage}" "${output_dir}" "${sec_dir}"
@@ -634,12 +599,19 @@ _copy_uefi_public_keys() {
 
     echo "Installing UEFI public keys into ${dst_dir}..."
     mkdir -p "${dst_dir}"
-    for f in PK.cer PK.crt PK.esl PK.auth KEK.cer KEK.crt KEK.auth KEK.esl db.cer db.esl db.crt db.auth image_key_pub.pem image_key.pub.b64 root.pem ; do
+    for f in PK.cer PK.crt PK.esl PK.auth KEK.cer KEK.crt KEK.auth KEK.esl db.cer db.esl db.crt db.auth root.pem ; do
         if [ -f "${SECRETS}/${f}" ]; then
             cp "${SECRETS}/${f}" "${dst_dir}/"
         else
-             echo "Missing key ${SECRETS}/${f}"
+             echo "ERROR: Missing required key ${SECRETS}/${f}" >&2
              exit 1
+        fi
+    done
+    for f in image_key_pub.pem image_key.pub.b64; do
+        if [ -f "${SECRETS}/${f}" ]; then
+            cp "${SECRETS}/${f}" "${dst_dir}/"
+        else
+            echo "  Optional key not found (skipping): ${SECRETS}/${f}"
         fi
     done
 }
@@ -804,27 +776,31 @@ build_boot_initos_signed() {
     rm -rf "${boot_path}"
 }
 
-# --- Dispatch ---
-# When run directly (not sourced), dispatch to the requested function.
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+show_help() {
+    echo "sign.sh — Initos signing and image generation tool"
+    echo ""
+    echo "Usage: $0 <command> [args...]"
+    echo ""
+    echo "Commands:"
+    echo "  sign_init                              Generate EFI and image signing keys"
+    echo "  sign_digest <file> <key> <out>         Sign a binary digest"
+    echo "  sign_hex_digest <hex> <key> <out>      Sign a hex digest string"
+    echo "  image <dir> <file>                     Sign an fsverity digest for an image"
+    echo "  artifacts <out_dir> [kernel_dir] [artifact_dir]"
+    echo "                                         Sign a Nix artifact tree"
+    echo "  build_boot_limine_unsigned <artifact_dir> <output_dir> [keys]"
+    echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys]"
+    echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys]"
+    echo "  help                                   Show this help"
+}
+
     if [[ -z "${1+x}" ]]; then
-        echo "setup_signed.sh — General-purpose Ed25519 image signing tool"
-        echo ""
-        echo "Usage: $0 <command> [args...]"
-        echo ""
-        echo "Commands:"
-        echo "  sign_init                         Generate EFI and image signing keys"
-        echo "  sign_digest <file> <key> <out>    Sign a binary digest"
-        echo "  sign_hex_digest <hex> <key> <out> Sign a hex digest string"
-        echo "  image <dir> <file>                Sign an fsverity digest for an image"
-        echo "  efi <sec_dir> <boot_dir>          Sign BOOTX64.EFI in a boot directory"
-        echo "  artifacts <out_dir> [artifact_dir] Sign a Nix artifact tree"
-        echo "  build_dmverity_boot               Build dm-verity boot config"
-        echo "  build_boot_limine_unsigned <artifact_dir> <output_dir> [keys]"
-        echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys]"
-        echo "  build_boot_initos_unsigned <artifact_dir> <output_dir>"
-        echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys]"
-        exit 0
+        set -- artifacts /tmp/initos
     fi
+    case "${1}" in
+        help)
+            show_help
+            exit 0
+            ;;
+    esac
     "$@"
-fi
