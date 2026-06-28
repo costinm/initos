@@ -538,9 +538,9 @@ artifacts() {
     cp "${bzimage}" "${boot_stage}/EFI/BOOT/bzImage"
 
     # Build the three boot variants from the staging area
-    build_boot_limine_unsigned "${boot_stage}" "${output_dir}" "${sec_dir}"
+    #build_boot_limine_unsigned "${boot_stage}" "${output_dir}" "${sec_dir}"
     build_boot_initos_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
-    build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
+    #build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
 
     rm -rf "${boot_stage}"
 }

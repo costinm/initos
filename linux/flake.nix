@@ -90,7 +90,8 @@
         patches = (old.patches or [ ]) ++ kernelPatchFiles;
       });
 
-      nvidiaOpen = (pkgs.linuxPackagesFor kernel).nvidiaPackages.stable.open.overrideAttrs (old: {
+      nvidiaPackage = (pkgs.linuxPackagesFor kernel).nvidiaPackages.stable;
+      nvidiaOpen = nvidiaPackage.open.overrideAttrs (old: {
         nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.removeReferencesTo ];
         postFixup = (old.postFixup or "") + ''
           find "$out" -type f -name '*.ko' -exec remove-references-to -t ${kernel.dev} '{}' +
@@ -160,20 +161,23 @@
           patches = (old.patches or [ ]) ++ kernelPatchFiles;
         });
 
+      mkNvidiaPackage = kernelForModules:
+        (pkgs.linuxPackagesFor kernelForModules).nvidiaPackages.stable;
+
       mkNvidiaOpen = kernelForModules:
-        (pkgs.linuxPackagesFor kernelForModules).nvidiaPackages.stable.open.overrideAttrs (old: {
+        (mkNvidiaPackage kernelForModules).open.overrideAttrs (old: {
           nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.removeReferencesTo ];
           postFixup = (old.postFixup or "") + ''
             find "$out" -type f -name '*.ko' -exec remove-references-to -t ${kernelForModules.dev} '{}' +
           '';
         });
 
-      mkKernelHostPackage = { packageName, kernel, configfile, nvidiaOpen, outputDir ? "kernel-image" }:
+      mkKernelHostPackage = { packageName, kernel, configfile, nvidiaPackage, nvidiaOpen, outputDir ? "kernel-image" }:
         pkgs.runCommand packageName {
-          nativeBuildInputs = [ pkgs.erofs-utils ];
+          nativeBuildInputs = [ pkgs.erofs-utils pkgs.kmod ];
           passthru = {
             mergedConfig = configfile;
-            inherit kernel nvidiaOpen firmwarePackages;
+            inherit kernel nvidiaPackage nvidiaOpen firmwarePackages;
           };
         } ''
           imageOut="$out/opt/${outputDir}"
@@ -195,7 +199,8 @@
           moduleDir=${kernel.modules}/lib/modules/${kernel.modDirVersion}
           nvidiaModuleDir=${nvidiaOpen}/lib/modules/${kernel.modDirVersion}
           if [ -d "$moduleDir" ]; then
-            combined="$TMPDIR/modules-${kernel.modDirVersion}"
+            moduleRoot="$TMPDIR/module-root"
+            combined="$moduleRoot/lib/modules/${kernel.modDirVersion}"
             mkdir -p "$combined"
             cp -a "$moduleDir/." "$combined/"
             chmod -R u+w "$combined"
@@ -206,8 +211,40 @@
               find ${nvidiaOpen} -maxdepth 4 -type f >&2
               exit 1
             fi
+            depmod -b "$moduleRoot" ${kernel.modDirVersion}
             cp -a "$combined" "$imageOut/modules-${kernel.modDirVersion}"
           fi
+
+          nvidiaCompute="$imageOut/nvidia-compute"
+          mkdir -p "$nvidiaCompute/bin" "$nvidiaCompute/lib"
+          for bin in \
+            nvidia-cuda-mps-control \
+            nvidia-cuda-mps-server \
+            nvidia-smi
+          do
+            if [ -e "${nvidiaPackage.bin}/bin/$bin" ]; then
+              cp -a "${nvidiaPackage.bin}/bin/$bin" "$nvidiaCompute/bin/"
+            fi
+          done
+          for libPattern in \
+            'libcuda.so*' \
+            'libcudadebugger.so*' \
+            'libnvcuvid.so*' \
+            'libnvidia-allocator.so*' \
+            'libnvidia-cfg.so*' \
+            'libnvidia-encode.so*' \
+            'libnvidia-fbc.so*' \
+            'libnvidia-ml.so*' \
+            'libnvidia-ngx.so*' \
+            'libnvidia-nvvm.so*' \
+            'libnvidia-nvvm70.so*' \
+            'libnvidia-opticalflow.so*' \
+            'libnvidia-ptxjitcompiler.so*'
+          do
+            find ${nvidiaPackage.out}/lib -maxdepth 1 \( -type f -o -type l \) -name "$libPattern" \
+              -exec cp -a '{}' "$nvidiaCompute/lib/" \;
+          done
+          printf '%s\n' '${nvidiaPackage.version}' > "$imageOut/nvidia-version"
 
           firmwareRoot="$TMPDIR/firmware"
           mkdir -p "$firmwareRoot"
@@ -223,18 +260,20 @@
         let
           configfile = mkMergedConfigWithExtra { inherit packageName extraConfigText; };
           kernelForConfig = mkPatchedKernel { inherit packageName configfile; };
+          nvidiaPackageForConfig = mkNvidiaPackage kernelForConfig;
           nvidiaOpenForConfig = mkNvidiaOpen kernelForConfig;
         in
         mkKernelHostPackage {
           inherit packageName configfile outputDir;
           kernel = kernelForConfig;
+          nvidiaPackage = nvidiaPackageForConfig;
           nvidiaOpen = nvidiaOpenForConfig;
         };
 
       kernel-host = (mkKernelHostPackage {
         packageName = "initos-kernel-host";
         configfile = mergedConfig;
-        inherit kernel nvidiaOpen;
+        inherit kernel nvidiaPackage nvidiaOpen;
       }).overrideAttrs (old: {
         passthru = (old.passthru or { }) // {
           inherit mkKernelHostWithExtraConfig;
