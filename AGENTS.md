@@ -61,7 +61,27 @@ tests/run_qemu.sh
 tests/verify_test.rs
 tests/tpm2_tests.rs
 tests/test_encrypt_decrypt.sh
+sidecar/bin/sign.sh
 ```
+
+## Signing Workflow
+
+`sidecar/bin/sign.sh` handles signing of boot images, kernel modules, and firmware.
+
+Key types:
+- **db.key/db.crt** (required): UEFI Secure Boot database key for signing EFI binaries and computing fs-verity digests
+- **image_key.pem** (optional): Ed25519 key for fs-verity image signing; generated via `generate_ed25519_keypair()` if needed
+
+Environment variables:
+- **NIX_PROFILE**: Path to the Nix profile directory (default: `$PWD/target/nix/profiles/profile`)
+- **SECRETS**: Path to the secrets directory (default: `/var/run/secrets/uefi-keys`)
+
+Signing workflow:
+1. `nix profile upgrade initos --profile target/nix/profiles/profile` - builds the Nix profile with kernel and artifacts
+2. `export PATH="target/nix/profiles/profile/bin:$PATH"` - add profile bin to PATH
+3. `sign.sh` - runs the default `artifacts` command, signing everything
+
+The script auto-detects kernel and artifact locations from the Nix profile.
 
 ## Common Verification Commands
 
@@ -70,6 +90,14 @@ Rust checks:
 ```sh
 cargo check
 cargo test -p initos
+```
+
+Nix profile upgrade and signing:
+
+```sh
+nix profile upgrade initos --profile target/nix/profiles/profile
+export PATH="target/nix/profiles/profile/bin:$PATH"
+sign.sh
 ```
 
 Nix artifact/profile checks:
