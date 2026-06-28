@@ -1,5 +1,6 @@
 # This is the trickiest part for laptops. Servers can use USB serial,
 # VMs can use serial.
+CONFIG_DRM_NOUVEAU=n
 
 # Not in debian:
 # CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y
