@@ -39,17 +39,16 @@ setup_fs() {
 
 upgrade() {
   DISK=${1:-/dev/sdb}
-  dd if=/z/img/initos-signed.fat of=/dev/${DISK}102
-  sync
-  /opt/busybox/bin/reboot -f
+  PART=${2:-101}
+  dd if=/z/img/${PART}/initos-signed.fat of=/dev/${DISK}${PART}
+  #sync
+  #/opt/busybox/bin/reboot -f
 
 }
 
 mount_install() {
   mkdir -p /mnt/STATE /mnt/BOOT1 /mnt/BOOT2 
   mount LABEL=STATE /mnt/STATE
-  mount LABEL=BOOT1 /mnt/BOOT1
-  mount LABEL=BOOT2 /mnt/BOOT2
 }
 
 part_labels() {
@@ -587,20 +586,6 @@ swapNext() {
   fi
 }
 
-
-
-# Mokutil requires a corresponding EFI.
-# /usr/share/efitools contains a set of EFI programs.
-# efi-readvar shows the keys in the system.
-mok() {
-  mokutil --sb-state
-  mokutil --list-enrolled
-  mokutil --pk /boot/efi/initos/KEYS/PK.cer
-  mokutil --kek
-  mokutil --db
-  # Looks for /var/lib/sbctl/keys/db/db.key
-  # sbctl enroll-keys -a -c --yes-this-might-brick-my-machine
-}
 
 
 efibackup() {
