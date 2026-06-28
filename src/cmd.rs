@@ -52,6 +52,12 @@ pub fn read_secret(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
 
 /// Get the fscrypt key: from FSCRYPT_KEY env var if set, otherwise prompt from stdin.
 /// AES-256-XTS requires a 64-byte raw key; short keys are padded by repeating.
+///
+/// NOTE: the repeat-padding below caps entropy at the shortest input ever used.
+/// This is acceptable for the primary use case (an installer generates a
+/// high-entropy 64-byte key and seals it via TPM), but a weak typed passphrase
+/// would produce a brute-forceable on-disk key. Do not rely on the prompt path
+/// for high-security deployments without a strong key.
 pub fn get_fscrypt_key() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let raw = if let Ok(key_str) = env::var("FSCRYPT_KEY") {
         key_str.into_bytes()
@@ -191,7 +197,11 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(identity) = age::x25519::Identity::from_str(id_path) {
                 identities.push(Box::new(identity));
             } else {
-                return Err(format!("failed to read identity file or parse identity from '{}'", id_path).into());
+                return Err(format!(
+                    "failed to read identity file or parse identity from '{}'",
+                    id_path
+                )
+                .into());
             }
         }
     }
@@ -239,7 +249,8 @@ pub fn cmd_decrypt() -> Result<(), Box<dyn std::error::Error>> {
     // Read ciphertext from file or stdin
     let mut cipher = Vec::new();
     if let Some(ref path) = input_file {
-        cipher = fs::read(path).map_err(|e| format!("failed to read input file '{}': {}", path, e))?;
+        cipher =
+            fs::read(path).map_err(|e| format!("failed to read input file '{}': {}", path, e))?;
     } else {
         io::stdin().read_to_end(&mut cipher)?;
     }
@@ -384,8 +395,8 @@ pub fn print_help() {
     eprintln!("  efi                           Read EFI variables (SecureBoot, BootCurrent, db)");
     eprintln!("  unseal [--dev|--secure] [--handle HANDLE]");
     eprintln!("                                 Unseal TPM2 key via PCR SHA256:7 policy");
-    eprintln!("  seal [--dev|--secure] [--handle HANDLE] <SECRET>");
-    eprintln!("                                 Seal a key to TPM2 with PCR SHA256:7 policy");
+    eprintln!("  seal [--dev|--secure] [--handle HANDLE] [--secret-file PATH]");
+    eprintln!("                                 Seal a key to TPM2 with PCR SHA256:7 policy (secret via file/env/stdin)");
     eprintln!("  primary                       Create a TPM2 primary key and persist it");
     eprintln!("  lock_tpm                      Extend PCR 7 to prevent further unsealing");
     eprintln!("  fscrypt <PATH>                Add encryption key to filesystem keyring (unlock)");
@@ -395,9 +406,9 @@ pub fn print_help() {
     eprintln!(
         "                                Decrypt file or stdin using age with identity from KEY_FILE, KEY, or CLI"
     );
-    eprintln!("  recovery-encrypt <SECRET> [PUB_KEY]");
+    eprintln!("  recovery-encrypt [PUB_KEY] [--secret-file PATH]");
     eprintln!(
-        "                                Encrypt a secret for recovery using an Ed25519 public key"
+        "                                Encrypt a secret for recovery (secret via file/env/stdin)"
     );
     eprintln!("  help                          Show this help message");
     eprintln!();

@@ -1,42 +1,37 @@
 # initos — Simpler Verified OS Boot and Initialization
 
-`initos` is a minimal, unified boot tool and initialization sequence for early host setup. It replaces complex, bloated, machine-specific initramfs systems (like dracut) with a single, easily auditable Rust binary. 
+`initos` is focused on the owner-signed host initialization and early boot.
 
-By integrating **UEFI Secure Boot**, **fs-verity**, and **TPM2 policies**, it decouples the bootloader and kernel from the host OS, providing a container-like read-only environment to run any Linux distribution.
+"Owner Verified" boot means the kernel, modules and initial rootfs are signed by keys owned or trusted
+by the machine or mesh owner - and the EFI is locked to only allow those keys, instead of keys
+from other vendors. Currently the EFI 'db' key is used to check all components in the early boot
+sequence - including kernel modules and the read only rootfs, and should be setup with only the 
+owner keys.
 
+By integrating **UEFI Secure Boot**, **fs-verity**, and **TPM2 policies**, it decouples the bootloader
+and kernel verification and TPM unlock from the host OS, providing a container-like read-only environment
+to run any Linux distribution - with the job of handling Grub/kernel/modules separate from the 
+main rootfs (as it would be in a container). 
 
-The goal is to simplify verified boot for common  physical machines, replacing the usual Initrd (dracut, etc) with a _minimal_ and easier to understand and review boot process. Minimal is the key, keep only features that can't be removed.
+The goal is to simplify verified boot for common  physical machines, replacing the usual Initrd (dracut, etc) 
+with a _minimal_ and easier to understand and review boot process. Minimal is the key, keeping only features
+that can't be removed - to make it easier to underastand what is actually happening and how the trust model
+is enforced.
+
+On most Linux distros the EFI uses Microsoft keys and a stub that signs a broad set of kernels, with
+modules signed by the distribution owner along with the kernel. When 'MOK' (machine owner key) is 
+supported for user-built kernels, the user keys are used in addition to all the existing vendor and
+platform keys, with a very complicated dance.
+
+The current init is using TPM2 to unlock a 'system' dir using fs-crypt - instead of the more common
+and less flexible LUKS. This allows the owner to have additional dirs with different fs-crypt 
+keys, unlocked later - as well as un-encrypted but fs-verity checked images in different dirs.
 
 ---
 
 ## Architecture Overview
 
 The boot chain establishes a secure path from the UEFI firmware up to the execution of the target operating system:
-
-```mermaid
-graph TD
-    subgraph UEFI Boot Stage
-        A["UEFI Firmware (Secure Boot)"] -->|Loads & Verifies| B["EFI Loader (efi.rs)"]
-        B -->|Verifies signature against DB cert| C["Kernel & Commandline (bzImage)"]
-    end
-
-    subgraph Initrd Stage (PID 1)
-        C -->|Executes /init| D["initos (initos-init)"]
-        D -->|Mounts| E["Pseudo-FS (proc, sysfs, devtmpfs)"]
-        D -->|Scans by label| F["STATE Partition (ext4)"]
-        D -->|Verifies fs-verity signature| G["Read-Only OS Image (initos.erofs)"]
-        G -->|Loop-mounts as EROFS| H["Verified Rootfs (/mnt/root)"]
-        H -->|Bind-mounts STATE| I["STATE at /z"]
-        I -->|Handover| J["switch_root"]
-    end
-
-    subgraph OS Stage
-        J --> K["Real OS (Debian, Alpine, etc.)"]
-        K -->|TPM2 Policy / fscrypt| L["Decrypt Writable Overlay / Home"]
-    end
-```
-
-### Flow Diagram (ASCII)
 
 ```
 ┌──────────────────────────────────────────┐
@@ -69,14 +64,19 @@ graph TD
 └──────────────────────────────────────────┘
 ```
 
+In progress: the minimal EFI loader stub can be removed to further simplify, booting directly to a kernel 
+with the initos initrd and cmdline 'built in' and locked. 
+
+Initrd is using partition or disk label - and signatures on the binaries - to load the rest.
+
 ---
 
 ## Core Benefits
 
 - **Zero-Trust Boot Chain**: Validates everything from the UEFI Secure Boot DB keys all the way up to the filesystem blocks using fs-verity Merkle trees.
 - **Host Portability**: Replaces machine-specific ramdisks. The same static `initos` initrd binary works across all physical servers
-- **Frictionless Upgrades**: Upgrading the OS is as simple as copying an `.erofs` image and its accompanying `.sig` signature to the STATE partition.
-- **Hardware Cryptography**: Out-of-the-box support for TPM2 sealing (locked to PCR 7 policies with automatic anti-replay extension lockout) and fscrypt-based folder encryption.
+- **Frictionless Upgrades**: Upgrading the kernel is as simple as copying few `.erofs` images and its accompanying `.sig` signature to the STATE partition, along with writing one of the 64M A/B boot partitions. The rootfs is also either an image or a directory. 
+- **Encryption**: Out-of-the-box support for TPM2 sealing (locked to PCR 7 policies with automatic anti-replay extension lockout) or boot key, using fscrypt-based folder encryption.
 - **Auditable & Small**: Written in Rust with minimal dependencies, replacing thousands of lines of shell scripting in standard initramfs generators.
 
 ---
@@ -86,7 +86,7 @@ graph TD
 1. **Firmware Stage**: The UEFI firmware executes `initos.EFI` (built from `src/bin/efi.rs`). The loader reads the kernel command line from `\EFI\BOOT\config` and verifies its signature (`config.sig`) against the Secure Boot `db` certificate. It then verifies and executes the kernel (`bzImage` and `initrd.img`).
 2. **Mounting Pseudo Filesystems**: Upon initrd start, `initos` is executed as PID 1. It mounts `/proc`, `/sys`, and `/dev`.
 3. **Partition Discovery**: `initos` scans block devices in sysfs for a partition or EXT4 volume labeled `STATE` and mounts it as /z.
-4. **fs-verity Verification**: Once mounted, it measures the EROFS system image (`img/initos.erofs`) and validates its cryptographic hash against the signature file (`initos.erofs.sig`) using a public key passed via kernel command line `INITOS_PUB_KEY`.
+4. **fs-verity Verification**: Once mounted, it measures the EROFS system image (`img/initos.erofs`) and validates its cryptographic hash against the signature file (`initos.erofs.sig`) using the UEFI Secure Boot `db` certificate.
 5. **Switch Root**: The image is loop-mounted, the `STATE` partition is bind-mounted at `/z` inside the new rootfs, and `initos` performs a `switch_root` to run the OS init (defaults `/opt/initos/bin/initos-init-ver` - `INITOS_INIT` command line override).
 
 ---
@@ -99,23 +99,24 @@ A standard installation expects the following drive partitions:
 |----------------|--------------|------------|---------|
 | `BOOTA`        | 32 MB        | VFAT       | Active UEFI Boot (Kernel, Loader, Configs) |
 | `BOOTB`        | 32 MB        | VFAT       | Alternate UEFI Boot (A/B updates) |
-| `STATE`        | 100+ GB      | EXT4       | Contains read-only system images and encrypted user data |
+| `STATE`        | 16+ GB      | EXT4       | Contains read-only system images and encrypted user data |
 
 ### Layout on `STATE` Partition:
 
 - `/img/` — Read-only EROFS images (e.g., `initos.erofs`, kernel modules, firmware)
 - `/c/` — `fscrypt`-encrypted directory for home directories, mutable settings, and distro overlays.
+- `/c/roots/ROOTA` or `/img/initos.erofs` - the default rootfs, configurable.
 
 ---
 
 ## Developer Tooling & Verification
 
-`initos` provides tools to manage images, encryption, and TPMs.
+`initos` binary also provides tools to manage images, encryption, and TPMs.
 
 ### Subcommands
 
 Run `initos help` to list all subcommands:
-- `initos verify <IMG>`: Verify an image against its signature using `INITOS_PUB_KEY`.
+- `initos verify <IMG>`: Verify an image against its signature using the `INITOS_PUB_KEY` environment variable (Ed25519) or the UEFI `db` certificates when Secure Boot is enabled.
 - `initos mount <IMG> <DIR>`: Cryptographically verify and loop-mount an EROFS image.
 - `initos primary`: Create an RSA-2048 primary storage key in the TPM owner hierarchy.
 - `initos seal <SECRET>`: Seal a key to the TPM under PCR SHA256:7.

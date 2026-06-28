@@ -99,6 +99,109 @@ pub fn read_boot_current(base_path: &str) -> io::Result<u16> {
     Ok(u16::from_le_bytes([payload[0], payload[1]]))
 }
 
+/// Read and parse the current BootOption EFI variable to extract its partition number.
+pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
+    let boot_current = match read_boot_current(base_path) {
+        Ok(val) => val,
+        Err(e) => {
+            eprintln!("initos: failed to read BootCurrent: {}", e);
+            return Ok(None);
+        }
+    };
+    let boot_var_name = format!("Boot{:04X}", boot_current);
+    let payload = match read_efi_var(&boot_var_name, base_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!(
+                "initos: failed to read EFI variable {}: {}",
+                boot_var_name, e
+            );
+            return Ok(None);
+        }
+    };
+
+    if payload.len() < 6 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Boot variable {} payload too short: {} bytes",
+                boot_var_name,
+                payload.len()
+            ),
+        ));
+    }
+
+    let file_path_list_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+
+    // Skip Description (null-terminated UTF-16 string starting at offset 6)
+    let mut offset = 6;
+    let mut found_null = false;
+    while offset + 1 < payload.len() {
+        let char_val = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        if char_val == 0 {
+            found_null = true;
+            break;
+        }
+    }
+
+    if !found_null {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Boot variable {} Description is not null-terminated",
+                boot_var_name
+            ),
+        ));
+    }
+
+    // Now offset is at the start of FilePathList
+    let file_path_list_end = offset + file_path_list_len;
+    if file_path_list_end > payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Boot variable {} FilePathList extends beyond payload ({} > {})",
+                boot_var_name,
+                file_path_list_end,
+                payload.len()
+            ),
+        ));
+    }
+
+    let file_path_list = &payload[offset..file_path_list_end];
+    let mut node_offset = 0;
+    while node_offset + 4 <= file_path_list.len() {
+        let node_type = file_path_list[node_offset];
+        let node_subtype = file_path_list[node_offset + 1];
+        let node_length = u16::from_le_bytes([
+            file_path_list[node_offset + 2],
+            file_path_list[node_offset + 3],
+        ]) as usize;
+
+        if node_length < 4 || node_offset + node_length > file_path_list.len() {
+            break;
+        }
+
+        if node_type == 4 && node_subtype == 1 {
+            // Hard Drive device path
+            if node_length >= 42 {
+                let part_num = u32::from_le_bytes([
+                    file_path_list[node_offset + 4],
+                    file_path_list[node_offset + 5],
+                    file_path_list[node_offset + 6],
+                    file_path_list[node_offset + 7],
+                ]);
+                return Ok(Some(part_num));
+            }
+        }
+
+        node_offset += node_length;
+    }
+
+    Ok(None)
+}
+
 /// Parse an EFI Signature List and extract X.509 certificates.
 ///
 /// ESL binary format:
@@ -408,6 +511,58 @@ mod tests {
         std::fs::write(&var_path, &[0x01, 0x02]).unwrap(); // only 2 bytes
         let result = read_secure_boot(dir.path().to_str().unwrap());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_efi_extract_partition_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().to_str().unwrap().to_string();
+
+        // 1. Write BootCurrent = 3 (attrs=6, value=3 u16)
+        let mut boot_current_data = vec![0x06, 0x00, 0x00, 0x00]; // attributes
+        boot_current_data.extend_from_slice(&3u16.to_le_bytes());
+        let bc_path = dir
+            .path()
+            .join("BootCurrent-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+        std::fs::write(&bc_path, &boot_current_data).unwrap();
+
+        // 2. Write Boot0003
+        let mut boot_var_data = vec![0x06, 0x00, 0x00, 0x00]; // attributes
+                                                              // Payload of EFI_LOAD_OPTION starts:
+                                                              // Attributes (4 bytes):
+        boot_var_data.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        // FilePathListLength (2 bytes): 42 bytes (length of Hard Drive device path)
+        boot_var_data.extend_from_slice(&42u16.to_le_bytes());
+        // Description (null-terminated UTF-16): e.g. "B" (0x42 0x00), "o" (0x6F 0x00), "o" (0x6F 0x00), "t" (0x74 0x00), null (0x00 0x00)
+        boot_var_data
+            .extend_from_slice(&[0x42, 0x00, 0x6F, 0x00, 0x6F, 0x00, 0x74, 0x00, 0x00, 0x00]);
+        // FilePathList (42 bytes of Hard Drive device path):
+        // Type: 4, SubType: 1
+        boot_var_data.push(0x04);
+        boot_var_data.push(0x01);
+        // Length: 42 (0x002A)
+        boot_var_data.extend_from_slice(&42u16.to_le_bytes());
+        // PartitionNumber: 101 (0x00000065)
+        boot_var_data.extend_from_slice(&101u32.to_le_bytes());
+        // PartitionStart: 8 bytes
+        boot_var_data.extend_from_slice(&[0u8; 8]);
+        // PartitionSize: 8 bytes
+        boot_var_data.extend_from_slice(&[0u8; 8]);
+        // Signature: 16 bytes
+        boot_var_data.extend_from_slice(&[0u8; 16]);
+        // PartitionFormat: 2 (GPT)
+        boot_var_data.push(0x02);
+        // SignatureType: 2 (GUID)
+        boot_var_data.push(0x02);
+
+        let b0003_path = dir
+            .path()
+            .join("Boot0003-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+        std::fs::write(&b0003_path, &boot_var_data).unwrap();
+
+        // Run extraction
+        let part_id = extract_boot_partition_id(&base_path).unwrap();
+        assert_eq!(part_id, Some(101));
     }
 
     #[test]

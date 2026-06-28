@@ -169,12 +169,12 @@ fn test_seal_and_unseal() {
     let primary = initos::tpm2::create_primary(&mut tpm).expect("create_primary failed");
     eprintln!("primary transient: 0x{:08X}", primary);
 
-    // 2. Compute the policy digest via a trial session
-    let trial = initos::tpm2::start_trial_session(&mut tpm).expect("start_trial_session failed");
-    initos::tpm2::policy_pcr(&mut tpm, trial).expect("policy_pcr (trial) failed");
+    // 2. Compute the policy digest using the same policy session shape as unseal
+    let policy = initos::tpm2::start_policy_session(&mut tpm).expect("start_policy_session failed");
+    initos::tpm2::policy_pcr(&mut tpm, policy).expect("policy_pcr failed");
     let digest =
-        initos::tpm2::policy_get_digest(&mut tpm, trial).expect("policy_get_digest failed");
-    initos::tpm2::flush_context(&mut tpm, trial).expect("flush trial session failed");
+        initos::tpm2::policy_get_digest(&mut tpm, policy).expect("policy_get_digest failed");
+    initos::tpm2::flush_context(&mut tpm, policy).expect("flush policy session failed");
     eprintln!("policy digest ({} bytes): {:02x?}", digest.len(), digest);
     assert_eq!(digest.len(), 32, "SHA256 policy digest should be 32 bytes");
 
@@ -243,12 +243,12 @@ fn test_full_seal_unseal_with_persist() {
         .expect("persist primary failed");
     eprintln!("primary persisted at 0x{:08X}", primary_handle);
 
-    // 2. Trial session to get policy digest (mirrors `cmd_seal`)
-    let trial = initos::tpm2::start_trial_session(&mut tpm).expect("start_trial_session failed");
-    initos::tpm2::policy_pcr(&mut tpm, trial).expect("policy_pcr (trial) failed");
+    // 2. Policy session to get policy digest (mirrors `cmd_seal`)
+    let policy = initos::tpm2::start_policy_session(&mut tpm).expect("start_policy_session failed");
+    initos::tpm2::policy_pcr(&mut tpm, policy).expect("policy_pcr failed");
     let digest =
-        initos::tpm2::policy_get_digest(&mut tpm, trial).expect("policy_get_digest failed");
-    initos::tpm2::flush_context(&mut tpm, trial).expect("flush trial session failed");
+        initos::tpm2::policy_get_digest(&mut tpm, policy).expect("policy_get_digest failed");
+    initos::tpm2::flush_context(&mut tpm, policy).expect("flush policy session failed");
 
     // 3. Create sealed object under persistent primary
     let secret = b"production-flow-secret";

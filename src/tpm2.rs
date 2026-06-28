@@ -168,6 +168,15 @@ pub fn policy_get_digest(
     Ok(rsp[12..12 + sz].to_vec())
 }
 
+pub fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{:02x}", byte).expect("write to string");
+    }
+    out
+}
+
 /// Extend a PCR with random data from /dev/urandom.
 pub fn pcr_extend(
     dev: &mut (impl Read + Write),
@@ -468,9 +477,25 @@ fn da_lock_reset_raw(dev: &mut (impl Read + Write)) {
 fn check_response(rsp: &[u8], cmd_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rc = get_u32(rsp, 6);
     if rc != 0 {
-        Err(format!("{}: TPM2 error 0x{:08X}", cmd_name, rc).into())
+        if let Some(reason) = response_code_reason(rc) {
+            Err(format!("{}: TPM2 error 0x{:08X} ({})", cmd_name, rc, reason).into())
+        } else {
+            Err(format!("{}: TPM2 error 0x{:08X}", cmd_name, rc).into())
+        }
     } else {
         Ok(())
+    }
+}
+
+fn response_code_reason(rc: u32) -> Option<&'static str> {
+    match rc {
+        0x0000_099d => Some(
+            "TPM_RC_POLICY_FAIL: policy session did not satisfy the sealed object's authPolicy",
+        ),
+        0x0000_0922 => Some("TPM_RC_RETRY: TPM asks caller to retry"),
+        0x0000_0908 => Some("TPM_RC_YIELDED: TPM yielded and asks caller to retry"),
+        0x0000_0921 => Some("TPM_RC_LOCKOUT: dictionary-attack lockout is active"),
+        _ => None,
     }
 }
 
