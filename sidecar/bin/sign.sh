@@ -358,6 +358,34 @@ _print_module_signing_key_info() {
     echo "  module sig_key: ${sig_key:-unknown}"
 }
 
+_run_depmod_for_modules_stage() {
+    local modules_name="${1:?Usage: _run_depmod_for_modules_stage <modules-name> <modules-stage>}"
+    local stage="${2:?Usage: _run_depmod_for_modules_stage <modules-name> <modules-stage>}"
+    local kernel_release="${modules_name#modules-}"
+    local depmod_root
+
+    if [ "${kernel_release}" = "${modules_name}" ] || [ -z "${kernel_release}" ]; then
+        echo "ERROR: cannot infer kernel release from module directory name: ${modules_name}" >&2
+        return 1
+    fi
+    if ! command -v depmod >/dev/null 2>&1; then
+        echo "ERROR: depmod not found; install kmod before signing modules" >&2
+        return 1
+    fi
+
+    depmod_root=$(mktemp -d)
+    mkdir -p "${depmod_root}/lib/modules"
+    ln -s "${stage}" "${depmod_root}/lib/modules/${kernel_release}"
+    depmod -b "${depmod_root}" "${kernel_release}"
+    rm -rf "${depmod_root}"
+
+    if [ ! -s "${stage}/modules.dep" ]; then
+        echo "ERROR: depmod did not generate ${stage}/modules.dep" >&2
+        return 1
+    fi
+    echo "  Regenerated module dependency metadata with depmod for ${kernel_release}"
+}
+
 _build_signed_modules_image() {
     local modules_src="${1:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
     local kernel_dir="${2:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
@@ -399,6 +427,7 @@ _build_signed_modules_image() {
         echo "  Stripped existing signatures from ${stripped} kernel modules"
     fi
     echo "  Signed ${count} kernel modules with db.key"
+    _run_depmod_for_modules_stage "${modules_name}" "${stage}"
     _print_module_signing_key_info "${sec_dir}/db.crt" "${stage}"
     mkfs.erofs -zlz4 "${img_dir}/${modules_name}.erofs" "${stage}"
     rm -rf "${stage}"

@@ -110,6 +110,35 @@ part_labels_usb() {
 #   chmod 600 /run/secrets/root/c_key
 # }
 
+copy_nix() {
+
+}
+
+get_nvidia_fw() {
+  DRIVER_VER="595.84"
+  RUNFILE="NVIDIA-Linux-x86_64-${DRIVER_VER}.run"
+  URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${DRIVER_VER}/${RUNFILE}"
+  TARGET_DIR="/lib/firmware/nvidia/${DRIVER_VER}"
+
+  # 1. Download the installer payload
+  echo "Downloading NVIDIA driver runfile v${DRIVER_VER}..."
+  curl -fL "${URL}" -o "/tmp/${RUNFILE}"
+
+  # 2. Extract the firmware file from the runfile without installing
+  echo "Extracting GSP firmware..."
+  cd /tmp
+  sh "${RUNFILE}" --extract-only
+
+  # 3. Deploy the binary to your target path
+  echo "Deploying firmware to ${TARGET_DIR}..."
+  mkdir -p "${TARGET_DIR}"
+  cp "NVIDIA-Linux-x86_64-${DRIVER_VER}/firmware/gsp_ga10x.bin" "${TARGET_DIR}/"
+
+  # 4. Cleanup
+  echo "Cleaning up temporary files..."
+  rm -rf "/tmp/${RUNFILE}" "/tmp/NVIDIA-Linux-x86_64-${DRIVER_VER}"
+
+}
 
 
 # # Will wipe a disk a create the partitions needed for initos.

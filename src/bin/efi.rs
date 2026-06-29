@@ -8,9 +8,11 @@ extern crate alloc;
 mod uefi_bin {
     extern crate alloc;
 
+    use alloc::format;
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use core::arch::asm;
+    use core::fmt::Write;
     use core::ptr::addr_of;
     use rsa::{pkcs1::DecodeRsaPublicKey, Pkcs1v15Sign, RsaPublicKey};
     use sha2::{Digest, Sha256};
@@ -20,7 +22,8 @@ mod uefi_bin {
     use uefi::proto::loaded_image::LoadedImage;
     use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
     use uefi::proto::media::fs::SimpleFileSystem;
-    use uefi::runtime::VariableVendor;
+    use uefi::proto::misc::Timestamp;
+    use uefi::runtime::{self, ResetType, VariableVendor};
     use x509_cert::der::Decode;
 
     #[repr(C, packed)]
@@ -69,6 +72,7 @@ mod uefi_bin {
     }
 
     const SETUP_MAGIC: u32 = 0x53726448; // "HdrS"
+    const FAILURE_REBOOT_DELAY_SECONDS: usize = 15;
 
     type HandoverFn = unsafe extern "sysv64" fn(
         image: *mut core::ffi::c_void,
@@ -84,20 +88,107 @@ mod uefi_bin {
         let st = uefi::table::system_table_raw()
             .expect("No system table")
             .as_ptr();
-        println!(
-            "Args: image={:p}, st={:p}, setup={:p}",
-            image.as_ptr(),
-            st,
-            setup
-        );
 
         #[cfg(target_arch = "x86_64")]
         asm!("cli", options(nomem, nostack));
 
         let handover: HandoverFn = core::mem::transmute(handover_addr);
 
-        println!("Jumping to handover...");
         handover(image.as_ptr(), st as *mut _, setup);
+    }
+
+    fn fail_and_reboot(message: &str) -> ! {
+        println!("{}", message);
+        println!(
+            "Boot failed; rebooting in {} seconds so firmware can try the next boot option.",
+            FAILURE_REBOOT_DELAY_SECONDS
+        );
+        boot::stall(FAILURE_REBOOT_DELAY_SECONDS * 1_000_000);
+        runtime::reset(ResetType::WARM, Status::LOAD_ERROR, None);
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let digest = Sha256::digest(data);
+        let mut out = String::new();
+        for b in digest {
+            let _ = write!(&mut out, "{:02x}", b);
+        }
+        out
+    }
+
+    fn fail_signature(label: &str, db_sha: &str, detail: String) -> ! {
+        fail_and_reboot(&format!(
+            "{} verification failed; db_sha256={}; {}",
+            label, db_sha, detail
+        ));
+    }
+
+    struct EfiTimer {
+        timestamp: Option<boot::ScopedProtocol<Timestamp>>,
+        frequency: u64,
+        start: u64,
+    }
+
+    impl EfiTimer {
+        fn new() -> Self {
+            if let Ok(handle) = boot::get_handle_for_protocol::<Timestamp>() {
+                if let Ok(timestamp) = boot::open_protocol_exclusive::<Timestamp>(handle) {
+                    if let Ok(properties) = timestamp.get_properties() {
+                        if properties.frequency != 0 {
+                            let start = timestamp.get_timestamp();
+                            return Self {
+                                timestamp: Some(timestamp),
+                                frequency: properties.frequency,
+                                start,
+                            };
+                        }
+                    }
+                }
+            }
+
+            Self {
+                timestamp: None,
+                frequency: 0,
+                start: 0,
+            }
+        }
+
+        fn now(&self) -> Option<u64> {
+            self.timestamp.as_ref().map(|ts| ts.get_timestamp())
+        }
+
+        fn elapsed_ms_since(&self, start: u64) -> Option<u64> {
+            let now = self.now()?;
+            let ticks = now.wrapping_sub(start);
+            Some(ticks.saturating_mul(1000) / self.frequency)
+        }
+
+        fn total_ms(&self) -> Option<u64> {
+            self.elapsed_ms_since(self.start)
+        }
+    }
+
+    fn start_message() {
+        match runtime::get_time() {
+            Ok(time) => println!(
+                "InitOS EFI starting {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}",
+                time.year(),
+                time.month(),
+                time.day(),
+                time.hour(),
+                time.minute(),
+                time.second(),
+                time.nanosecond()
+            ),
+            Err(_) => println!("InitOS EFI starting"),
+        }
+    }
+
+    fn format_ms(value: Option<u64>) -> String {
+        match value {
+            Some(ms) => format!("{}ms", ms),
+            None => "n/a".to_string(),
+        }
     }
 
     fn load_file_to_memory(path: &str) -> uefi::Result<Vec<u8>> {
@@ -219,15 +310,20 @@ mod uefi_bin {
         kernel_addr: usize,
         initrd_addr: usize,
         initrd_size: usize,
-    ) -> Status {
+        timer: &EfiTimer,
+        bzimage_load_ms: Option<u64>,
+        initrd_load_ms: Option<u64>,
+    ) -> ! {
         let image_setup = kernel_addr as *const SetupHeader;
 
         let sig = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).signature)) };
         let hdr = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).header)) };
 
         if sig != 0xAA55 || hdr != SETUP_MAGIC {
-            println!("Invalid kernel signature: 0x{:x}, header: 0x{:x}", sig, hdr);
-            return Status::LOAD_ERROR;
+            fail_and_reboot(&format!(
+                "Kernel handover failed: invalid setup signature=0x{:x}, header=0x{:x}",
+                sig, hdr
+            ));
         }
 
         let version = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).version)) };
@@ -235,19 +331,18 @@ mod uefi_bin {
             unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).relocatable_kernel)) };
         let xloadflags = unsafe { core::ptr::read_unaligned(addr_of!((*image_setup).xloadflags)) };
 
-        println!("Kernel xloadflags: 0x{:x}", xloadflags);
         if xloadflags & 0x08 == 0 {
-            println!(
-                "WARNING: Kernel does not report support for 64-bit EFI handover (bit 3 clear)!"
-            );
+            fail_and_reboot(&format!(
+                "Kernel handover failed: xloadflags=0x{:x} does not report 64-bit EFI handover support",
+                xloadflags
+            ));
         }
 
         if version < 0x20b || relocatable == 0 {
-            println!(
-                "Unsupported kernel version: 0x{:x}, relocatable: {}",
+            fail_and_reboot(&format!(
+                "Kernel handover failed: unsupported version=0x{:x}, relocatable={}",
                 version, relocatable
-            );
-            return Status::LOAD_ERROR;
+            ));
         }
 
         let pages_needed = 4;
@@ -257,7 +352,12 @@ mod uefi_bin {
             pages_needed,
         ) {
             Ok(addr) => addr,
-            Err(e) => return e.status(),
+            Err(e) => {
+                fail_and_reboot(&format!(
+                    "Kernel handover failed: boot setup allocation failed: {:?}",
+                    e.status()
+                ));
+            }
         };
 
         let boot_setup_ptr = boot_setup_addr.as_ptr() as *mut SetupHeader;
@@ -272,21 +372,20 @@ mod uefi_bin {
                 core::ptr::read_unaligned(addr_of!((*image_setup).handover_offset));
             let code32_start = kernel_addr + (setup_secs as usize + 1) * 512;
             let handover_addr = code32_start + 512 + handover_offset as usize;
-            println!(
-                "Kernel setup_secs: {}, ramdisk_max: 0x{:x}",
-                setup_secs, ramdisk_max
-            );
-            println!(
-                "Handover info: code32_start=0x{:x}, offset=0x{:x}, addr=0x{:x}",
-                code32_start, handover_offset, handover_addr
-            );
 
             setup.loader_id = 0x21;
             setup.ramdisk_max = ramdisk_max;
 
             let cmdline_len = cmdline.len();
-            let cmdline_pool =
-                boot::allocate_pool(MemoryType::LOADER_DATA, cmdline_len + 1).unwrap();
+            let cmdline_pool = match boot::allocate_pool(MemoryType::LOADER_DATA, cmdline_len + 1) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    fail_and_reboot(&format!(
+                        "Kernel handover failed: cmdline allocation failed: {:?}",
+                        e.status()
+                    ));
+                }
+            };
             core::ptr::copy_nonoverlapping(cmdline.as_ptr(), cmdline_pool.as_ptr(), cmdline_len);
             *cmdline_pool.as_ptr().add(cmdline_len) = 0;
             setup.cmd_line_ptr = cmdline_pool.as_ptr() as u32;
@@ -296,6 +395,12 @@ mod uefi_bin {
                 setup.ramdisk_len = initrd_size as u32;
             }
 
+            println!(
+                "Starting Linux total={} bzImage_load={} initrd_load={}",
+                format_ms(timer.total_ms()),
+                format_ms(bzimage_load_ms),
+                format_ms(initrd_load_ms)
+            );
             linux_efi_handover(boot::image_handle(), handover_addr, boot_setup_ptr);
         }
     }
@@ -307,9 +412,14 @@ mod uefi_bin {
         db_data: &[u8],
         sig_path_template: &str,
         label: &str,
-    ) -> bool {
+    ) -> Result<(), String> {
         let mut offset = 0;
-        let mut verified = false;
+        let mut cert_count = 0usize;
+        let mut sig_file_count = 0usize;
+        let mut mismatch_count = 0usize;
+        let mut unsupported_count = 0usize;
+        let mut last_key_id = String::new();
+        let mut last_sig_path = String::new();
 
         let rsa_oid = x509_cert::der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
@@ -322,22 +432,38 @@ mod uefi_bin {
             let sig_size =
                 u32::from_le_bytes(db_data[offset + 24..offset + 28].try_into().unwrap()) as usize;
 
+            if list_size == 0 {
+                break;
+            }
+            if offset + list_size > db_data.len() {
+                return Err(format!(
+                    "malformed db: signature list at offset {} extends past db size {}",
+                    offset,
+                    db_data.len()
+                ));
+            }
+
             if sig_type != EFI_CERT_X509_GUID {
-                if list_size == 0 {
-                    break;
-                }
                 offset += list_size;
                 continue;
             }
 
             let sigs_start = offset + 28 + header_size;
             let sigs_end = offset + list_size;
+            if sig_size < 16 || sigs_start > sigs_end {
+                return Err(format!(
+                    "malformed db: invalid X.509 list at offset {} header_size={} sig_size={}",
+                    offset, header_size, sig_size
+                ));
+            }
+
             let cert_data_size = sig_size - 16;
 
             let mut sig_offset = sigs_start;
             while sig_offset + sig_size <= sigs_end {
                 let der_bytes = &db_data[sig_offset + 16..sig_offset + 16 + cert_data_size];
                 if let Ok(cert) = x509_cert::Certificate::from_der(der_bytes) {
+                    cert_count += 1;
                     let tbs = &cert.tbs_certificate;
 
                     use x509_cert::der::Encode;
@@ -354,15 +480,15 @@ mod uefi_bin {
 
                     let mut key_id = String::new();
                     for b in &digest[..8] {
-                        use core::fmt::Write;
                         let _ = write!(&mut key_id, "{:02x}", b);
                     }
 
                     let sig_path = sig_path_template.replace("{}", &key_id);
-                    println!("  Computed key_id: {}, looking for: {}", key_id, sig_path);
+                    last_key_id = key_id;
+                    last_sig_path = sig_path;
 
-                    if let Ok(sig_data) = load_file_to_memory(&sig_path) {
-                        println!("  Checking {} signature: {}", label, sig_path);
+                    if let Ok(sig_data) = load_file_to_memory(&last_sig_path) {
+                        sig_file_count += 1;
 
                         let algo_oid = tbs.subject_public_key_info.algorithm.oid;
                         let mut data_hasher = Sha256::new();
@@ -375,18 +501,15 @@ mod uefi_bin {
                                     .verify(Pkcs1v15Sign::new::<Sha256>(), &data_digest, &sig_data)
                                     .is_ok()
                                 {
-                                    println!(
-                                        "  ✅ RSA Signature VERIFIED for {} KEY_ID: {}",
-                                        label, key_id
-                                    );
-                                    verified = true;
+                                    return Ok(());
                                 } else {
-                                    println!(
-                                        "  ❌ RSA Signature mismatch for {} KEY_ID: {}",
-                                        label, key_id
-                                    );
+                                    mismatch_count += 1;
                                 }
+                            } else {
+                                unsupported_count += 1;
                             }
+                        } else {
+                            unsupported_count += 1;
                         }
                     }
                 }
@@ -394,27 +517,44 @@ mod uefi_bin {
             }
             offset += list_size;
         }
-        verified
+
+        if cert_count == 0 {
+            Err("no X.509 certificates found in db".to_string())
+        } else if sig_file_count == 0 {
+            Err(format!(
+                "no {} signature file matched any db cert; checked {} cert(s); last expected path={} KEY_ID={}",
+                label, cert_count, last_sig_path, last_key_id
+            ))
+        } else if mismatch_count > 0 {
+            Err(format!(
+                "{} RSA signature mismatch; checked {} signature file(s); last path={} KEY_ID={}",
+                label, sig_file_count, last_sig_path, last_key_id
+            ))
+        } else {
+            Err(format!(
+                "unsupported {} signing key or signature format; checked {} signature file(s), unsupported {}",
+                label, sig_file_count, unsupported_count
+            ))
+        }
     }
 
     #[entry]
     fn main() -> Status {
         uefi::helpers::init().unwrap();
-        println!("InitOS EFI Loader starting...");
+        let timer = EfiTimer::new();
+        start_message();
 
         // 1. Read config file
-        println!("Reading config file...");
         let config_data = match load_file_to_memory("\\EFI\\BOOT\\config") {
             Ok(data) => data,
             Err(e) => {
                 println!("Failed to read config file: {:?}", e);
-                loop {}
+                fail_and_reboot("Config load failed");
             }
         };
 
         let config_str = String::from_utf8_lossy(&config_data);
         let cmdline = config_str.lines().next().unwrap_or("").trim().to_string();
-        println!("Command line: {}", cmdline);
 
         // 2. Check Secure Boot status
         let mut sb_name_buf = [0u16; 16];
@@ -435,7 +575,6 @@ mod uefi_bin {
         // silently skipping verification.
         let mut db_buf = [0u8; 4096];
         let db_slice: &[u8] = if secure_boot {
-            println!("Secure Boot is ENABLED. Reading db variable...");
             let mut db_name_buf = [0u16; 16];
             let db_name = uefi::CStr16::from_str_with_buf("db", &mut db_name_buf).unwrap();
 
@@ -444,95 +583,95 @@ mod uefi_bin {
             match uefi::runtime::get_variable(db_name, &db_vendor, &mut db_buf) {
                 Ok((data, _)) if !data.is_empty() => data,
                 Ok(_) => {
-                    println!("❌ db variable is empty — refusing to boot without a usable signature database");
-                    loop {}
+                    fail_and_reboot(
+                        "db variable is empty; refusing to boot without a usable signature database",
+                    );
                 }
                 Err(e) => {
-                    println!("❌ Failed to read db variable: {:?} — refusing to boot without a usable signature database", e);
-                    loop {}
+                    println!(
+                        "Failed to read db variable: {:?}; refusing to boot without a usable signature database",
+                        e
+                    );
+                    fail_and_reboot("db variable read failed");
                 }
             }
         } else {
-            println!("Secure Boot is DISABLED. Skipping verification.");
             &[]
+        };
+        let db_sha = if secure_boot {
+            sha256_hex(db_slice)
+        } else {
+            String::new()
         };
 
         // 4. Verify config signature using db certs
         if secure_boot {
-            println!("Verifying config signature...");
-            if verify_data_signature(&config_data, db_slice, "\\EFI\\BOOT\\{}.sig", "config") {
-                println!("✅ CONFIG VERIFIED OK");
-            } else {
-                println!("❌ CONFIG VERIFICATION FAILED!");
-                loop {}
+            if let Err(detail) =
+                verify_data_signature(&config_data, db_slice, "\\EFI\\BOOT\\{}.sig", "config")
+            {
+                fail_signature("config", &db_sha, detail);
             }
         }
 
         // 5. Load kernel
-        println!("Loading kernel...");
-        let (kernel_addr, kernel_size, kernel_image_size) =
+        let bzimage_load_start = timer.now();
+        let (kernel_addr, kernel_size, _kernel_image_size) =
             match load_pe_kernel_to_address("\\EFI\\BOOT\\BZIMAGE") {
                 Ok(res) => res,
                 Err(e) => {
                     println!("Failed to load kernel: {:?}", e);
-                    loop {}
+                    fail_and_reboot("Kernel load failed");
                 }
             };
-        println!(
-            "Kernel loaded at 0x{:x} ({} bytes file, {} bytes image)",
-            kernel_addr, kernel_size, kernel_image_size
-        );
+        let bzimage_load_ms = bzimage_load_start.and_then(|start| timer.elapsed_ms_since(start));
 
         // Verify kernel signature if secure boot is enabled
         if secure_boot {
-            println!("Verifying kernel signature...");
             let kernel_data =
                 unsafe { core::slice::from_raw_parts(kernel_addr as *const u8, kernel_size) };
-            if verify_data_signature(
+            if let Err(detail) = verify_data_signature(
                 kernel_data,
                 db_slice,
                 "\\EFI\\BOOT\\{}.kernel.sig",
                 "kernel",
             ) {
-                println!("✅ KERNEL VERIFIED OK");
-            } else {
-                println!("❌ KERNEL VERIFICATION FAILED!");
-                loop {}
+                fail_signature("kernel", &db_sha, detail);
             }
         }
 
         // 6. Load initrd (optional)
+        let initrd_load_start = timer.now();
+        let mut initrd_load_ms = None;
         let (initrd_addr, initrd_size) = match load_kernel_to_address("\\EFI\\BOOT\\INITRD.IMG") {
             Ok((addr, size)) => {
-                println!("Initrd loaded at 0x{:x} ({} bytes)", addr, size);
-
+                initrd_load_ms = initrd_load_start.and_then(|start| timer.elapsed_ms_since(start));
                 // Verify initrd signature if secure boot is enabled
                 if secure_boot && !db_slice.is_empty() {
-                    println!("Verifying initrd signature...");
                     let initrd_data =
                         unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
-                    if verify_data_signature(
+                    if let Err(detail) = verify_data_signature(
                         initrd_data,
                         db_slice,
                         "\\EFI\\BOOT\\{}.initrd.sig",
                         "initrd",
                     ) {
-                        println!("✅ INITRD VERIFIED OK");
-                    } else {
-                        println!("❌ INITRD VERIFICATION FAILED!");
-                        loop {}
+                        fail_signature("initrd", &db_sha, detail);
                     }
                 }
                 (addr, size)
             }
-            Err(_) => {
-                println!("No initrd found, continuing...");
-                (0, 0)
-            }
+            Err(_) => (0, 0),
         };
 
-        println!("Booting Linux...");
-        linux_exec(&cmdline, kernel_addr, initrd_addr, initrd_size)
+        linux_exec(
+            &cmdline,
+            kernel_addr,
+            initrd_addr,
+            initrd_size,
+            &timer,
+            bzimage_load_ms,
+            initrd_load_ms,
+        )
     }
 }
 

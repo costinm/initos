@@ -2,6 +2,11 @@
 
 ## P0
 
+- [] depmod still doesn't work - need to be done in sign.sh
+- [] nvidia firmware not installed
+- [] need the nvidia binaries and deps to be packaged - most likely in a nix store on USB
+- [] scripts to copy the store from docker image or 'admin' server to a target.
+
 - [] cleanup 
 - [x] mount modules/firmware from rust, verify
 - [] install script 

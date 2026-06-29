@@ -23,6 +23,8 @@ targets are supplied, this builds:
 
   .#initos-signer
   ./linux#kernel-host
+  ./linux#nvidia-compute
+  .#initos-host
   .#docker-image
 
 Options:
@@ -64,6 +66,8 @@ if [ "${#targets[@]}" -eq 0 ]; then
     targets=(
         ".#initos-signer"
         "./linux#kernel-host"
+        "./linux#nvidia-compute"
+        ".#initos-host"
         ".#docker-image"
     )
 fi

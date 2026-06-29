@@ -199,10 +199,77 @@
         paths = signRuntimeDeps;
       };
 
+      hostRuntimeDeps = with pkgs; [
+        bash
+        bash-completion
+        bind
+        bridge-utils
+        btrfs-progs
+        bubblewrap
+        cacert
+        coreutils
+        curl
+        dig
+        dosfstools
+        e2fsprogs
+        e2tools
+        efibootmgr
+        erofs-utils
+        ethtool
+        file
+        findutils
+        fsverity-utils
+        fuse-overlayfs
+        fuse3
+        genext2fs
+        git
+        gnupg
+        gptfdisk
+        hdparm
+        i2c-tools
+        inetutils
+        iperf3
+        iproute2
+        iptables
+        iputils
+        iw
+        kmod
+        less
+        lsof
+        mc
+        minisign
+        mtools
+        nettools
+        nftables
+        nix
+        openssh
+        openssl
+        pciutils
+        radvd
+        rsync
+        sbsigntool
+        tini
+        tmux
+        unzip
+        usbutils
+        util-linux
+        vim
+        wget
+        wpa_supplicant
+      ];
+
+      initos-host = pkgs.symlinkJoin {
+        name = "initos-host";
+        paths = [ linuxFlake.packages.${system}.nvidia-compute ] ++ hostRuntimeDeps;
+        postBuild = ''
+          test -d "$out/opt/kernel-image/nvidia-compute"
+        '';
+      };
+
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image deps;
+        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image deps initos-host;
         default = initos-signer;
       };
     };

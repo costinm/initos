@@ -270,6 +270,48 @@
           nvidiaOpen = nvidiaOpenForConfig;
         };
 
+      nvidia-compute =
+        let
+          nvidiaUserspace = pkgs.linuxPackages.nvidiaPackages.stable;
+        in
+        assert lib.assertMsg (nvidiaUserspace.version == nvidiaPackage.version)
+          "nvidia-compute userspace version ${nvidiaUserspace.version} does not match kernel NVIDIA version ${nvidiaPackage.version}";
+        pkgs.runCommand "initos-nvidia-compute" { } ''
+          imageOut="$out/opt/kernel-image"
+          nvidiaCompute="$imageOut/nvidia-compute"
+          mkdir -p "$nvidiaCompute/bin" "$nvidiaCompute/lib"
+          for bin in \
+            nvidia-cuda-mps-control \
+            nvidia-cuda-mps-server \
+            nvidia-smi
+          do
+            if [ -e "${nvidiaUserspace.bin}/bin/$bin" ]; then
+              cp -a "${nvidiaUserspace.bin}/bin/$bin" "$nvidiaCompute/bin/"
+            fi
+          done
+          for libPattern in \
+            'libcuda.so*' \
+            'libcudadebugger.so*' \
+            'libnvcuvid.so*' \
+            'libnvidia-allocator.so*' \
+            'libnvidia-cfg.so*' \
+            'libnvidia-encode.so*' \
+            'libnvidia-fbc.so*' \
+            'libnvidia-ml.so*' \
+            'libnvidia-ngx.so*' \
+            'libnvidia-nvvm.so*' \
+            'libnvidia-nvvm70.so*' \
+            'libnvidia-opticalflow.so*' \
+            'libnvidia-ptxjitcompiler.so*'
+          do
+            find ${nvidiaUserspace.out}/lib -maxdepth 1 \( -type f -o -type l \) -name "$libPattern" \
+              -exec cp -a '{}' "$nvidiaCompute/lib/" \;
+          done
+          printf '%s\n' '${nvidiaUserspace.version}' > "$imageOut/nvidia-version"
+          test -e "$nvidiaCompute/bin/nvidia-smi"
+          test -e "$nvidiaCompute/lib/libcuda.so"
+        '';
+
       kernel-host = (mkKernelHostPackage {
         packageName = "initos-kernel-host";
         configfile = mergedConfig;
@@ -294,7 +336,7 @@
     in
     {
       packages.${system} = {
-        inherit kernel-host docker-image;
+        inherit kernel-host docker-image nvidia-compute;
         default = kernel-host;
       };
     };
