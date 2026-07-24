@@ -13,7 +13,8 @@ jobs:
   build-latest:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -22,12 +23,30 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build with latest Nixpkgs
-        run: scripts/build-latest-nixpkgs.sh
+      - name: Build with latest Nixpkgs (refresh locks + build)
+        run: |
+          # Update flake locks to latest nixpkgs
+          nix flake update
+          scripts/build.sh align_flake_locks
+
+          # Build the same targets as presubmit, with output symlinks
+          nix build .#initos-signer    -o result-signer
+          nix build ./linux#kernel-host -o result-kernel-host
+          nix build .#docker-image     -o result-docker-image
 
       - name: Show refreshed locks
         if: always()
         run: git diff -- flake.lock linux/flake.lock || true
+
+      - name: Package artifacts
+        run: |
+          # Signer tarball
+          tar -C result-signer -czf initos-signer.tar.gz .
+
+          # Kernel NAR + tarball
+          STORE_PATH=$(readlink -f result-kernel-host)
+          nix-store --export "$STORE_PATH" > initos-kernel-host.nar
+          tar -C result-kernel-host -czf initos-kernel-host.tar.gz .
 
       - name: Upload refreshed locks
         if: always()
@@ -37,3 +56,42 @@ jobs:
           path: |
             flake.lock
             linux/flake.lock
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-nixpkgs-artifacts
+          path: |
+            initos-signer.tar.gz
+            initos-kernel-host.nar
+            initos-kernel-host.tar.gz
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load and Push Docker/OCI image to GHCR
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          docker load -i "$(readlink -f result-docker-image)"
+          docker tag initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
+          docker push ghcr.io/${owner_lc}/initos-signer:latest
+
+      - name: Create Rolling Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rolling-release
+          name: Rolling Release
+          draft: false
+          prerelease: true
+          make_latest: true
+          files: |
+            initos-signer.tar.gz
+            initos-kernel-host.nar
+            initos-kernel-host.tar.gz
+          body: "Rolling Release built against latest Nixpkgs. Docker image: ghcr.io/costinm/initos-signer:latest"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

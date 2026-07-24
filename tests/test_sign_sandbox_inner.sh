@@ -57,16 +57,12 @@ if [ "${KERNEL_TYPE}" = "dir" ]; then
         fi
     done
 fi
-check_file "${OUT}/img/boot-limine-unsigned.img"
 check_file "${OUT}/img/boot-initos-signed.img"
-check_file "${OUT}/img/boot-limine-signed.img"
 check_file "${OUT}/boot/EFI/BOOT/BOOTX64.EFI"
 check_file "${OUT}/boot/EFI/BOOT/config"
 check_file "${OUT}/boot/EFI/BOOT/bzImage"
 check_file "${OUT}/boot/EFI/BOOT/initrd.img"
-check_file "${OUT}/boot-limine-unsigned/EFI/BOOT/BOOTX64.EFI"
 check_file "${OUT}/boot-initos-signed/EFI/BOOT/BOOTX64.EFI"
-check_file "${OUT}/boot-limine-signed/EFI/BOOT/BOOTX64.EFI"
 
 echo ""
 echo "  --- Generated keys ---"

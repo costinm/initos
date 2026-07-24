@@ -270,7 +270,7 @@ fn select_init(
         });
     }
 
-    for candidate in ["/opt/initos/bin/initos-init", "/sbin/init"] {
+    for candidate in ["/nix/var/nix/profiles/system/bin/init", "/sbin/init"] {
         if Path::new(root_mount)
             .join(candidate.trim_start_matches('/'))
             .is_file()
@@ -288,6 +288,18 @@ fn select_init(
             path: systemd.to_string(),
             args: vec!["--system"],
         });
+    }
+
+    for candidate in ["/opt/initos/bin/initos-init"] {
+        if Path::new(root_mount)
+            .join(candidate.trim_start_matches('/'))
+            .is_file()
+        {
+            return Ok(SelectedInit {
+                path: candidate.to_string(),
+                args: Vec::new(),
+            });
+        }
     }
 
     Err("no init found: checked /z/c/initos/init, /opt/initos/bin/initos-init, /sbin/init, /lib/systemd/systemd".into())

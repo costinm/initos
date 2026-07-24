@@ -87,13 +87,6 @@ fn main() {
                 cmd_fscrypt_setup(&args[2])
             }
             "boot" => initos::boot::cmd_boot(),
-            "mount" => {
-                if args.len() < 4 {
-                    eprintln!("Usage: initos mount <IMAGE> <MOUNTPOINT>");
-                    process::exit(1);
-                }
-                cmd_mount(&args[2], &args[3])
-            }
             "verify" => {
                 if args.len() < 3 {
                     eprintln!("Usage: initos verify <IMAGE>");
@@ -457,29 +450,11 @@ fn cmd_seal(
 
 // ─── Verify / Mount ────────────────────────────────────────────────────────
 
-/// Verify and loop-mount an erofs image.
-fn cmd_mount(img: &str, mount_point: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    let verified_boot = initos::boot::detect_verified_boot();
-    initos::boot::verify_image_trusted(img, &pub_key, verified_boot)?;
-
-    eprintln!("initos: mounting image {} at {}", img, mount_point);
-    initos::mount::mount_loop(img, mount_point)?;
-    eprintln!("initos: mount_ok {}", mount_point);
-    Ok(())
-}
 
 /// Verify the fsverity digest + signature of an image.
 fn cmd_verify(img: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pub_key = env::var("INITOS_PUB_KEY").unwrap_or_default();
-    let verified_boot = initos::boot::detect_verified_boot();
-    if pub_key.is_empty() && !verified_boot {
-        eprintln!(
-            "initos: INITOS_PUB_KEY not set and EFI SecureBoot not enabled, nothing to verify"
-        );
-        return Ok(());
-    }
-    initos::boot::verify_image_trusted(img, &pub_key, verified_boot)?;
+    initos::boot::verify_image_trusted(img, &pub_key, true)?;
     eprintln!("initos: VERIFIED OK: {}", img);
     Ok(())
 }

@@ -109,9 +109,63 @@ part_labels_usb() {
 #   chmod 600 /run/secrets/root/c_key
 # }
 
-copy_nix() {
-
+profile() {
+    nix profile add nixpkgs#nixos-install-tools
+    nix profile add nixpkgs#nixos-rebuild
 }
+# 1. Define the workspace root path
+WORKSPACE=${R:-"/ws/nixos"}
+
+nixinstall() {
+    local d=${1}
+    
+    # This is for machine-specific install - initos handles the first stage and mounting.
+    # nixos-generate-config --root ${d}
+
+    nixos-install --root ${WORKSPACE} --no-bootloader --no-root-password -v 
+    # Can also take a system path - instead of the config.
+}
+
+# Run the installed nixos in bwrap - assume WORKSPACE is a rootfs with /nix dir.
+# This doesn't work with systemd.
+bnix() {
+    set -euo pipefail
+
+    # 2. Extract the absolute path of the built NixOS system profile
+    # This follows the official Nix profile link and strips the host prefix
+    FULL_PATH=$(readlink -f "$WORKSPACE/nix/var/nix/profiles/system")
+    TARGET_SYS="${FULL_PATH#$WORKSPACE}"
+
+    rm -rf ${WORKSPACE}/bin ${WORKSPACE}/run
+    
+    echo $TARGET_SYS
+
+    exec bwrap \
+    --bind "$WORKSPACE" / \
+    --proc /proc \
+    --dev /dev \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --ro-bind /sys /sys \
+    --unshare-all \
+    --share-net \
+    --as-pid-1 \
+    --uid 1 \
+    --gid 1 \
+    --dir /bin \
+    --dir /run \
+    --setenv HOME "/home/user1" \
+    --setenv USER "user1" \
+    --symlink "$TARGET_SYS/sw/bin/sh" /bin/sh \
+    --symlink "$TARGET_SYS" /run/current-system \
+    --setenv PATH "/run/current-system/sw/bin:/bin" \
+    /bin/sh
+
+# /run/current-system/activate
+
+# --extra-experimental-features "nix-command flakes"
+#/nix/store/q1b3vwc8lcj11piixjnhqbz8p8phjr40-nixos-system-nixos-26.11pre-git/init
+}
+
 
 get_nvidia_fw() {
   DRIVER_VER="595.84"

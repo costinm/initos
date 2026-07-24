@@ -7,7 +7,7 @@
 # - kernel/modules for host and cloud
 #
 # Output layout (under $out/artifacts/):
-#   boot/EFI/BOOT/  — initrd.img, BOOTX64.EFI, initos.EFI, limine.conf
+#   boot/EFI/BOOT/  — initrd.img, initos.EFI (unsigned, will be moved to BOOTX84.EFI and signed)
 #   img/            — initos.erofs
 #   bin/            — initos binary, sidecar scripts
 #
@@ -15,7 +15,6 @@
 #   INITOS_BIN    — path to pre-built initos binary
 #   EFI_BIN       — path to pre-built efi.efi binary
 #   USE_BUSYBOX   — path to static busybox binary
-#   LIMINE_EFI    — path to Limine BOOTX64.EFI
 #   KERNEL_BZIMAGE — path to a kernel bzImage
 #   KERNEL_DIR     — directory containing bzImage
 
@@ -78,28 +77,6 @@ _resolve_busybox() {
         echo "ERROR: busybox not found. Set USE_BUSYBOX." >&2
         return 1
     fi
-}
-
-# Resolve Limine EFI binary: env var > limine package next to CLI
-_resolve_limine_efi() {
-    if [ -n "${LIMINE_EFI:-}" ] && [ -f "${LIMINE_EFI}" ]; then
-        echo "${LIMINE_EFI}"
-        return 0
-    fi
-
-    if command -v limine >/dev/null 2>&1; then
-        local limine_bin limine_root limine_efi
-        limine_bin="$(command -v limine)"
-        limine_root="$(cd "$(dirname "${limine_bin}")/.." && pwd)"
-        limine_efi="${limine_root}/share/limine/BOOTX64.EFI"
-        if [ -f "${limine_efi}" ]; then
-            echo "${limine_efi}"
-            return 0
-        fi
-    fi
-
-    echo "ERROR: Limine BOOTX64.EFI not found. Set LIMINE_EFI." >&2
-    return 1
 }
 
 _resolve_kernel_bzimage() {
@@ -284,15 +261,7 @@ build_boot() {
     local boot_path="${ARTIFACTS}/boot"
     mkdir -p "${boot_path}/EFI/BOOT"
 
-    # Copy Limine BOOTX64.EFI
-    local limine_efi
-    limine_efi=$(_resolve_limine_efi)
-    cp "${limine_efi}" "${boot_path}/EFI/BOOT/BOOTX64.EFI"
-
-    # Copy limine.conf
-    cp "${src}/prebuilt/boot/EFI/BOOT/limine.conf" "${boot_path}/EFI/BOOT/"
-
-    # Copy custom loader as initos.EFI
+    # Copy custom loader as initos.EFI - unsigned
     local efi_bin
     efi_bin=$(_resolve_efi_bin)
     cp "${efi_bin}" "${boot_path}/EFI/BOOT/initos.EFI"
@@ -325,8 +294,8 @@ build_qemu_test() {
     build_qemu_mount_fixtures "${keys}"
 
     # Build the three boot variants — sign.sh reads from artifacts/
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
-    "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    # "${src}/sidecar/bin/sign.sh" build_boot_limine_unsigned "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
+    # "${src}/sidecar/bin/sign.sh" build_boot_limine_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
     "${src}/sidecar/bin/sign.sh" build_boot_initos_signed "${ARTIFACTS}/boot" "${out}/disks" "${keys}"
 
     build_qemu_state
@@ -440,6 +409,13 @@ nvidia() {
 
 firmware() {
     "${src}/scripts/setup-kernel" add_firmware
+}
+
+deps() {
+    rustup target add x86_64-unknown-uefi
+    mkdir -p target/nix
+    #nix profile add nixpkgs#erofs-utils nixpkgs#mtools --profile target/nix/profile
+    nix profile add .#deps --profile target/nix/profile
 }
 
 align_flake_locks() {

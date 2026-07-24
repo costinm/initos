@@ -21,7 +21,7 @@ set -euo pipefail
 PATH="/usr/sbin:/sbin:${PATH}"
 
 SECRETS=${SECRETS:-/var/run/secrets/uefi-keys}
-NIX_PROFILE=${NIX_PROFILE:-${PWD}/target/nix/profiles/profile}
+NIX_PROFILE=${NIX_PROFILE:-${PWD}/target/nix/profile}
 
 # --- Key generation ---
 
@@ -458,7 +458,7 @@ artifacts() {
     local kernel_dir="${2:-}"
     local artifact_dir="${3:-}"
     local sec_dir="${SECRETS:-/var/run/secrets/uefi-keys}"
-    local profile_dir="${NIX_PROFILE:-${PWD}/target/nix/profiles/profile}"
+    local profile_dir="${NIX_PROFILE:-${PWD}/target/nix/profile}"
 
     # Auto-detect kernel_dir
     if [ -z "${kernel_dir}" ]; then
@@ -770,7 +770,7 @@ build_boot_initos_signed() {
     _safe_cp "$initrd_src" "${boot_path}/EFI/BOOT/initrd.img"
     _safe_cp "$initos_efi_src" "${boot_path}/EFI/BOOT/initos.EFI"
     
-    local cmdline="${INITOS_CMDLINE:-rdinit=/init console=tty1 console=ttyS0,115200 console=hvc0 loglevel=6 net.ifnames=0 panic=5}"
+    local cmdline="${INITOS_CMDLINE:-rdinit=/init console=tty1 systemd.default_timeout_start_sec=15 console=ttyS0,115200 console=hvc0 loglevel=6 net.ifnames=0 panic=5}"
 
     printf '%s\n' "${cmdline}" > "${boot_path}/EFI/BOOT/config"
 

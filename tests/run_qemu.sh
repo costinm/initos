@@ -64,7 +64,7 @@ stage_nix_artifacts() {
     done
 
     echo "=== Staging Nix boot images ==="
-    for variant in boot-limine-unsigned boot-initos-signed boot-limine-signed; do
+    for variant in boot-initos-signed ; do
         local img_path="${nix_result}/img/${variant}.img"
         if [[ -f "${img_path}" ]]; then
             mkdir -p "${out}/disks/${variant}"
@@ -122,7 +122,7 @@ require_artifacts() {
         missing=1
     fi
 
-    for variant in boot-limine-unsigned boot-initos-signed boot-limine-signed; do
+    for variant in boot-initos-signed; do
         if [[ ! -f "${out}/disks/img/${variant}.vfat" ]]; then
             echo "Missing signed boot image: ${out}/disks/img/${variant}.vfat" >&2
             missing=1
@@ -290,50 +290,6 @@ run_direct_kernel() {
     fi
 }
 
-test_unsigned_negative() {
-    echo "=== Running Negative Test (Unsigned bootloader) ==="
-    rm -rf "${ESP_DIR}"
-    mkdir -p "${ESP_DIR}"
-    
-    mcopy -i "${out}/disks/img/boot-limine-unsigned.vfat" -s ::EFI "${ESP_DIR}/" || true
-    mcopy -i "${out}/disks/img/boot-limine-unsigned.vfat" -s ::keys "${ESP_DIR}/" || true
-
-    local log_file="${out}/qemu_efi_unsigned.log"
-    LOG_FILE="${log_file}" run 6
-
-    echo "=== Analyzing Unsigned Boot (Expected to Fail) ==="
-    if grep -q "Linux version" "${log_file}" || grep -q "InitOS EFI Loader" "${log_file}"; then
-        echo "❌ FAILURE: Unsigned bootloader or kernel booted successfully under Secure Boot!"
-        exit 1
-    else
-        echo "✅ SUCCESS: Unsigned bootloader was blocked by Secure Boot!"
-    fi
-}
-
-test_limine_signed() {
-    echo "=== Running Signed Limine Direct Boot Test ==="
-    rm -rf "${ESP_DIR}"
-    mkdir -p "${ESP_DIR}"
-    local signed_timeout_s="${SIGNED_TIMEOUT:-${TIMEOUT:-30}}"
-    
-    build_qemu_state basic
-    mcopy -i "${out}/disks/img/boot-limine-signed.vfat" -s ::EFI "${ESP_DIR}/" || true
-    mcopy -i "${out}/disks/img/boot-limine-signed.vfat" -s ::keys "${ESP_DIR}/" || true
-
-    local log_file="${out}/qemu_efi_limine_signed.log"
-    LOG_FILE="${log_file}" run "${signed_timeout_s}"
-
-    echo "=== Analyzing Signed Limine Boot ==="
-    
-    if grep -q "initos: image db signature verified OK" "${log_file}" && \
-        grep -q "=== ALL TESTS COMPLETE ===" "${log_file}"; then
-        echo "✅ SUCCESS: Signed Limine booted and completed all tests!"
-    else
-        echo "❌ FAILURE: Signed Limine boot failed or did not complete tests."
-        exit 1
-    fi
-}
-
 test_initos_signed() {
     echo "=== Running Signed InitOS Custom Loader Boot Test ==="
     rm -rf "${ESP_DIR}"
@@ -464,8 +420,6 @@ test() {
         "${src}/scripts/build.sh" build_qemu_state
     fi
     require_artifacts
-    test_unsigned_negative
-    test_limine_signed
     test_initos_signed
     test_initos_signed_stateless
     test_direct_kernel_embedded_if_present

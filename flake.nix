@@ -82,6 +82,7 @@
         bc
         binutils
         bison
+        erofs-utils
         flex
         gnused
         efitools
@@ -93,7 +94,6 @@
         kmod
         mtools
         minisign
-        limine
         openssh
         openssl
         perl
@@ -114,11 +114,10 @@
         src = ./.;
         nativeBuildInputs = with pkgs; [
           cpio gzip erofs-utils mtools makeWrapper
-        ] ++ [ initos efi pkgs.limine ];
+        ] ++ [ initos efi ];
       } ''
         export out="$out"
         export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
-        export LIMINE_EFI="${pkgs.limine}/share/limine/BOOTX64.EFI"
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
         export KERNEL_DIR="${linuxFlake.packages.${system}.kernel-host}/opt/kernel-image"
@@ -130,19 +129,22 @@
         # Move artifacts to the root of $out
         mv $out/artifacts/* $out/
         rmdir $out/artifacts
+
+        # Wrap sign.sh so it finds all runtime tools when invoked from a nix profile
+        wrapProgram $out/bin/sign.sh \
+          --prefix PATH : "${signRuntimePath}"
       '';
 
       directBootInitrd = pkgs.runCommand "initos-direct-boot-initrd" {
         src = ./.;
         nativeBuildInputs = with pkgs; [
           cpio gzip erofs-utils mtools makeWrapper
-        ] ++ [ initos efi pkgs.limine ];
+        ] ++ [ initos efi ];
       } ''
         finalOut="$out"
         buildOut="$TMPDIR/initos-direct-boot-initrd-build"
         export out="$buildOut"
         export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
-        export LIMINE_EFI="${pkgs.limine}/share/limine/BOOTX64.EFI"
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
         export KERNEL_DIR="${linuxFlake.packages.${system}.kernel-host}/opt/kernel-image"
