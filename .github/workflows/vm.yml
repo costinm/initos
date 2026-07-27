@@ -47,19 +47,19 @@ jobs:
       - name: Build VM Docker image
         run: nix build ./vm#docker-image -o result-vm-docker-image
 
-      - name: Package VM kernel artifacts
-        run: |
-          STORE_PATH=$(readlink -f result-kernel-cloud)
-          nix-store --export "$STORE_PATH" > initos-kernel-cloud.nar
-          tar -C result-kernel-cloud -czf initos-kernel-cloud.tar.gz .
+      # - name: Package VM kernel artifacts
+      #   run: |
+      #     STORE_PATH=$(readlink -f result-kernel-cloud)
+      #     nix-store --export "$STORE_PATH" > initos-kernel-cloud.nar
+      #     tar -C result-kernel-cloud -czf initos-kernel-cloud.tar.gz .
 
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: initos-vm-artifacts
-          path: |
-            initos-kernel-cloud.nar
-            initos-kernel-cloud.tar.gz
+      # - name: Upload workflow artifacts
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: initos-vm-artifacts
+      #     path: |
+      #       initos-kernel-cloud.nar
+      #       initos-kernel-cloud.tar.gz
 
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -74,21 +74,21 @@ jobs:
         run: |
           owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker load -i "$(readlink -f result-vm-docker-image)"
-          docker tag initos-vm:latest ghcr.io/${owner_lc}/initos-vm:latest
-          docker push ghcr.io/${owner_lc}/initos-vm:latest
+          docker tag initos-vm:latest ghcr.io/${owner_lc}/initos/vm:latest
+          docker push ghcr.io/${owner_lc}/initos/vm:latest
 
-      - name: Create / Update Rolling Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: rolling-release
-          name: Rolling Release
-          draft: false
-          prerelease: true
-          make_latest: true
-          files: |
-            initos-kernel-cloud.nar
-            initos-kernel-cloud.tar.gz
-          body: "Rolling Release — VM kernel, hypervisors, and init scripts. Docker image: ghcr.io/costinm/initos-vm:latest"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Create / Update Rolling Release
+      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     tag_name: rolling-release
+      #     name: Rolling Release
+      #     draft: false
+      #     prerelease: true
+      #     make_latest: true
+      #     files: |
+      #       initos-kernel-cloud.nar
+      #       initos-kernel-cloud.tar.gz
+      #     body: "Rolling Release — VM kernel, hypervisors, and init scripts. Docker image: ghcr.io/costinm/initos-vm:latest"
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
