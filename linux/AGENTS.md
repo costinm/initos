@@ -12,8 +12,11 @@ The kernel build is driven by the nix flake or `scripts/setup_kernel.sh` in the 
 
 ## Current Defaults
 
-- `scripts/setup-kernel` defaults `BRANCH=6.18`.
-- Base config inputs are:
+- The Nix host build and VM build both use `pkgs.linuxPackages_latest.kernel`
+  (currently 7.1.3 from their shared nixpkgs lock).
+- `scripts/setup-kernel` defaults `BRANCH=7.1`.
+- The 6.18 Debian config is intentionally retained as the migration seed and
+  is resolved by `olddefconfig` against the selected kernel. Base config inputs are:
   - `linux/6.18/config.amd64`
   - `linux/6.18/config`
 - Host fragments merged by `kernel_cfg` include:

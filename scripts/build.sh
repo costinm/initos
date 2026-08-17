@@ -152,7 +152,7 @@ _resolve_qemu_kernel_release() {
         done
     fi
 
-    echo "6.18.34"
+    echo "7.1.3"
 }
 
 # 1. Rust binaries: EFI loader and the helper binary.

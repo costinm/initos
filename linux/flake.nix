@@ -16,9 +16,12 @@
       };
 
       lib = pkgs.lib;
-      baseKernel = pkgs.linuxKernel.kernels.linux_6_18;
+      # Keep the host on the same rolling kernel selection as the VM build.
+      baseKernel = pkgs.linuxPackages_latest.kernel;
       src = ./.;
-      branch = "6.18";
+      # The existing Debian config remains the migration seed. olddefconfig
+      # resolves it and all host fragments against the selected kernel.
+      configBranch = "6.18";
       kernelPatchFiles = [
         ./patches/module-signing-use-platform-keyring.patch
       ];
@@ -71,9 +74,9 @@
         mergeRoot="$PWD/merge"
         mkdir -p "$buildRoot" "$mergeRoot"
 
-        install -m 0644 ${src}/${branch}/config.amd64 "$buildRoot/.config"
+        install -m 0644 ${src}/${configBranch}/config.amd64 "$buildRoot/.config"
         cd "$mergeRoot"
-        "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${branch}/config
+        "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${configBranch}/config
         ${mergeFragmentCommands}
 
         make -C "$kernelSrc" O="$buildRoot" ARCH=x86 olddefconfig
@@ -136,9 +139,9 @@
           mergeRoot="$PWD/merge"
           mkdir -p "$buildRoot" "$mergeRoot"
 
-          install -m 0644 ${src}/${branch}/config.amd64 "$buildRoot/.config"
+          install -m 0644 ${src}/${configBranch}/config.amd64 "$buildRoot/.config"
           cd "$mergeRoot"
-          "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${branch}/config
+          "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${src}/${configBranch}/config
           ${mergeFragmentCommands}
           ${lib.optionalString (extraConfigText != "") ''
             "$kernelSrc/scripts/kconfig/merge_config.sh" -m -O "$buildRoot" "$buildRoot/.config" ${extraConfigFile}

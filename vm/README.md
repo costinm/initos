@@ -56,11 +56,20 @@ vm/
 - Console used either as a terminal, or as the main SSH connection. If used as a
   terminal, vsock is used for SSH.
 
-## Network model
+## Network Model
 
 Network is optional — the expectation is that the mesh will apply policies and handle
 communication without having to intercept traffic, with application code using UDS or
 localhost connections.
+
+VMs that need to test `ssh-mesh` network integration use:
+- **vsock** (`AF_VSOCK`): the VM guest connects to the host-side `ssh-mesh` over vsock.
+- **nftables / Istio-style capture**: outbound TCP is redirected in the VM by nftables,
+  matching Istio's iptables capture approach; `mesh-init` manages the rules.
+- **mesh-init**: owns the network namespace setup and service lifecycle inside the VM.
+
+The `tun`/`passt` approach (pasta/passt userspace networking) was evaluated and
+dropped — tests showed it to be slower and more complex.
 
 ## Hypervisors
 
@@ -72,9 +81,15 @@ The `vm-tools` package and `docker-image` output bundle all three hypervisors. T
 kernel `kernel-cloud` package is intentionally kept separate so it can be copied to
 another machine without pulling hypervisor closures along.
 
-## Script origins
+## Script Origins and Test Location
 
 `bin/initos-init-vm`, `bin/vrun`, and `bin/run_bwrap.sh` were originally developed in
 `github.com/costinm/ssh-mesh`. They have been moved here to keep VM-specific tooling
 co-located with the kernel it targets and to reduce the scope of `ssh-mesh` to SSH /
 mesh-init and associated mesh binaries.
+
+VM test scripts (`test_vm_qemu_echo.sh`, `test_vm_vrun_cloud_hypervisor_echo.sh`,
+`test_vm_vrun_crosvm_echo.sh`, `test_vm_microvm_echo.sh`, `test_vm_echo_latency.sh`,
+`test_vm_mesh_init_root_hardening.sh`) and the `microvm-echo/` Nix flake have also
+been moved from `ssh-mesh/tests/` to `initos/tests/`. The `ssh-mesh` repo no longer
+contains VM execution tests or build targets for EROFS rootfs images.

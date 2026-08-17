@@ -27,7 +27,11 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 APTINSTALL='apt install -o Dpkg::Options::=--force-confold --assume-yes --no-install-recommends '
 
-BRANCH=${BRANCH:-6.18}
+# Keep this source branch aligned with linux/flake.nix's current 7.1 kernel.
+BRANCH=${BRANCH:-7.1}
+# The Debian 6.18 config is deliberately retained as a migration seed; the
+# source tree's olddefconfig resolves it and the host fragments for BRANCH.
+CONFIG_BRANCH=${CONFIG_BRANCH:-6.18}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -132,8 +136,8 @@ kernel_cfg() {
   cd ${out}/linux
 
   # load debian and apply overrides.
-  cp  ${src}/linux/${BRANCH}/config.amd64 .config 
-  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/${BRANCH}/config
+  cp  ${src}/linux/${CONFIG_BRANCH}/config.amd64 .config
+  ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/${CONFIG_BRANCH}/config
     
   ./scripts/kconfig/merge_config.sh -m .config ${src}/linux/builtins.fragment 
   
