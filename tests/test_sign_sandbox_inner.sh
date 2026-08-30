@@ -16,7 +16,7 @@ export PATH="${SIGNER_PATH}/bin:${COREUTILS_BIN}:$PATH"
 export SECRETS="/out/keys"
 
 if [ "${KERNEL_TYPE}" = "dir" ]; then
-    export KERNEL_DIR="/out/kernel"
+    export KERNEL_DIR="/out/kernel/opt/kernel-image"
 elif [ "${KERNEL_TYPE}" = "file" ]; then
     export KERNEL_BZIMAGE="/out/kernel/bzImage"
 fi
@@ -26,7 +26,7 @@ sign.sh sign_init
 echo ""
 
 echo "=== Step 2: Sign artifacts ==="
-sign.sh artifacts "${OUT}" "${ARTIFACTS_PATH}"
+sign.sh artifacts "${OUT}" "${KERNEL_DIR:-${KERNEL_BZIMAGE%/*}}" "${ARTIFACTS_PATH}"
 echo ""
 
 # Verify outputs
@@ -57,12 +57,7 @@ if [ "${KERNEL_TYPE}" = "dir" ]; then
         fi
     done
 fi
-check_file "${OUT}/img/boot-initos-signed.img"
-check_file "${OUT}/boot/EFI/BOOT/BOOTX64.EFI"
-check_file "${OUT}/boot/EFI/BOOT/config"
-check_file "${OUT}/boot/EFI/BOOT/bzImage"
-check_file "${OUT}/boot/EFI/BOOT/initrd.img"
-check_file "${OUT}/boot-initos-signed/EFI/BOOT/BOOTX64.EFI"
+check_file "${OUT}/img/boot-initos-signed.vfat"
 
 echo ""
 echo "  --- Generated keys ---"

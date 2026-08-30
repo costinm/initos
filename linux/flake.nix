@@ -252,6 +252,11 @@
           firmwareRoot="$TMPDIR/firmware"
           mkdir -p "$firmwareRoot"
           ${firmwareCopyCommands}
+          # NVIDIA packages keep GSP blobs in a separate firmware output.  It
+          # must match the module/userspace version selected for this kernel.
+          if [ -d ${nvidiaPackage.firmware}/lib/firmware ]; then
+            cp -a ${nvidiaPackage.firmware}/lib/firmware/. "$firmwareRoot/"
+          fi
           chmod -R u+w "$firmwareRoot"
           (cd "$firmwareRoot" && mkfs.erofs -zlz4 "$imageOut/firmware.erofs" .)
 

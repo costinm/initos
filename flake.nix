@@ -79,6 +79,7 @@
       # ── Runtime deps for signing ────────────────────────────────────────
       signRuntimeDeps = with pkgs; [
         coreutils
+        diffutils
         erofs-utils
         gnused
         efitools
@@ -110,15 +111,20 @@
         export USE_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
         export INITOS_BIN="${initos}/bin/initos"
         export EFI_BIN="${efi}/bin/efi.efi"
-        export KERNEL_DIR="${linuxFlake.packages.${system}.kernel-host}/opt/kernel-image"
 
         bash $src/scripts/build.sh build_initos
-        bash $src/scripts/build.sh build_boot
+        bash $src/scripts/build.sh build_initrd
         bash $src/scripts/build.sh build_bin
 
-        # Move artifacts to the root of $out
-        mv $out/artifacts/* $out/
-        rmdir $out/artifacts
+        # The signer owns only the unsigned InitOS/EFI inputs.  The kernel,
+        # including bzImage, modules, firmware, and NVIDIA, belongs exclusively
+        # to kernel-host.  Do not leave build staging in the package output.
+        mkdir -p "$out/img"
+        mv "$out/artifacts/img/initos.erofs" "$out/img/"
+        mv "$out/artifacts/boot/EFI/BOOT/initrd.img" "$out/img/"
+        cp "$EFI_BIN" "$out/img/initos.EFI"
+        mv "$out/artifacts/bin" "$out/bin"
+        rm -rf "$out/artifacts" "$out/staging"
 
         # Wrap sign.sh so it finds all runtime tools when invoked from a nix profile
         wrapProgram $out/bin/sign.sh \

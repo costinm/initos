@@ -510,8 +510,9 @@ artifacts() {
         fi
     fi
 
-    if [ -z "${artifact_dir}" ] || [ ! -f "${artifact_dir}/img/initos.erofs" ]; then
-        echo "ERROR: initos artifacts not found. Please provide artifact_dir." >&2
+    if [ -z "${artifact_dir}" ] || [ ! -f "${artifact_dir}/img/initos.erofs" ] || \
+       [ ! -f "${artifact_dir}/img/initrd.img" ] || [ ! -f "${artifact_dir}/img/initos.EFI" ]; then
+        echo "ERROR: initos artifacts not found; artifact_dir/img must contain initos.erofs, initrd.img, and initos.EFI." >&2
         exit 1
     fi
 
@@ -568,19 +569,15 @@ artifacts() {
         image "${output_dir}/img" "firmware.erofs"
     fi
 
-    # Create a temporary staging area for the boot files
+    # Assemble the kernel-independent signer inputs with the kernel bzImage.
+    # This stage is temporary and is never retained in the signer package or
+    # emitted artifact set.
     local boot_stage
     boot_stage=$(mktemp -d)
     mkdir -p "${boot_stage}/EFI/BOOT"
 
-    # Copy from artifact_dir
-    if [ -d "${artifact_dir}/boot" ]; then
-        cp -R "${artifact_dir}/boot/." "${boot_stage}/"
-    else
-        cp -R "${artifact_dir}/." "${boot_stage}/"
-    fi
-    chmod -R u+w "${boot_stage}"
-
+    cp "${artifact_dir}/img/initrd.img" "${boot_stage}/EFI/BOOT/initrd.img"
+    cp "${artifact_dir}/img/initos.EFI" "${boot_stage}/EFI/BOOT/initos.EFI"
     cp "${bzimage}" "${boot_stage}/EFI/BOOT/bzImage"
 
     # Build the three boot variants from the staging area

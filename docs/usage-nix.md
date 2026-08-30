@@ -13,12 +13,20 @@ initos=github:costinm/initos
 linux="$initos?dir=linux"
 
 # The kernel build also pulls its modules, firmware, and matched NVIDIA payload.
-signer=$(nix build --no-link --print-out-paths "$initos#initos-signer")
-kernel=$(nix build --no-link --print-out-paths "$linux#kernel-host")
+kernel=$(nix build --refresh --no-link --print-out-paths "$linux#kernel-host")
 
-# Basic host tools, Nix, signing tools, and the matched NVIDIA compute closure.
-host_with_nvidia=$(nix build --no-link --print-out-paths "$initos#initos-host-with-nvidia")
+# Retained Nix output links: these are registered as GC roots.
+mkdir -p "$HOME/opt"
+nix build --refresh --out-link "$HOME/opt/initos-signer" "$initos#initos-signer"
+nix build --refresh --out-link "$HOME/opt/initos-host" "$initos#initos-host-with-nvidia"
+signer="$HOME/opt/initos-signer"
+host_with_nvidia="$HOME/opt/initos-host"
 ```
+
+The signer and host links are Nix GC roots, so their complete closures are
+retained. The kernel is intentionally built with `--no-link`; once signing has
+produced ordinary files in `$output_dir`, its kernel, modules, and firmware can
+be garbage-collected and rebuilt when needed.
 
 ## Create signed artifacts
 
@@ -50,13 +58,6 @@ ssh "$remote" \
   "nix-store --add-root /nix/var/nix/gcroots/initos-host --indirect -r '$host_with_nvidia'"
 ```
 
-The GC root keeps the transferred host tools and NVIDIA compute closure alive.
-To make the tools immediately convenient in a shell on the remote host:
-
-```sh
-ssh "$remote" "export PATH='$host_with_nvidia/bin':\$PATH; bash"
-```
-
 ## Copy signed images to a boot slot
 
 Ensure the remote login account can write the selected slot directory (or
@@ -64,10 +65,10 @@ prepare it with `sudo install -d /z/img/$slot`). Then copy the signed images
 to each slot that should receive the update:
 
 ```sh
-slot=101 # repeat with 102 when updating both slots
+slot=101 # alternate with 102
 ssh "$remote" "sudo install -d /z/img/$slot"
 scp "$output_dir/img/"* "$remote:/z/img/$slot/"
-```
 
-Deploy `boot-initos.img` to the EFI boot partition separately when the target
-boot layout requires it.
+disk=/dev/sda
+ssh $remote dd if=/z/img/$slot/boot-initos-signed.vfat of=${disk}${slot}
+```

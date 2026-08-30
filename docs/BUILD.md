@@ -14,7 +14,7 @@ little for an operator.
 
 | Nix output | Compressed archive | Contents |
 | --- | ---: | --- |
-| `docker-signer-tools-image` | 78 MB | signer script, unsigned initrd/boot inputs, signing tools |
+| `docker-signer-tools-image` | 78 MB | signer script, unsigned `img/` inputs, signing tools; no kernel |
 | `docker-kernel-artifacts-image` | 1.52 GB | kernel, modules, firmware, `sign-file`, matched NVIDIA compute |
 | `docker-signer-kernel-image` | 1.57 GB | compatibility combination of signer tools and kernel artifacts |
 | `docker-host-runtime-image` | 287 MB | `/result`: generic host tools, Nix, signing tools; no kernel/NVIDIA |
