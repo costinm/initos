@@ -79,27 +79,17 @@
       # ── Runtime deps for signing ────────────────────────────────────────
       signRuntimeDeps = with pkgs; [
         coreutils
-        bc
-        binutils
-        bison
         erofs-utils
-        flex
         gnused
         efitools
         findutils
         fsverity-utils
         gnugrep
         gawk
-        gnumake
         kmod
         mtools
-        minisign
-        openssh
         openssl
-        perl
         sbsigntool
-        stdenv.cc
-        swtpm
         tinyxxd
         util-linux
       ];
@@ -183,9 +173,36 @@
         chmod 1777 $out/tmp
       '';
 
-      # ── Docker Image (runs signer) ──────────────────────────────────────
+      # ── Docker images ───────────────────────────────────────────────────
 
-      docker-image = pkgs.dockerTools.buildLayeredImage {
+      # Signing executable, unsigned initrd/boot inputs, and signing tools.
+      # Kernel artifacts are intentionally excluded so this image can be
+      # updated independently from the kernel/NVIDIA payload.
+      docker-signer-tools-image = pkgs.dockerTools.buildLayeredImage {
+        name = "initos-signer-tools";
+        tag = "latest";
+        contents = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir ] ++ signRuntimeDeps;
+        config = {
+          Entrypoint = [ "/bin/sign.sh" ];
+          Env = [ "PATH=/bin" ];
+          WorkingDir = "/";
+        };
+      };
+
+      # Build artifacts matched as one unit: kernel, unpacked modules,
+      # firmware EROFS, sign-file, and NVIDIA compute userspace under
+      # /opt/kernel-image. No signer scripts or signing runtime tools.
+      docker-kernel-artifacts-image = pkgs.dockerTools.buildLayeredImage {
+        name = "initos-kernel-artifacts";
+        tag = "latest";
+        contents = [ linuxFlake.packages.${system}.kernel-host ];
+        config = {
+          WorkingDir = "/";
+        };
+      };
+
+      # Compatibility image for workflows that still need both halves.
+      docker-signer-kernel-image = pkgs.dockerTools.buildLayeredImage {
         name = "initos-signer";
         tag = "latest";
         contents = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host ] ++ signRuntimeDeps;
@@ -262,16 +279,77 @@
 
       initos-host = pkgs.symlinkJoin {
         name = "initos-host";
-        paths = [ linuxFlake.packages.${system}.nvidia-compute ] ++ hostRuntimeDeps;
-        postBuild = ''
-          test -d "$out/opt/kernel-image/nvidia-compute"
-        '';
+        # Host tooling intentionally excludes kernel-coupled userspace.  The
+        # matching NVIDIA compute payload is packaged by kernel-host under
+        # /opt/kernel-image/nvidia-compute and ships with the signer-kernel
+        # image so driver modules and userspace upgrade together.  Signing
+        # tools are generic host capabilities and are included here without
+        # their kernel or NVIDIA inputs.
+        paths = hostRuntimeDeps ++ signRuntimeDeps;
+      };
+
+      # Package roots copied into a Docker image do not include the Nix store
+      # registration database.  Keep closure metadata alongside /result so
+      # sign.sh can register the image's store paths in a temporary source DB
+      # before copying them to a daemon or fresh chroot store.
+      initos-host-closure = pkgs.closureInfo {
+        rootPaths = [ initos-host ];
+      };
+
+      host-runtime-root = pkgs.runCommand "initos-host-runtime-root" { } ''
+        mkdir -p "$out"
+        ln -s ${initos-host} "$out/result"
+        ln -s ${initos-host-closure} "$out/result-closure"
+        printf '%s\n' '${initos-host}' > "$out/result-path"
+      '';
+
+      docker-host-runtime-image = pkgs.dockerTools.buildLayeredImage {
+        name = "initos-host-runtime";
+        tag = "latest";
+        contents = [ host-runtime-root ];
+        config = {
+          WorkingDir = "/";
+        };
+      };
+
+      # The workflow image transfers the generic host package set together with
+      # NVIDIA compute userspace.  Keep this transfer root distinct from the
+      # standalone host-runtime image: NVIDIA stays absent from its generic
+      # /result payload, but is available when a workflow image upgrades a host.
+      initos-host-with-nvidia = pkgs.symlinkJoin {
+        name = "initos-host-with-nvidia";
+        paths = [ initos-host linuxFlake.packages.${system}.nvidia-compute ];
+      };
+
+      initos-host-with-nvidia-closure = pkgs.closureInfo {
+        rootPaths = [ initos-host-with-nvidia ];
+      };
+
+      workflow-runtime-root = pkgs.runCommand "initos-workflow-runtime-root" { } ''
+        mkdir -p "$out"
+        ln -s ${initos-host-with-nvidia} "$out/result"
+        ln -s ${initos-host-with-nvidia-closure} "$out/result-closure"
+        printf '%s\n' '${initos-host-with-nvidia}' > "$out/result-path"
+      '';
+
+      # Retain the original all-in-one workflow image, but make the smaller
+      # signer and host-runtime images independently selectable and measurable.
+      docker-image = pkgs.dockerTools.buildLayeredImage {
+        # Keep this tag aligned with the published GHCR workflow.
+        name = "initos-signer";
+        tag = "latest";
+        contents = [ initos-signer pkgs.coreutils usrBinEnv pkgs.bash tmpDir linuxFlake.packages.${system}.kernel-host workflow-runtime-root ] ++ signRuntimeDeps;
+        config = {
+          Entrypoint = [ "/bin/sign.sh" ];
+          Env = [ "PATH=/bin" ];
+          WorkingDir = "/";
+        };
       };
 
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image deps initos-host;
+        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image docker-signer-tools-image docker-kernel-artifacts-image docker-signer-kernel-image docker-host-runtime-image deps initos-host;
         default = initos-signer;
       };
     };

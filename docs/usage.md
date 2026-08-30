@@ -1,125 +1,75 @@
-# Using initos
+# Using InitOS
 
-initos builds a signing container and a nix package containing an unsigned
-kernel, modules, EFI stub and initrd. It is **not** a USB installer — it is a
-tool to sign and package those artifacts with **your own keys**, producing
-images ready to deploy on target machines.
-
-The docker image and nix kernel package are rebuilt weekly by a GitHub Actions
-scheduled workflow and pushed to the rolling release:
-
-- **Container**: `ghcr.io/costinm/initos-signer:latest`
-- **Release assets**: <https://github.com/costinm/initos/releases/tag/rolling-release>
-  - `initos-kernel-host.nar` — Nix store archive (CI build cache, ~1.8 GB)
-  - `initos-kernel-host.tar.gz` — Kernel tarball for manual inspection
-  - `initos-signer.tar.gz` — Signer scripts + initrd/EFI artifacts
-
----
-
-## Option 1: Container (docker / podman)
-
-On the trusted signing machine, mount a secrets directory and an output
-directory into the container.  The first run generates keys under `SECRETS`
-(default `/var/run/secrets/uefi-keys`).
+These instructions are for an operator outside the source tree. They require Docker or Podman.
 
 ```sh
-# Pull the latest weekly build
-docker pull ghcr.io/costinm/initos-signer:latest
+image=ghcr.io/costinm/initos-signer:latest
+docker pull "$image"
+```
 
-# Run - keys are created on first run, reused on subsequent runs
+## Install the host package closure
+
+The image includes `/result`: the basic host package set, Nix, and signing tools - but excluding kernel and kernel-dependent packages.
+
+### Fresh host without `/nix`
+
+Create the host `/nix` directory, mount only it at `/host/nix`, and initialize
+it from `/result`. Run it only when `/nix` is empty.
+
+```sh
+sudo mkdir -p /nix
+sudo docker run --rm \
+  -v /nix:/host/nix \
+  "$image" \
+  init_nix
+```
+
+### Existing host Nix daemon
+
+Mount only the daemon socket. This imports the `/result` closure if it is not
+already present. The container prints the host-side GC-root and SSH-copy
+commands instead of requiring a `/nix` bind mount.
+
+```sh
+sudo docker run --rm \
+  -v /nix/var/nix/daemon-socket/socket:/run/host-nix-daemon.sock \
+  "$image" \
+  copy_nix
+```
+
+## Create signed artifacts
+
+Keep signing keys on the trusted signing host. They are mounted read-only and
+are never copied into the image or output directory.
+
+```sh
+output_dir="$PWD/initos-signed"
+mkdir -p "$output_dir"
+
 docker run --rm \
-  -v $HOME/.ssh/initos:/var/run/secrets/uefi-keys \
-  -v /tmp/out:/out \
-  ghcr.io/costinm/initos-signer:latest \
+  -v "$HOME/.ssh/initos:/var/run/secrets/uefi-keys:ro" \
+  -v "$output_dir:/out" \
+  "$image" \
   artifacts /out
-
-# Image is rebuilt weekly; discard and re-pull to get updates
-docker rmi ghcr.io/costinm/initos-signer:latest
 ```
 
-The container bundles the kernel, modules and unsigned initrd/EFI artifacts
-and all signing tools.  `artifacts` signs everything with the db key and
-writes the output to `/out`.
+## Install signed images
 
----
+Copy the generated files to /z/img/$SLOT (101 or 102) - this is what the kernel us using. The number should match the partition number used for boot - I'm using 101 and 102, but 
+can be any partition number and as many as needed.
 
-## Option 2: Nix profile (no docker required)
+This copies `initos.erofs`, module/firmware EROFS files, signatures, and the boot VFAT image.
 
-Requires Nix (as a package manager; NixOS is not required).
-
-### 2a. From the rolling-release NAR (binary, no build)
 
 ```sh
-# Import the kernel + modules into the local nix store (~1.8 GB)
-nix-store --import < <(curl -fL \
-  https://github.com/costinm/initos/releases/download/rolling-release/initos-kernel-host.nar)
-
-# Build the signer from source (fast — kernel is already in the store)
-# or wait for a pre-built signer to be published
-nix profile add --profile ./target/nix/profiles \
-  github:costinm/initos#initos-signer \
-  github:costinm/initos/linux#kernel-host
+slot=101 # or 102
+sudo install -d "/z/img/$slot"
+sudo cp -a "$output_dir/img/." "/z/img/$slot/"
 ```
 
-### 2b. From git source
+Deploy the VFAT image to the EFI boot partition separately if
+your host boot layout requires it:
 
 ```sh
-np() { nix profile "$@" --profile "${NIX_PROFILE:-target/nix/profiles}"; }
-
-# First time (slow — builds kernel)
-np add ./linux#kernel-host
-np add .#initos-signer
-
-# On changes
-np upgrade linux
-np upgrade initos
+dd if=/z/img/$slot/boot-initos.img /dev/nvme0n1p${slot}
 ```
-
-### Generate signed images
-
-```sh
-# Keys are generated in SECRETS on first run (default: /var/run/secrets/uefi-keys)
-# sign.sh has all runtime tools pre-wired in its PATH via nix
-
-rm -rf /tmp/outi
-./target/nix/profiles/bin/sign.sh artifacts /tmp/outi
-```
-
----
-
-## Deploying to a machine
-
-```sh
-HOST=host17
-
-# Copy signed module/firmware images to the STATE partition
-rsync -avu /tmp/outi/img/ $HOST:/z/img/
-
-# Flash the EFI boot partition (A or B)
-cat /tmp/outi/img/boot-initos-signed.vfat | ssh $HOST dd of=/dev/nvme0n1p102
-```
-
----
-
-## Generated artifacts
-
-`sign.sh artifacts <output_dir>` produces:
-
-- **Keys** (first run only) — PK, KEK, db UEFI Secure Boot keys and an Ed25519
-  image-signing key, stored in `SECRETS` (default `$HOME/.ssh/initos`).
-- **`kernel/bzImage`** — kernel copied from the signing container / nix profile.
-- **`img/initos.erofs` + `.sig`** — fs-verity signed initrd EROFS image.
-- **`img/modules-<version>.erofs` + `.sig`** — kernel modules re-signed with
-  db.key and packed into a signed EROFS image.
-- **`img/firmware.erofs`** — firmware image (unsigned, verified by path).
-- **`img/boot-initos-signed.vfat`** — 32 MB VFAT EFI boot partition containing
-  the signed kernel, initrd, EFI stub and boot config.
-
-The `.vfat` images go to the target machine's GPT `BOOTA`/`BOOTB` EFI
-partitions.  The `.erofs` images go under `/img/` on the `STATE` partition.
-
----
-
-## First install
-
-TODO

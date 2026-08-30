@@ -393,6 +393,12 @@ _build_signed_modules_image() {
     local sec_dir="${4:?Usage: _build_signed_modules_image <modules-dir> <kernel-dir> <output-img-dir> <secrets-dir>}"
 
     local modules_name sign_file stage count stripped before_size after_size
+    modules_src=$(readlink -f "${modules_src}")
+    kernel_dir=$(readlink -f "${kernel_dir}")
+    if [ ! -d "${modules_src}" ]; then
+        echo "ERROR: resolved module directory does not exist: ${modules_src}" >&2
+        return 1
+    fi
     modules_name=$(basename "${modules_src}")
     sign_file="${kernel_dir}/sign-file"
     if [ ! -x "${sign_file}" ]; then
@@ -401,8 +407,18 @@ _build_signed_modules_image() {
     fi
 
     stage=$(mktemp -d)
-    cp -a "${modules_src}/." "${stage}/"
+    # Docker package roots may be a symlink forest into /nix/store.  Dereference
+    # it before signing so the EROFS contains the module contents, never store
+    # references.  The generated kernel module tree currently has no meaningful
+    # symlinks; reject any residual link rather than emitting a broken image.
+    cp -aL "${modules_src}/." "${stage}/"
     chmod -R u+w "${stage}"
+    if find "${stage}" -type l -print -quit | grep -q .; then
+        echo "ERROR: module staging tree still contains symlinks" >&2
+        find "${stage}" -type l -printf '  %p -> %l\\n' >&2 || true
+        rm -rf "${stage}"
+        return 1
+    fi
 
     if find "${stage}" -type f \( -name '*.ko.xz' -o -name '*.ko.zst' -o -name '*.ko.gz' \) | grep -q .; then
         echo "ERROR: compressed kernel modules found in ${modules_src}; disable module compression in the kernel config" >&2
@@ -480,6 +496,7 @@ artifacts() {
         echo "ERROR: Kernel artifacts not found. Please provide kernel_dir with bzImage." >&2
         exit 1
     fi
+    kernel_dir=$(readlink -f "${kernel_dir}")
 
     # Auto-detect artifact_dir
     if [ -z "${artifact_dir}" ]; then
@@ -572,6 +589,107 @@ artifacts() {
     #build_boot_limine_signed "${boot_stage}" "${output_dir}" "${sec_dir}"
 
     rm -rf "${boot_stage}"
+}
+
+_host_runtime_nix() {
+    local nix_bin="/result/bin/nix"
+    if [ ! -x "${nix_bin}" ]; then
+        echo "ERROR: host runtime Nix binary not found at ${nix_bin}" >&2
+        return 1
+    fi
+    if [ ! -f /result-closure/registration ] || [ ! -f /result-path ]; then
+        echo "ERROR: host runtime closure metadata is missing; use the host-runtime or combined image" >&2
+        return 1
+    fi
+    printf '%s\n' "${nix_bin}"
+}
+
+_host_runtime_source_state() {
+    local nix_store="/result/bin/nix-store"
+    local state_dir
+    state_dir=$(mktemp -d)
+    NIX_REMOTE=local NIX_STATE_DIR="${state_dir}" \
+        "${nix_store}" --load-db < /result-closure/registration
+    printf '%s\n' "${state_dir}"
+}
+
+_host_runtime_path() {
+    local result_path
+    result_path=$(cat /result-path)
+    case "${result_path}" in
+        /nix/store/*) ;;
+        *)
+            echo "ERROR: invalid host runtime store path in /result-path: ${result_path}" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "${result_path}"
+}
+
+# Copy /result (host packages plus workflow NVIDIA compute) to an existing Nix
+# daemon. The socket is the only required mount; print follow-up commands for a
+# host-side GC root or transfer to another host instead of requiring /nix here.
+copy_nix() {
+    local daemon_socket="${1:-/run/nix-daemon.sock}"
+    local nix_bin result_path nix_config source_state
+
+    if [ ! -S "${daemon_socket}" ]; then
+        echo "ERROR: Nix daemon socket is not available: ${daemon_socket}" >&2
+        return 1
+    fi
+    nix_bin=$(_host_runtime_nix)
+    result_path=$(_host_runtime_path)
+    nix_config="nix-daemon-socket-file = ${daemon_socket}"
+    source_state=$(_host_runtime_source_state)
+
+    NIX_CONFIG="${nix_config}" "${nix_bin}" store info --store daemon >/dev/null
+    NIX_REMOTE=local NIX_STATE_DIR="${source_state}" NIX_CONFIG="${nix_config}" \
+        "${nix_bin}" copy --from / --to daemon --no-check-sigs "${result_path}"
+    rm -rf "${source_state}"
+    echo "Imported ${result_path} through ${daemon_socket}"
+    echo "On the host, retain it with:"
+    echo "  nix-store --add-root /nix/var/nix/gcroots/initos-host --indirect -r ${result_path}"
+    echo "To copy it to another Nix host:"
+    echo "  nix copy --to ssh://HOST ${result_path}"
+}
+
+# Populate a fresh host /nix. The default assumes host /nix is mounted at
+# /host/nix; only that mount is required, not the host root.
+init_nix() {
+    local target_dir="${1:-/host}"
+    local nix_bin result_path target_real target_nix source_state
+
+    target_real=$(readlink -f "${target_dir}")
+    if [ "${target_real}" = "/nix" ] || [ "${target_real}" = "/" ]; then
+        echo "ERROR: refuse to use a container path as the host-store parent: ${target_real}" >&2
+        return 1
+    fi
+    target_nix="${target_real}/nix"
+    if ! mountpoint -q "${target_nix}"; then
+        echo "ERROR: host /nix must be mounted at ${target_nix}" >&2
+        return 1
+    fi
+    if [ ! -w "${target_nix}" ]; then
+        echo "ERROR: host /nix mount is not writable: ${target_nix}" >&2
+        return 1
+    fi
+    if find "${target_nix}" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        echo "ERROR: fresh host /nix is not empty: ${target_nix}" >&2
+        return 1
+    fi
+    nix_bin=$(_host_runtime_nix)
+    result_path=$(_host_runtime_path)
+    source_state=$(_host_runtime_source_state)
+
+    NIX_REMOTE=local NIX_STATE_DIR="${source_state}" \
+        "${nix_bin}" copy --from / --to "${target_real}" --no-check-sigs "${result_path}"
+    rm -rf "${source_state}"
+    echo "Initialized Nix store at ${target_nix}/store"
+    echo "Imported ${result_path}"
+    echo "On the host, retain it with:"
+    echo "  nix-store --add-root /nix/var/nix/gcroots/initos-host --indirect -r ${result_path}"
+    echo "To copy it to another Nix host:"
+    echo "  nix copy --to ssh://HOST ${result_path}"
 }
 
 _resolve_path() {
@@ -817,6 +935,8 @@ show_help() {
     echo "  image <dir> <file>                     Sign an fsverity digest for an image"
     echo "  artifacts <out_dir> [kernel_dir] [artifact_dir]"
     echo "                                         Sign a Nix artifact tree"
+    echo "  copy_nix [daemon-socket]               Copy /result to an existing Nix daemon"
+    echo "  init_nix [host-store-parent]           Initialize mounted host /nix from /result"
     echo "  build_boot_limine_unsigned <artifact_dir> <output_dir> [keys]"
     echo "  build_boot_limine_signed <artifact_dir> <output_dir> [keys]"
     echo "  build_boot_initos_signed <artifact_dir> <output_dir> [keys]"
