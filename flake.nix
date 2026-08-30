@@ -349,7 +349,7 @@
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image docker-signer-tools-image docker-kernel-artifacts-image docker-signer-kernel-image docker-host-runtime-image deps initos-host;
+        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image docker-signer-tools-image docker-kernel-artifacts-image docker-signer-kernel-image docker-host-runtime-image deps initos-host initos-host-with-nvidia;
         default = initos-signer;
       };
     };

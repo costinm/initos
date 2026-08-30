@@ -1,7 +1,8 @@
 # Building initos and container images
 
 This document is for maintainers working from the initos source tree. Operators
-who only have Docker or Podman should use [usage.md](usage.md).
+who only have Docker or Podman should use [usage.md](usage.md); Nix-only
+operators should use [usage-nix.md](usage-nix.md).
 
 ## Build outputs
 

@@ -1,6 +1,6 @@
 # Using InitOS
 
-These instructions are for an operator outside the source tree. They require Docker or Podman.
+These instructions are for an operator outside the source tree. They require Docker or Podman. For a host that already runs Nix and does not use a container, see [usage-nix.md](usage-nix.md).
 
 ```sh
 image=ghcr.io/costinm/initos-signer:latest
