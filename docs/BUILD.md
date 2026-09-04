@@ -15,15 +15,19 @@ little for an operator.
 | Nix output | Compressed archive | Contents |
 | --- | ---: | --- |
 | `docker-signer-tools-image` | 78 MB | signer script, unsigned `img/` inputs, signing tools; no kernel |
-| `docker-kernel-artifacts-image` | 1.52 GB | kernel, modules, firmware, `sign-file`, matched NVIDIA compute |
-| `docker-signer-kernel-image` | 1.57 GB | compatibility combination of signer tools and kernel artifacts |
-| `docker-host-runtime-image` | 287 MB | `/result`: generic host tools, Nix, signing tools; no kernel/NVIDIA |
-| `docker-image` | 1.79 GB | published workflow image: signer, kernel artifacts, and `/result` |
+| `docker-kernel-artifacts-image` | rebuild required | kernel, modules, firmware, `sign-file`, matched NVIDIA compute |
+| `docker-signer-kernel-image` | rebuild required | compatibility combination of signer tools and kernel artifacts |
+| `docker-host-runtime-image` | rebuild required | `/result`: generic host tools, SSH-mesh, Nix, signing tools; no kernel/NVIDIA |
+| `docker-image` | rebuild required | published workflow image: signer, kernel artifacts, and `/result` |
 | `./linux#docker-image` | 1.52 GB | legacy kernel-artifacts image from the Linux subflake |
 
-Archive sizes are measured compressed Docker tarballs. The largest individual
+Archive sizes are measured compressed Docker tarballs. Rows marked `rebuild
+required` changed after the previous measurement. The largest individual
 objects are `initos-kernel-host` and `nvidia-x11`; see the current build report
 or `nix path-info --json` for exact NAR sizes.
+
+CUDA llama.cpp is deliberately separate because its closure is about 5.18 GiB
+unpacked. Build it only on GPU hosts with `nix build .#gpu`.
 
 ## Build with Nix
 

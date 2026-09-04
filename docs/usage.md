@@ -9,7 +9,7 @@ docker pull "$image"
 
 ## Install the host package closure
 
-The image includes `/result`: the basic host package set, Nix, and signing tools - but excluding kernel and kernel-dependent packages.
+The image includes `/result`: the basic host package set, SSH-mesh, Nix, and signing tools - but excluding kernel and kernel-dependent packages.
 
 ### Fresh host without `/nix`
 

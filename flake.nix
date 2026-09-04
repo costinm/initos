@@ -8,9 +8,14 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    flake-utils.url = "github:numtide/flake-utils";
+    ssh-mesh = {
+      url = "github:costinm/ssh-mesh";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane }:
+  outputs = { self, nixpkgs, rust-overlay, crane, flake-utils, ssh-mesh }:
     let
       system = "x86_64-linux";
       muslTarget = "x86_64-unknown-linux-musl";
@@ -99,6 +104,20 @@
       linuxFlake = (import ./linux/flake.nix).outputs {
         self = ./linux;
         inherit nixpkgs;
+      };
+      gpuFlake = (import ./sidecar/gpu/flake.nix).outputs {
+        self = ./sidecar/gpu;
+        inherit nixpkgs;
+      };
+      vmFlake = (import ./vm/flake.nix).outputs {
+        self = ./vm;
+        inherit nixpkgs flake-utils;
+      };
+      sshMesh = ssh-mesh.packages.${system}.default;
+      gpu = gpuFlake.packages.${system}.default;
+      vm = pkgs.symlinkJoin {
+        name = "initos-vm";
+        paths = with vmFlake.packages.${system}; [ kernel-cloud vm-tools vm-scripts ];
       };
 
       initos-signer = pkgs.runCommand "initos-signer" {
@@ -281,6 +300,7 @@
         vim
         wget
         wpa_supplicant
+        sshMesh
       ];
 
       initos-host = pkgs.symlinkJoin {
@@ -319,9 +339,9 @@
       };
 
       # The workflow image transfers the generic host package set together with
-      # NVIDIA compute userspace.  Keep this transfer root distinct from the
-      # standalone host-runtime image: NVIDIA stays absent from its generic
-      # /result payload, but is available when a workflow image upgrades a host.
+      # NVIDIA compute userspace stays distinct from the standalone host-runtime
+      # image: it is available when a workflow image upgrades a host, while
+      # the CUDA llama.cpp profile remains an explicit optional `.#gpu` package.
       initos-host-with-nvidia = pkgs.symlinkJoin {
         name = "initos-host-with-nvidia";
         paths = [ initos-host linuxFlake.packages.${system}.nvidia-compute ];
@@ -355,7 +375,7 @@
     in
     {
       packages.${system} = {
-        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image docker-signer-tools-image docker-kernel-artifacts-image docker-signer-kernel-image docker-host-runtime-image deps initos-host initos-host-with-nvidia;
+        inherit initos efi initos-signer directBootInitrd linux-direct-efi kernel-host-direct-efi docker-image docker-signer-tools-image docker-kernel-artifacts-image docker-signer-kernel-image docker-host-runtime-image deps initos-host initos-host-with-nvidia gpu vm;
         default = initos-signer;
       };
     };

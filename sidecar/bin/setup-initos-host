@@ -6,6 +6,23 @@
 
 disk_setup() {
   DISK=${1:-"/dev/sdb"}
+
+  sfdisk --label gpt "$DISK" <<EOF
+label-id: gpt
+
+partition-101 : size=64M, name="BOOT1", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+partition-102 : size=64M, name="BOOT2", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+partition-1   : size=+, name="STATE"
+EOF
+
+#  sfdisk --part-label $d 101 BOOT1
+#  sfdisk --part-label $d 102 BOOT2
+#  sfdisk --part-label $d 1 STATE
+
+}
+
+setup_fs() {
+  DISK=${1:-/dev/sdb}
   suffix=""
   if echo "$DISK" | grep -q "nvme"; then
     suffix="p"
@@ -14,27 +31,26 @@ disk_setup() {
     suffix="p"
   fi
 
+  mkfs.ext4 -L STATE -O encrypt,verity ${DISK}${suffix}1
+  mkdir -p /mnt/STATE 
+  mount LABEL=STATE /mnt/STATE
 
-  sfdisk --label gpt "$DISK" <<EOF
-label-id: gpt
-
-partition-100 : size=64M, name="BOOTD", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-partition-101 : size=64M, name="BOOT1", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-partition-102 : size=64M, name="BOOT2", type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-partition-1   : size=+, name="STATE"
-EOF
 }
 
-setup_fs() {
-  DISK=${1:-/dev/sdb}
+init_c() {
+  local p=${1:-/mnt/STATE}
+  mkdir ${p}/c ${p}/initos
+  
+  FSCRYPT_KEY=$(cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14)
 
-  mkfs.ext4 -L STATE -O encrypt,verity ${d}1
-  mkfs.vfat -n BOOT1 ${DISK}101
-  mkfs.vfat -n BOOT2 ${DISK}102
+  echo "Enter host unlock password:"
+	read -s -r KEY 2>/dev/null 
+  echo -n ${FSCRYPT_KEY} | KEY=${KEY} initos encrypt > ${p}/initos/c.age
 
-  mkfs.ext4 -L INITOS1 ${d}111
-  mkfs.ext4 -L INITOS2 ${d}112
+  FSCRYPT_KEY=${FSCRYPT_KEY} initos fscrypt-setup ${p}/c
 
+  mkdir -p ${p}/c/home/root
+  mkdir -p ${p}/c/mnt
 }
 
 upgrade() {
@@ -46,73 +62,6 @@ upgrade() {
 
 }
 
-mount_install() {
-  mkdir -p /mnt/STATE /mnt/BOOT1 /mnt/BOOT2 
-  mount LABEL=STATE /mnt/STATE
-}
-
-part_labels() {
-  local d=${1}
-
-  sfdisk --part-label $d 100 BOOTD
-  sfdisk --part-label $d 101 BOOT1
-  sfdisk --part-label $d 102 BOOT2
-  sfdisk --part-label $d 1 STATE
-
-  mkfs.ext4 -L STATE -O encrypt,verity ${d}1
-  #mkfs.vfat -n BOOTA ${d}101
-  #mkfs.vfat -n BOOTB ${d}102
-
-  # use e2label or fatlabel to change
-}
-
-# rebuild_root() {
-#     # Excluding some directories since for dev the ext4 may
-#     # be an actual root install. It is bind mounted to /z/a/ROOTA,
-#     # but includes /z as well.
-#     (cd /z/a/ROOTA && \
-#         mkfs.erofs -zlz4 /z/img/ROOTA.erofs . \
-#         --exclude-path c \
-#         --exclude-path tmp \
-#         --exclude-path initos \
-#         --exclude-path img \
-#         --exclude-path z \
-#         --exclude-path a \
-#         )
-# }
-
-# rebuild_initos() {
-#     (cd /z/a/initos && \
-#         mkfs.erofs -zlz4 /z/img/initos.erofs .)
-# }
-
-
-part_labels_usb() {
-  local d=${1}
-
-  sfdisk --part-label $d 101 UBOOTA
-  sfdisk --part-label $d 102 UBOOTB
-  sfdisk --part-label $d 1 USTATE
-
-  mkfs.ext4 -L USTATE -O encrypt,verity ${d}1
-  # mkfs.vfat -n UBOOTA ${d}101
-  # mkfs.vfat -n UBOOTB ${d}102
-
-  # use e2label or fatlabel to change
-}
-
-# init_secrets() {
-#   mkdir -p /run/secrets/root
-#   chown root /run/secrets/root
-#   chmod 600 /run/secrets/root
-#   age-keygen -o /run/secrets/root/c_key
-#   chmod 600 /run/secrets/root/c_key
-# }
-
-profile() {
-    nix profile add nixpkgs#nixos-install-tools
-    nix profile add nixpkgs#nixos-rebuild
-}
 # 1. Define the workspace root path
 WORKSPACE=${R:-"/ws/nixos"}
 
@@ -167,103 +116,6 @@ bnix() {
 }
 
 
-get_nvidia_fw() {
-  DRIVER_VER="595.84"
-  RUNFILE="NVIDIA-Linux-x86_64-${DRIVER_VER}.run"
-  URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${DRIVER_VER}/${RUNFILE}"
-  TARGET_DIR="/lib/firmware/nvidia/${DRIVER_VER}"
-
-  # 1. Download the installer payload
-  echo "Downloading NVIDIA driver runfile v${DRIVER_VER}..."
-  curl -fL "${URL}" -o "/tmp/${RUNFILE}"
-
-  # 2. Extract the firmware file from the runfile without installing
-  echo "Extracting GSP firmware..."
-  cd /tmp
-  sh "${RUNFILE}" --extract-only
-
-  # 3. Deploy the binary to your target path
-  echo "Deploying firmware to ${TARGET_DIR}..."
-  mkdir -p "${TARGET_DIR}"
-  cp "NVIDIA-Linux-x86_64-${DRIVER_VER}/firmware/gsp_ga10x.bin" "${TARGET_DIR}/"
-
-  # 4. Cleanup
-  echo "Cleaning up temporary files..."
-  rm -rf "/tmp/${RUNFILE}" "/tmp/NVIDIA-Linux-x86_64-${DRIVER_VER}"
-
-}
-
-
-# # Will wipe a disk a create the partitions needed for initos.
-# # This should be called explicitly by the user - it will normally not be done automatically.
-# # In practice we need ~100M on the EFI, and some btrfs volume.
-# #
-# install_wipe_disk() {
-#   DISK=${1:-/dev/nvme0n1}
-
-#   suffix=""
-#   if echo "$DISK" | grep -q "nvme"; then
-#     suffix="p"
-#   fi
-#   if echo "$DISK" | grep -q "mmcblk"; then
-#     suffix="p"
-#   fi
-
-#   # List partitions with parted
-#   partitions=$(parted --script --machine -- "${DISK}" unit s print)
-
-#   parted --script --machine -- "${DISK}" mklabel gpt
-
-#   parted "$DISK" mkpart BOOTA vfat 101 2048
-#   parted "$DISK" set 1 boot on
-#   parted "$DISK" set 1 esp on
-#   parted "$DISK" name 1 "BOOTA"
-
-#   parted "$DISK" mkpart BOOTB fat32 2048 4096
-#   parted "$DISK" name 2 "BOOTB"
-#   parted "$DISK" set 2 esp on
-
-#   parted "$DISK" mkpart INITOSA fat32 2048 4096
-#   parted "$DISK" name 3 "INITOSA"
-#   parted "$DISK" set 3 esp on
-
-#   parted "$DISK" mkpart INITOSB fat32 2048 4096
-#   parted "$DISK" name 2 "INITOSB"
-#   parted "$DISK" set 2 esp on
-
-#   parted "$DISK" mkpart STATE ext4 4096 100%
-#   parted "$DISK" name 3 "STATE"
-
-#   partprobe $DISK
-
-#   bootd ${DISK}${suffix}1 BOOTA
-#   bootd ${DISK}${suffix}2 BOOTB
-
-#   #install_boot_options ${DISK}
-# }
-
-# install_wipe_usb() {
-#   DISK=${1:-/dev/sda}
-
-#   parted --script --machine -- "${DISK}" mklabel gpt
-
-#   parted "$DISK" mkpart primary fat32 1 4096
-#   parted "$DISK" set 1 boot on
-#   parted "$DISK" set 1 esp on
-#   parted "$DISK" name 1 "BOOTUSB"
-
-#   # Create the LUKS partition
-#   parted "$DISK" mkpart primary ext4 4096 100%
-#   parted "$DISK" name 2 "INITOSLUKSUSB"
-
-#   partprobe $DISK
-
-#   bootd ${DISK}1 BOOTUSB
-
-#   #install_boot_options ${DISK}
-# }
-
-
 ### Host tools ###
 
 # Fix terminal on laptop - for example if the screen is gone or the sensor
@@ -273,10 +125,6 @@ fixtty() {
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty0
   setterm --blank=force --powersave=powerdown --powerdown=1 --store --term linux <>/dev/tty1
 }
-
-# hdinfo() {
-#   cryptsetup luksDump $1
-# }
 
 # On debian, find the explicitly installed packages
 find_installed_deb() {
@@ -291,28 +139,6 @@ lsgrp() {
      printf 'IOMMU Group %s ' "$n";
      lspci -nns "${d##*/}";
   done;
-}
-
-genpass() {
-  cat /dev/urandom | \
-     tr -dc a-zA-Z0-9 | \
-     head -c14; echo
-}
-
-init_c() {
-  local p=${1:-/mnt/STATE}
-  mkdir ${p}/c ${p}/initos
-  
-  FSCRYPT_KEY=$(cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c14)
-
-  echo "Enter host unlock password:"
-	read -s -r KEY 2>/dev/null 
-  echo -n ${FSCRYPT_KEY} | KEY=${KEY} initos encrypt > ${p}/initos/c.age
-
-  FSCRYPT_KEY=${FSCRYPT_KEY} initos fscrypt-setup ${p}/c
-
-  mkdir -p ${p}/c/home/root
-  mkdir -p ${p}/c/mnt
 }
 
 chk_firmware() {
