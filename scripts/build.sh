@@ -39,6 +39,12 @@ TMPDIR="${TMPDIR:-/tmp}"
 cd "${src}"
 export src out
 
+# Prepend Nix profile tools if available (target/nix/profiles/profile)
+# This provides erofs-utils, swtpm, mtools, e2fsprogs, sbsigntool, etc.
+if [ -d "${out}/nix/profiles/profile/bin" ]; then
+    PATH="${out}/nix/profiles/profile/bin:${PATH}"
+fi
+
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 ARTIFACTS="${out}/artifacts"
@@ -67,16 +73,50 @@ _resolve_efi_bin() {
     fi
 }
 
-# Resolve busybox: env var > system
+# Resolve busybox: env var > static binary in target/nix > system (static preferred)
 _resolve_busybox() {
     if [ -n "${USE_BUSYBOX:-}" ] && [ -f "${USE_BUSYBOX}" ]; then
         echo "${USE_BUSYBOX}"
-    elif command -v busybox >/dev/null 2>&1; then
-        command -v busybox
-    else
-        echo "ERROR: busybox not found. Set USE_BUSYBOX." >&2
-        return 1
+        return 0
     fi
+
+    # Prefer statically linked busybox for initrd
+    local busybox_path=""
+
+    # Check target/nix for static busybox
+    if [ -f "${out}/nix/busybox-static/bin/busybox" ]; then
+        busybox_path="${out}/nix/busybox-static/bin/busybox"
+    # Check Nix profile for static busybox
+    elif [ -L "${out}/nix/profiles/profile/bin/busybox" ] 2>/dev/null; then
+        local linked_target
+        linked_target=$(readlink -f "${out}/nix/profiles/profile/bin/busybox" 2>/dev/null || true)
+        if [ -n "${linked_target}" ] && file "$linked_target" 2>/dev/null | grep -q "statically linked"; then
+            busybox_path="${linked_target}"
+        fi
+    # Check system busybox for static linking
+    elif command -v busybox >/dev/null 2>&1; then
+        local sys_busybox
+        sys_busybox=$(command -v busybox)
+        if file "$sys_busybox" 2>/dev/null | grep -q "statically linked"; then
+            busybox_path="$sys_busybox"
+        fi
+    fi
+
+    if [ -n "${busybox_path}" ]; then
+        echo "${busybox_path}"
+        return 0
+    fi
+
+    # Fallback to system busybox (may be dynamic - will fail in initrd)
+    if command -v busybox >/dev/null 2>&1; then
+        echo "WARNING: busybox $(command -v busybox) is not statically linked; initrd may fail" >&2
+        command -v busybox
+        return 0
+    fi
+
+    echo "ERROR: statically linked busybox not found. Set USE_BUSYBOX or install one via:" >&2
+    echo "  nix build nixpkgs#pkgsStatic.busybox --out-link ${out}/nix/busybox-static" >&2
+    return 1
 }
 
 _resolve_kernel_bzimage() {
@@ -93,6 +133,7 @@ _resolve_kernel_bzimage() {
     local candidate
     for candidate in \
         "${out}/opt/kernel-image/bzImage" \
+        "${out}/nix/kernel/opt/kernel-image/bzImage" \
         "${out}/img/bzImage" \
         "${out}/linux/arch/x86/boot/bzImage" \
         "${out}/linux/arch/x86_64/boot/bzImage" \
@@ -123,6 +164,7 @@ _resolve_kernel_dir() {
     local candidate
     for candidate in \
         "${out}/opt/kernel-image" \
+        "${out}/nix/kernel/opt/kernel-image" \
         "${src}/target/nix/profiles/opt/kernel-image" \
         "${src}/result-kernel/opt/kernel-image" \
         "${src}/result-kernel"; do

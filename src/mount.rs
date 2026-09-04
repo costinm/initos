@@ -127,6 +127,14 @@ fn scan_sysfs_for_label(label: &str) -> Option<PathBuf> {
     None
 }
 
+fn read_uevent_value(path: &Path, key: &str) -> io::Result<Option<String>> {
+    let uevent = fs::read_to_string(path)?;
+    let prefix = format!("{}=", key);
+    Ok(uevent
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned)))
+}
+
 /// Read an ext2/3/4 filesystem volume name directly from the superblock.
 fn read_ext4_label(device: &Path) -> io::Result<Option<String>> {
     let mut file = File::open(device)?;
@@ -150,6 +158,284 @@ fn read_ext4_label(device: &Path) -> io::Result<Option<String>> {
         Ok(None)
     } else {
         Ok(Some(label))
+    }
+}
+
+/// Get the parent disk name from a partition device name.
+/// e.g., "sda1" -> "sda", "nvme0n1p101" -> "nvme0n1"
+pub fn partition_parent_disk(partition_name: &str) -> Option<String> {
+    let stripped = partition_name.trim_end_matches(|c: char| c.is_ascii_digit());
+    let stripped = if stripped.ends_with('p')
+        && stripped[..stripped.len() - 1].ends_with(|c: char| c.is_ascii_digit())
+    {
+        &stripped[..stripped.len() - 1]
+    } else {
+        stripped
+    };
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+/// Resolve a partition device path to its parent disk device path.
+/// Uses /sys/block/ to find the parent disk.
+pub fn resolve_parent_disk(partition_path: &Path) -> io::Result<Option<PathBuf>> {
+    // Try to find the sysfs entry for this device
+    let dev_name = partition_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cannot extract device name"))?;
+
+    let sys_block = Path::new("/sys/block");
+    if !sys_block.exists() {
+        return Ok(None);
+    }
+
+    // /sys/class/block entries are symlinks. Their resolved parent is the disk
+    // for ordinary partitions such as sda1, nvme0n1p101, and mmcblk0p1.
+    let part_sys = sys_block.join(dev_name);
+    if part_sys.exists() && part_sys.join("partition").exists() {
+        if let Ok(canonical) = fs::canonicalize(&part_sys) {
+            if let Some(disk_name) = canonical
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+            {
+                return Ok(Some(PathBuf::from(format!("/dev/{}", disk_name))));
+            }
+        }
+    }
+
+    // Search all block devices for one that contains this partition
+    for entry in fs::read_dir(sys_block)? {
+        let entry = entry?;
+        let disk_name = entry.file_name().to_string_lossy().to_string();
+        let disk_sys = entry.path();
+
+        // Check if this disk has the partition
+        let part_path = disk_sys.join(dev_name);
+        if part_path.exists() && part_path.join("partition").exists() {
+            return Ok(Some(PathBuf::from(format!("/dev/{}", disk_name))));
+        }
+    }
+
+    // Fallback: use name-based heuristic
+    if let Some(disk_name) = partition_parent_disk(dev_name) {
+        let disk_dev = PathBuf::from(format!("/dev/{}", disk_name));
+        if disk_dev.exists() {
+            return Ok(Some(disk_dev));
+        }
+    }
+
+    Ok(None)
+}
+
+/// List all partitions of a given disk as /dev/ paths.
+pub fn list_disk_partitions(disk_path: &Path) -> io::Result<Vec<PathBuf>> {
+    let disk_name = disk_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cannot extract disk name"))?;
+
+    let mut partitions = Vec::new();
+    let disk_sys = format!("/sys/block/{}", disk_name);
+
+    if let Ok(entries) = fs::read_dir(&disk_sys) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // A partition entry under /sys/block/<disk>/ has a "partition" file
+            if entry.path().join("partition").exists() {
+                partitions.push(PathBuf::from(format!("/dev/{}", name)));
+            }
+        }
+    }
+
+    // Sort by partition number (numeric sort)
+    partitions.sort_by(|a, b| {
+        let a_name = a
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let b_name = b
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let a_num: u32 = a_name
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        let b_num: u32 = b_name
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        a_num.cmp(&b_num)
+    });
+
+    Ok(partitions)
+}
+
+/// Check if a block device has an ext4 filesystem by reading the superblock magic.
+pub fn is_ext4(device: &Path) -> io::Result<bool> {
+    let mut file = File::open(device)?;
+    let mut magic = [0u8; 2];
+    file.seek(SeekFrom::Start(1024 + 56))?;
+    file.read_exact(&mut magic)?;
+    Ok(magic == [0x53, 0xef])
+}
+
+/// Find a partition on a specific disk by label.
+/// Scans only the partitions of the given disk.
+pub fn find_partition_on_disk_by_label(
+    disk_path: &Path,
+    label: &str,
+) -> io::Result<Option<PathBuf>> {
+    let partitions = list_disk_partitions(disk_path)?;
+
+    for part in &partitions {
+        // Check ext4 superblock label
+        if let Ok(Some(fs_label)) = read_ext4_label(part) {
+            if fs_label == label {
+                return Ok(Some(part.clone()));
+            }
+        }
+
+        // Check partition name/label via uevent
+        let part_name = part.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let uevent_path = format!(
+            "/sys/block/{}/{}",
+            disk_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            part_name
+        );
+        let uevent_file = format!("{}/uevent", uevent_path);
+        if let Ok(uevent) = fs::read_to_string(&uevent_file) {
+            for line in uevent.lines() {
+                if let Some(val) = line.strip_prefix("PARTNAME=") {
+                    if val == label {
+                        return Ok(Some(part.clone()));
+                    }
+                }
+            }
+        }
+
+        // Also check /dev/disk/by-label symlink
+        let label_path = Path::new("/dev/disk/by-label").join(label);
+        if label_path.exists() {
+            if let Ok(canonical) = fs::canonicalize(&label_path) {
+                if canonical.ends_with(part) {
+                    return Ok(Some(part.clone()));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Find partition N on a disk (by partition number).
+pub fn find_partition_by_number(
+    disk_path: &Path,
+    partition_number: u32,
+) -> io::Result<Option<PathBuf>> {
+    let partitions = list_disk_partitions(disk_path)?;
+
+    for part in &partitions {
+        let part_name = part.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        let disk_name = disk_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let part_num_path = Path::new("/sys/block")
+            .join(disk_name)
+            .join(part_name)
+            .join("partition");
+        if let Ok(num_str) = fs::read_to_string(part_num_path) {
+            if let Ok(num) = num_str.trim().parse::<u32>() {
+                if num == partition_number {
+                    return Ok(Some(part.clone()));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Find the boot disk by matching EFI boot device info against sysfs.
+/// Returns (disk_path, partition_path) if found.
+pub fn find_boot_disk(
+    partition_guid: Option<&[u8; 16]>,
+    partition_number: Option<u32>,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let block_dir = Path::new("/sys/class/block");
+    if !block_dir.exists() {
+        return Ok(None);
+    }
+
+    let partition_guid = partition_guid.map(|g| {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
+        )
+    });
+
+    let mut number_matches = Vec::new();
+
+    for entry in fs::read_dir(block_dir)? {
+        let entry = entry?;
+        let dev_name = entry.file_name().to_string_lossy().to_string();
+        let dev_path = PathBuf::from(format!("/dev/{}", dev_name));
+        let part_num_path = entry.path().join("partition");
+        if !part_num_path.exists() {
+            continue;
+        }
+
+        let actual_number = fs::read_to_string(part_num_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if partition_number.is_some() && actual_number != partition_number {
+            continue;
+        }
+        let Some(disk_path) = resolve_parent_disk(&dev_path)? else {
+            continue;
+        };
+
+        if let Some(ref expected_guid) = partition_guid {
+            let actual_guid = read_uevent_value(&entry.path().join("uevent"), "PARTUUID")?
+                .map(|value| value.replace('-', "").to_lowercase());
+            if actual_guid.as_ref() == Some(expected_guid) {
+                eprintln!(
+                    "initos: found boot disk {} partition {} by GPT partition GUID",
+                    disk_path.display(),
+                    dev_name
+                );
+                return Ok(Some((disk_path, dev_path)));
+            }
+        } else if partition_number.is_some() {
+            number_matches.push((disk_path, dev_path));
+        }
+    }
+
+    if number_matches.len() == 1 {
+        Ok(number_matches.pop())
+    } else {
+        if number_matches.len() > 1 {
+            eprintln!(
+                "initos: partition number {:?} is ambiguous across {} disks",
+                partition_number,
+                number_matches.len()
+            );
+        }
+        Ok(None)
     }
 }
 
@@ -365,4 +651,50 @@ fn current_environment() -> io::Result<Vec<CString>> {
             CString::new(entry).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn partition_parent_names_cover_common_linux_devices() {
+        assert_eq!(partition_parent_disk("sda1").as_deref(), Some("sda"));
+        assert_eq!(
+            partition_parent_disk("nvme0n1p101").as_deref(),
+            Some("nvme0n1")
+        );
+        assert_eq!(
+            partition_parent_disk("mmcblk0p102").as_deref(),
+            Some("mmcblk0")
+        );
+    }
+
+    #[test]
+    fn ext4_detection_does_not_require_a_label() {
+        let mut image = tempfile::NamedTempFile::new().unwrap();
+        image.as_file_mut().set_len(2048).unwrap();
+        image.seek(SeekFrom::Start(1024 + 56)).unwrap();
+        image.write_all(&[0x53, 0xef]).unwrap();
+        image.flush().unwrap();
+
+        assert!(is_ext4(image.path()).unwrap());
+    }
+
+    #[test]
+    fn reads_partuuid_from_partition_uevent() {
+        let mut uevent = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            uevent,
+            "MAJOR=259\nPARTUUID=533f3dd0-2bc1-0545-b816-0d636099dad7"
+        )
+        .unwrap();
+        assert_eq!(
+            read_uevent_value(uevent.path(), "PARTUUID")
+                .unwrap()
+                .as_deref(),
+            Some("533f3dd0-2bc1-0545-b816-0d636099dad7")
+        );
+    }
 }

@@ -4,7 +4,8 @@ These instructions are for a trusted build/sign machine that has Nix.
 
 We fetch the InitOS flake from GitHub, build the signer and the kernel artifacts locally, and retain the host-tool plus NVIDIA-compute closure for transfer to another Nix machine.
 
-The signed boot artifacts are built and signed - ready to distribute.
+The signed boot artifacts are built and signed - ready to distribute. They can
+also be produced by the protected GitHub Actions signing path described below.
 
 ## Build the required outputs
 
@@ -42,7 +43,87 @@ SECRETS="$HOME/.ssh/initos" \
 ```
 
 The result is in `$output_dir/img`, including the signed kernel/initrd, module
-and firmware EROFS images, their signatures, and `boot-initos.img`.
+and firmware EROFS images, their signatures, and
+`boot-initos-signed.vfat`.
+
+## GitHub signed rolling release
+
+The `Nix Build` workflow has a separate `sign-release` job for trusted `main`
+pushes and manual runs. Create a protected GitHub environment named `signing`
+and add its `INITOS_SIGNING_KEYS_B64` secret. Pull requests never run this job.
+The secret is a base64-encoded gzip tar containing the existing contents of the
+trusted signing directory:
+
+```sh
+tar -C "$HOME/.ssh/initos" -czf - \
+  PK.crt PK.cer PK.esl PK.auth \
+  KEK.crt KEK.cer KEK.esl KEK.auth \
+  db.key db.crt db.cer db.esl db.auth \
+  root.pem \
+  | base64 -w0 \
+  | gh secret set --env signing INITOS_SIGNING_KEYS_B64
+```
+
+GitHub secrets are limited to 48 KB. Check the encoded byte count before
+uploading if extra material is added. The workflow refuses to generate missing
+keys and publishes no private key files. Only `db.key`, which signs the EFI
+loader, kernel, initrd, modules, firmware, and root image, is uploaded; keep the
+PK, KEK, and mesh-root private keys offline. Protect `main` and require review
+for workflow changes, because any trusted workflow with access to this secret
+is part of the signing trust boundary.
+
+The `signed-rolling` release contains stable asset names:
+
+```text
+initos-signed.nar
+initos-signed.store-path
+initos-signed.tar.gz
+SHA256SUMS
+```
+
+The tarball is convenient for inspection. The NAR is the deployment artifact:
+it preserves the signed tree as an exact Nix store path and includes
+`img/boot-initos-signed.vfat`, ready to write to a boot partition.
+
+## Import on the master and promote through canary
+
+On the master machine:
+
+```sh
+mkdir -p "$HOME/releases/initos"
+initos-upgrade fetch costinm/initos signed-rolling "$HOME/releases/initos"
+initos-upgrade import \
+  "$HOME/releases/initos/initos-signed.nar" \
+  "$HOME/releases/initos/initos-signed.store-path"
+signed=$(cat "$HOME/releases/initos/initos-signed.store-path")
+```
+
+Copy that exact, already-signed store path to the canary. If the target's SSH
+Nix store supports `nix copy`:
+
+```sh
+nix copy --to ssh://canary "$signed"
+ssh canary "sudo nix-store --add-root /nix/var/nix/gcroots/initos-signed --indirect -r '$signed'"
+```
+
+For a host whose SSH Nix store rejects `registerDrvOutput`, use ordinary SSH:
+
+```sh
+nix-store --export $(nix-store -qR "$signed") \
+  | ssh canary 'sudo nix-store --import >/dev/null'
+ssh canary "sudo nix-store --add-root /nix/var/nix/gcroots/initos-signed --indirect -r '$signed'"
+```
+
+Install only the inactive canary slot. The final `--write` is mandatory:
+
+```sh
+ssh canary "sudo initos-upgrade install '$signed' /dev/nvme0n1 102 --write"
+```
+
+This creates `/z/initos/102` pointing at the signed image directory in the
+persistent `/z/c/nix/store`, then writes `boot-initos-signed.vfat` to partition
+102. Boot the canary and validate it before copying the same store path and
+installing the inactive slot on the remaining machines.
 
 ## Transfer host tools and NVIDIA compute to a Nix host
 

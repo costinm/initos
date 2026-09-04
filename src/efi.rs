@@ -16,6 +16,31 @@ use x509_cert::der::{Decode, Encode};
 /// EFI global variable GUID.
 const EFI_GLOBAL_GUID: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 
+/// Boot device information extracted from EFI variables.
+#[derive(Debug, Clone)]
+pub struct BootDeviceInfo {
+    /// Partition number from the EFI Hard Drive device path (e.g., 101, 102).
+    pub partition_number: u32,
+    /// GPT partition GUID (16 bytes in EFI GUID byte order), or None for MBR/unknown.
+    pub partition_guid: Option<[u8; 16]>,
+    /// MBR disk signature (4 bytes) for MBR disks, or None for GPT/unknown.
+    pub mbr_signature: Option<u32>,
+    /// Partition format: 1 = MBR, 2 = GPT, 0 = Unknown.
+    pub partition_format: u8,
+}
+
+impl BootDeviceInfo {
+    /// Format the GPT partition GUID like Linux exposes it as PARTUUID.
+    pub fn partition_guid_uuid(&self) -> Option<String> {
+        self.partition_guid.map(|g| {
+            format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
+            )
+        })
+    }
+}
+
 /// EFI Image Security Database GUID (used for db, dbx, dbt, dbr).
 const EFI_IMAGE_SECURITY_DB_GUID: &str = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
 
@@ -194,6 +219,147 @@ pub fn extract_boot_partition_id(base_path: &str) -> io::Result<Option<u32>> {
                 ]);
                 return Ok(Some(part_num));
             }
+        }
+
+        node_offset += node_length;
+    }
+
+    Ok(None)
+}
+
+/// Read and parse the current BootOption EFI variable to extract full boot device info.
+/// Returns partition number, GPT partition GUID or MBR signature, and partition format.
+pub fn extract_boot_device_info(base_path: &str) -> io::Result<Option<BootDeviceInfo>> {
+    let boot_current = match read_boot_current(base_path) {
+        Ok(val) => val,
+        Err(e) => {
+            eprintln!("initos: failed to read BootCurrent: {}", e);
+            return Ok(None);
+        }
+    };
+    let boot_var_name = format!("Boot{:04X}", boot_current);
+    let payload = match read_efi_var(&boot_var_name, base_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!(
+                "initos: failed to read EFI variable {}: {}",
+                boot_var_name, e
+            );
+            return Ok(None);
+        }
+    };
+
+    if payload.len() < 6 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Boot variable {} payload too short: {} bytes",
+                boot_var_name,
+                payload.len()
+            ),
+        ));
+    }
+
+    let file_path_list_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+
+    // Skip Description (null-terminated UTF-16 string starting at offset 6)
+    let mut offset = 6;
+    let mut found_null = false;
+    while offset + 1 < payload.len() {
+        let char_val = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        if char_val == 0 {
+            found_null = true;
+            break;
+        }
+    }
+
+    if !found_null {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Boot variable {} Description is not null-terminated",
+                boot_var_name
+            ),
+        ));
+    }
+
+    // Now offset is at the start of FilePathList
+    let file_path_list_end = offset + file_path_list_len;
+    if file_path_list_end > payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Boot variable {} FilePathList extends beyond payload ({} > {})",
+                boot_var_name,
+                file_path_list_end,
+                payload.len()
+            ),
+        ));
+    }
+
+    let file_path_list = &payload[offset..file_path_list_end];
+    let mut node_offset = 0;
+    while node_offset + 4 <= file_path_list.len() {
+        let node_type = file_path_list[node_offset];
+        let node_subtype = file_path_list[node_offset + 1];
+        let node_length = u16::from_le_bytes([
+            file_path_list[node_offset + 2],
+            file_path_list[node_offset + 3],
+        ]) as usize;
+
+        if node_length < 4 || node_offset + node_length > file_path_list.len() {
+            break;
+        }
+
+        if node_type == 4 && node_subtype == 1 {
+            // Hard Drive device path
+            // Minimum size: 4 (header) + 4 (part num) + 8 (start) + 8 (size) + 1 (format) = 25 for MBR
+            //              4 (header) + 4 (part num) + 8 (start) + 8 (size) + 16 (GUID) + 1 (format) = 42 for GPT
+            let base = node_offset;
+            let part_num = u32::from_le_bytes([
+                file_path_list[base + 4],
+                file_path_list[base + 5],
+                file_path_list[base + 6],
+                file_path_list[base + 7],
+            ]);
+
+            let mut partition_guid = None;
+            let mut mbr_signature = None;
+            let mut partition_format: u8 = 0;
+
+            if node_length >= 42 {
+                partition_format = file_path_list[base + 40];
+                let signature_type = file_path_list[base + 41];
+                if partition_format == 2 && signature_type == 2 {
+                    partition_guid = Some(
+                        file_path_list[base + 24..base + 40]
+                            .try_into()
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "GUID extraction failed")
+                            })?,
+                    );
+                } else if partition_format == 1 && signature_type == 1 {
+                    mbr_signature = Some(u32::from_le_bytes([
+                        file_path_list[base + 24],
+                        file_path_list[base + 25],
+                        file_path_list[base + 26],
+                        file_path_list[base + 27],
+                    ]));
+                }
+            } else if node_length >= 25 {
+                // MBR: format at offset 24
+                partition_format = file_path_list[base + 24];
+                // MBR signature is the disk ID, not directly in the device path.
+                // We'll need to match by other means.
+            }
+
+            return Ok(Some(BootDeviceInfo {
+                partition_number: part_num,
+                partition_guid,
+                mbr_signature,
+                partition_format,
+            }));
         }
 
         node_offset += node_length;
@@ -563,6 +729,56 @@ mod tests {
         // Run extraction
         let part_id = extract_boot_partition_id(&base_path).unwrap();
         assert_eq!(part_id, Some(101));
+    }
+
+    #[test]
+    fn test_efi_extract_boot_device_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().to_str().unwrap().to_string();
+
+        // 1. Write BootCurrent = 3
+        let mut boot_current_data = vec![0x06, 0x00, 0x00, 0x00];
+        boot_current_data.extend_from_slice(&3u16.to_le_bytes());
+        let bc_path = dir
+            .path()
+            .join("BootCurrent-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+        std::fs::write(&bc_path, &boot_current_data).unwrap();
+
+        // 2. Write Boot0003 with a known GUID
+        let mut boot_var_data = vec![0x06, 0x00, 0x00, 0x00];
+        boot_var_data.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        boot_var_data.extend_from_slice(&42u16.to_le_bytes());
+        boot_var_data
+            .extend_from_slice(&[0x42, 0x00, 0x6F, 0x00, 0x6F, 0x00, 0x74, 0x00, 0x00, 0x00]);
+        boot_var_data.push(0x04);
+        boot_var_data.push(0x01);
+        boot_var_data.extend_from_slice(&42u16.to_le_bytes());
+        boot_var_data.extend_from_slice(&101u32.to_le_bytes()); // partition number
+        boot_var_data.extend_from_slice(&[0u8; 8]); // partition start
+        boot_var_data.extend_from_slice(&[0u8; 8]); // partition size
+                                                    // GPT partition GUID in EFI byte order.
+        let partition_guid = [
+            0xaa, 0x11, 0xbb, 0x22, 0xcc, 0x33, 0xdd, 0x44, 0xee, 0x55, 0xff, 0x66, 0x77, 0x88,
+            0x99, 0x00,
+        ];
+        boot_var_data.extend_from_slice(&partition_guid);
+        boot_var_data.push(0x02); // PartitionFormat: GPT
+        boot_var_data.push(0x02); // SignatureType: GUID
+
+        let b0003_path = dir
+            .path()
+            .join("Boot0003-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+        std::fs::write(&b0003_path, &boot_var_data).unwrap();
+
+        // Run extraction
+        let info = extract_boot_device_info(&base_path).unwrap().unwrap();
+        assert_eq!(info.partition_number, 101);
+        assert_eq!(info.partition_guid, Some(partition_guid));
+        assert_eq!(info.partition_format, 2); // GPT
+        assert_eq!(
+            info.partition_guid_uuid().as_deref(),
+            Some("22bb11aa-33cc-44dd-ee55-ff6677889900")
+        );
     }
 
     #[test]

@@ -72,8 +72,8 @@ jobs:
 
           # Load and push initos-signer
           docker load -i "$(readlink -f result-docker-image)"
-          docker tag initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
-          docker push ghcr.io/${owner_lc}/initos-signer:latest
+          docker tag initos-signer:latest "ghcr.io/${owner_lc}/initos-signer:latest"
+          docker push "ghcr.io/${owner_lc}/initos-signer:latest"
 
 
       - name: Create Release
@@ -90,5 +90,86 @@ jobs:
             initos-kernel-host.nar
             initos-kernel-host.tar.gz
           body: "Rolling Release containing initos-signer NAR, tarball, and kernel artifacts. Docker image: ghcr.io/costinm/initos-signer:latest"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sign-release:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build signer and host kernel
+        run: |
+          nix build .#initos-signer -o result-signer
+          nix build ./linux#kernel-host -o result-kernel-host
+
+      - name: Decode signing keys
+        env:
+          INITOS_SIGNING_KEYS_B64: ${{ secrets.INITOS_SIGNING_KEYS_B64 }}
+        run: |
+          test -n "${INITOS_SIGNING_KEYS_B64}"
+          install -d -m 0700 "$RUNNER_TEMP/uefi-keys"
+          printf '%s' "${INITOS_SIGNING_KEYS_B64}" | base64 --decode | \
+            tar -xz -C "$RUNNER_TEMP/uefi-keys" --no-same-owner
+          find "$RUNNER_TEMP/uefi-keys" -type f -name '*.key' -exec chmod 0600 {} +
+
+      - name: Sign release and create Nix closure
+        run: |
+          signed_dir="$RUNNER_TEMP/initos-signed"
+          SECRETS="$RUNNER_TEMP/uefi-keys" SIGNING_KEYS_REQUIRED=1 \
+            result-signer/bin/sign.sh artifacts \
+              "$signed_dir" \
+              result-kernel-host/opt/kernel-image \
+              result-signer
+
+          printf '%s\n' "${GITHUB_SHA}" > "$signed_dir/revision"
+          signed_store=$(nix store add-path --name initos-signed "$signed_dir")
+          printf '%s\n' "$signed_store" > initos-signed.store-path
+          mapfile -t closure_paths < <(nix-store -qR "$signed_store")
+          nix-store --export "${closure_paths[@]}" > initos-signed.nar
+          tar -C "$signed_store" -czf initos-signed.tar.gz .
+          sha256sum initos-signed.nar initos-signed.store-path initos-signed.tar.gz > SHA256SUMS
+
+      - name: Remove signing keys
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/uefi-keys" -type f -delete 2>/dev/null || true
+          rmdir "$RUNNER_TEMP/uefi-keys" 2>/dev/null || true
+
+      - name: Upload signed release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: initos-signed-${{ github.sha }}
+          retention-days: 14
+          path: |
+            initos-signed.nar
+            initos-signed.store-path
+            initos-signed.tar.gz
+            SHA256SUMS
+
+      - name: Create Signed Rolling Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: signed-rolling
+          name: Signed Rolling Release
+          draft: false
+          prerelease: true
+          make_latest: false
+          files: |
+            initos-signed.nar
+            initos-signed.store-path
+            initos-signed.tar.gz
+            SHA256SUMS
+          body: "Signed InitOS closure and directly writable VFAT boot image for ${{ github.sha }}."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -91,23 +91,69 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         let verified_boot = detect_verified_boot_strict()?;
         verified_boot_mode.set(Some(verified_boot));
 
-        let efi_base_path = env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
-        let boot_partition_id = match crate::efi::extract_boot_partition_id(&efi_base_path) {
-            Ok(Some(part_id)) => {
-                eprintln!("initos: extracted boot partition ID: {}", part_id);
-                Some(part_id)
+        let efi_base_path =
+            env::var("INITOS_EFI_PATH").unwrap_or_else(|_| "/sys/firmware/efi/efivars".to_string());
+        let boot_device_info = match crate::efi::extract_boot_device_info(&efi_base_path) {
+            Ok(Some(info)) => {
+                eprintln!(
+                    "initos: boot device info: partition={}, partition_guid={:?}, format={}",
+                    info.partition_number,
+                    info.partition_guid_uuid(),
+                    info.partition_format
+                );
+                Some(info)
             }
             Ok(None) => {
-                eprintln!("initos: no boot partition ID could be extracted from EFI variables");
+                eprintln!("initos: no boot device info could be extracted from EFI variables");
                 None
             }
             Err(e) => {
-                eprintln!("initos: error extracting boot partition ID: {}", e);
+                eprintln!("initos: error extracting boot device info: {}", e);
                 None
             }
         };
 
-        let dev = find_data_device(&data)?;
+        let boot_partition_id = boot_device_info.as_ref().map(|info| info.partition_number);
+
+        // Find the boot disk and partition
+        let (boot_disk, boot_partition) = if let Some(ref info) = boot_device_info {
+            match crate::mount::find_boot_disk(
+                info.partition_guid.as_ref(),
+                Some(info.partition_number),
+            ) {
+                Ok(Some((disk, part))) => {
+                    eprintln!(
+                        "initos: boot disk={}, boot partition={}",
+                        disk.display(),
+                        part.display()
+                    );
+                    (Some(disk), Some(part))
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "initos: could not find boot disk for partition {}",
+                        info.partition_number
+                    );
+                    (None, None)
+                }
+                Err(e) => {
+                    eprintln!("initos: error finding boot disk: {}", e);
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        // Set environment variables for boot disk and partition
+        if let Some(ref disk) = boot_disk {
+            env::set_var("INITOS_BOOT_DISK", disk.to_string_lossy().to_string());
+        }
+        if let Some(ref part) = boot_partition {
+            env::set_var("INITOS_BOOT_PARTITION", part.to_string_lossy().to_string());
+        }
+
+        let dev = find_data_device(&data, boot_disk.as_ref().map(|v| &**v))?;
         eprintln!("initos: found data device: {:?}", dev);
 
         let state_mount = "/z";
@@ -116,7 +162,13 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
         unlock_state_c(state_mount, verified_boot)?;
 
         let root_mount = "/sysroot";
-        mount_rootfs(state_mount, root_mount, &img, verified_boot, boot_partition_id)?;
+        mount_rootfs(
+            state_mount,
+            root_mount,
+            &img,
+            verified_boot,
+            boot_partition_id,
+        )?;
 
         let new_state_mount = format!("{}/z", root_mount);
         crate::mount::bind_mount(state_mount, &new_state_mount)?;
@@ -166,9 +218,36 @@ pub fn cmd_boot() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn find_data_device(label: &str) -> io::Result<PathBuf> {
+fn find_data_device(label: &str, boot_disk: Option<&Path>) -> io::Result<PathBuf> {
     let deadline = Instant::now() + Duration::from_secs(20);
-    eprintln!("initos: waiting for {} data device", label);
+
+    // Strategy 1: Look for labeled partition on the boot disk
+    if let Some(disk) = boot_disk {
+        eprintln!(
+            "initos: searching for {} on boot disk {}",
+            label,
+            disk.display()
+        );
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match crate::mount::find_partition_on_disk_by_label(disk, label) {
+                Ok(Some(dev)) => {
+                    eprintln!("initos: found {} on boot disk: {:?}", label, dev);
+                    return Ok(dev);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("initos: error scanning boot disk for {}: {}", label, e);
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    // Strategy 2: Global search for labeled partition (existing behavior)
+    eprintln!("initos: waiting for {} data device (global search)", label);
     loop {
         match crate::mount::find_partition_by_label(label) {
             Ok(dev) => return Ok(dev),
@@ -176,10 +255,65 @@ fn find_data_device(label: &str) -> io::Result<PathBuf> {
                 let last_error = e;
                 thread::sleep(Duration::from_secs(1));
                 if Instant::now() >= deadline {
+                    // Strategy 3: Fall back to partition 1 on boot disk if it's ext4
+                    if let Some(disk) = boot_disk {
+                        eprintln!(
+                            "initos: {} not found, trying partition 1 on boot disk {}",
+                            label,
+                            disk.display()
+                        );
+                        match crate::mount::find_partition_by_number(disk, 1) {
+                            Ok(Some(part1)) => {
+                                if crate::mount::is_ext4(&part1)? {
+                                    eprintln!(
+                                        "initos: using fallback partition 1 (ext4): {:?}",
+                                        part1
+                                    );
+                                    return Ok(part1);
+                                } else {
+                                    eprintln!(
+                                        "initos: partition 1 is not ext4, not using as fallback"
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                eprintln!("initos: partition 1 not found on boot disk");
+                            }
+                            Err(e) => {
+                                eprintln!("initos: error finding partition 1: {}", e);
+                            }
+                        }
+                    }
                     return Err(last_error);
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Strategy 3: Fall back to partition 1 on boot disk if it's ext4
+                if let Some(disk) = boot_disk {
+                    eprintln!(
+                        "initos: {} not found, trying partition 1 on boot disk {}",
+                        label,
+                        disk.display()
+                    );
+                    match crate::mount::find_partition_by_number(disk, 1) {
+                        Ok(Some(part1)) => {
+                            if crate::mount::is_ext4(&part1)? {
+                                eprintln!("initos: using fallback partition 1 (ext4): {:?}", part1);
+                                return Ok(part1);
+                            } else {
+                                eprintln!("initos: partition 1 is not ext4, not using as fallback");
+                            }
+                        }
+                        Ok(None) => {
+                            eprintln!("initos: partition 1 not found on boot disk");
+                        }
+                        Err(e) => {
+                            eprintln!("initos: error finding partition 1: {}", e);
+                        }
+                    }
+                }
+                return Err(e);
+            }
         }
     }
 }
@@ -192,14 +326,20 @@ fn mount_rootfs(
     boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_name = env::var("INITOS_ROOT").unwrap_or_else(|_| "ROOTA".to_string());
-    
+
     let mut encrypted_root = None;
     if let Some(part_id) = boot_partition_id {
-        let part_root = Path::new(state_mount).join("c/roots").join(part_id.to_string()).join(&root_name);
+        let part_root = Path::new(state_mount)
+            .join("c/roots")
+            .join(part_id.to_string())
+            .join(&root_name);
         if part_root.exists() {
             encrypted_root = Some(part_root);
         } else {
-            let part_root_alt = Path::new(state_mount).join("roots").join(part_id.to_string()).join(&root_name);
+            let part_root_alt = Path::new(state_mount)
+                .join("roots")
+                .join(part_id.to_string())
+                .join(&root_name);
             if part_root_alt.exists() {
                 encrypted_root = Some(part_root_alt);
             }
@@ -228,9 +368,19 @@ fn mount_rootfs(
 
     let default_img_path = Path::new(state_mount).join(img.trim_start_matches('/'));
     let img_path = if let Some(part_id) = boot_partition_id {
-        match check_partitioned_image(&default_img_path, part_id, verified_boot)? {
-            Some(part_path) => part_path,
-            None => default_img_path,
+        let slot_link_base = Path::new(state_mount).join("initos").join(
+            default_img_path
+                .file_name()
+                .ok_or("root image has no file name")?,
+        );
+        if let Some(part_path) = check_partitioned_image(&slot_link_base, part_id, verified_boot)? {
+            part_path
+        } else if let Some(part_path) =
+            check_partitioned_image(&default_img_path, part_id, verified_boot)?
+        {
+            part_path
+        } else {
+            default_img_path
         }
     } else {
         default_img_path
@@ -358,7 +508,10 @@ fn unlock_c_with_tpm(c_dir: &Path, verified_boot: bool) -> Result<(), Box<dyn st
             Ok(()) => eprintln!("initos: PCR 7 extended (sealed against further unseal)"),
             Err(e) => eprintln!("initos: PCR 7 extend failed (non-fatal): {}", e),
         },
-        Err(e) => eprintln!("initos: cannot reopen TPM for PCR extend (non-fatal): {}", e),
+        Err(e) => eprintln!(
+            "initos: cannot reopen TPM for PCR extend (non-fatal): {}",
+            e
+        ),
     }
 
     Ok(())
@@ -762,7 +915,9 @@ fn mount_host_image(
     verified_boot: bool,
     boot_partition_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(image_path) = find_host_image(state_mount, image_name, boot_partition_id, verified_boot)? else {
+    let Some(image_path) =
+        find_host_image(state_mount, image_name, boot_partition_id, verified_boot)?
+    else {
         eprintln!("initos: {} not found, skipping mount", image_name);
         return Ok(());
     };
@@ -805,9 +960,10 @@ fn check_partitioned_image(
         let mut sig_exists = false;
 
         let sig_path1 = part_path.with_extension(
-            part_path.extension()
+            part_path
+                .extension()
                 .map(|e| format!("{}.sig", e.to_string_lossy()))
-                .unwrap_or_else(|| "sig".to_string())
+                .unwrap_or_else(|| "sig".to_string()),
         );
         if sig_path1.exists() {
             sig_exists = true;
@@ -827,7 +983,10 @@ fn check_partitioned_image(
 
         if part_path.exists() {
             if sig_exists {
-                eprintln!("initos: partitioned image and signature found at {}", part_path.display());
+                eprintln!(
+                    "initos: partitioned image and signature found at {}",
+                    part_path.display()
+                );
                 return Ok(Some(part_path));
             }
             if verified_boot {
@@ -849,6 +1008,7 @@ fn find_host_image(
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     if let Some(part_id) = boot_partition_id {
         let candidates = [
+            Path::new(state_mount).join("initos").join(image_name),
             Path::new(state_mount).join("img").join(image_name),
             Path::new("/img").join(image_name),
             Path::new("/data/img").join(image_name),
@@ -945,47 +1105,51 @@ mod tests {
     fn test_check_partitioned_image_exists_and_signed() {
         let dir = tempdir().unwrap();
         let base_path = dir.path();
-        
+
         let orig_img = base_path.join("firmware.erofs");
-        
+
         // 1. Create a partitioned directory, image, and signature
         let part_dir = base_path.join("101");
         fs::create_dir(&part_dir).unwrap();
-        
+
         let part_img = part_dir.join("firmware.erofs");
         fs::write(&part_img, b"test image").unwrap();
-        
+
         let part_sig = part_dir.join("firmware.erofs.sig");
         fs::write(&part_sig, b"test signature").unwrap();
-        
+
         // 2. Check check_partitioned_image (dev mode: no sig requirement)
         let result = check_partitioned_image(&orig_img, 101, false).unwrap();
         assert_eq!(result, Some(part_img.clone()));
-        
+
         // 3. Without signature in dev mode, it should return None (fall back)
         fs::remove_file(&part_sig).unwrap();
-        assert!(check_partitioned_image(&orig_img, 101, false).unwrap().is_none());
+        assert!(check_partitioned_image(&orig_img, 101, false)
+            .unwrap()
+            .is_none());
 
         // 3b. Without signature in verified mode, it should error
         assert!(check_partitioned_image(&orig_img, 101, true).is_err());
-        
+
         // 4. Without image, it should return None
         fs::write(&part_sig, b"test signature").unwrap();
         fs::remove_file(&part_img).unwrap();
-        assert!(check_partitioned_image(&orig_img, 101, false).unwrap().is_none());
+        assert!(check_partitioned_image(&orig_img, 101, false)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn test_find_host_image_partitioned_first() {
         let dir = tempdir().unwrap();
         let base_path = dir.path();
-        
+
         // Setup default path: state_mount/img/firmware.erofs
         let img_dir = base_path.join("img");
         fs::create_dir(&img_dir).unwrap();
         let default_img = img_dir.join("firmware.erofs");
         fs::write(&default_img, b"default image").unwrap();
-        
+
         // Setup partitioned path: state_mount/img/101/firmware.erofs
         let part_dir = img_dir.join("101");
         fs::create_dir(&part_dir).unwrap();
@@ -993,15 +1157,39 @@ mod tests {
         fs::write(&part_img, b"partitioned image").unwrap();
         let part_sig = part_dir.join("firmware.erofs.sig");
         fs::write(&part_sig, b"sig").unwrap();
-        
+
         let state_mount = base_path.to_str().unwrap();
-        
+
         // With partition ID 101, it should find the partitioned one (dev mode)
-        let found = find_host_image(state_mount, "firmware.erofs", Some(101), false).unwrap().unwrap();
+        let found = find_host_image(state_mount, "firmware.erofs", Some(101), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(found, part_img);
-        
+
         // Without partition ID, it should fall back to default
-        let found_default = find_host_image(state_mount, "firmware.erofs", None, false).unwrap().unwrap();
+        let found_default = find_host_image(state_mount, "firmware.erofs", None, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(found_default, default_img);
+    }
+
+    #[test]
+    fn test_find_host_image_prefers_nix_store_slot_link_layout() {
+        let dir = tempdir().unwrap();
+        let slot_dir = dir.path().join("initos/102");
+        fs::create_dir_all(&slot_dir).unwrap();
+        let slot_image = slot_dir.join("firmware.erofs");
+        fs::write(&slot_image, b"slot image").unwrap();
+        fs::write(slot_dir.join("firmware.erofs.sig"), b"signature").unwrap();
+
+        let found = find_host_image(
+            dir.path().to_str().unwrap(),
+            "firmware.erofs",
+            Some(102),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(found, Some(slot_image));
     }
 }

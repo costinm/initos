@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  initos-upgrade fetch [OWNER/REPO] [TAG] [DEST]
+  initos-upgrade import NAR STORE_PATH_FILE
+  initos-upgrade install STORE_PATH DISK SLOT --write
+
+fetch downloads and verifies the stable signed release assets.
+import adds the complete signed closure to this machine's Nix store.
+install links /z/initos/SLOT to the signed store output and writes its VFAT
+image to DISK partition SLOT. SLOT must be 101 or 102; --write is mandatory.
+EOF
+    exit 2
+}
+
+partition_device() {
+    local disk="${1}"
+    local slot="${2}"
+    case "${disk}" in
+        *[0-9]) printf '%sp%s\n' "${disk}" "${slot}" ;;
+        *) printf '%s%s\n' "${disk}" "${slot}" ;;
+    esac
+}
+
+fetch_release() {
+    local repo="${1:-costinm/initos}"
+    local tag="${2:-signed-rolling}"
+    local dest="${3:-.}"
+    local base="https://github.com/${repo}/releases/download/${tag}"
+    local file
+
+    install -d -m 0755 "${dest}"
+    for file in initos-signed.nar initos-signed.store-path initos-signed.tar.gz SHA256SUMS; do
+        curl -fL --retry 3 --proto '=https' --tlsv1.2 \
+            -o "${dest}/${file}" "${base}/${file}"
+    done
+    (cd "${dest}" && sha256sum -c SHA256SUMS)
+}
+
+import_release() {
+    local nar="${1:?NAR path is required}"
+    local store_path_file="${2:?store path file is required}"
+    local expected
+
+    expected=$(cat "${store_path_file}")
+    case "${expected}" in
+        /nix/store/*) ;;
+        *) echo "ERROR: invalid signed store path: ${expected}" >&2; exit 1 ;;
+    esac
+
+    nix-store --import < "${nar}" >/dev/null
+    if [ ! -d "${expected}/img" ]; then
+        echo "ERROR: imported closure does not contain ${expected}/img" >&2
+        exit 1
+    fi
+    nix-store --add-root /nix/var/nix/gcroots/initos-signed --indirect -r "${expected}"
+}
+
+install_slot() {
+    local store_path="${1:?signed store path is required}"
+    local disk="${2:?whole-disk device is required}"
+    local slot="${3:?slot is required}"
+    local confirm="${4:-}"
+    local partition state_store target
+
+    case "${store_path}" in
+        /nix/store/*) ;;
+        *) echo "ERROR: STORE_PATH must be in /nix/store" >&2; exit 1 ;;
+    esac
+    case "${slot}" in
+        101|102) ;;
+        *) echo "ERROR: SLOT must be 101 or 102" >&2; exit 1 ;;
+    esac
+    if [ "${confirm}" != --write ]; then
+        echo "ERROR: refusing to write a boot partition without --write" >&2
+        exit 1
+    fi
+    if [ ! -b "${disk}" ]; then
+        echo "ERROR: not a block device: ${disk}" >&2
+        exit 1
+    fi
+
+    partition=$(partition_device "${disk}" "${slot}")
+    if [ ! -b "${partition}" ]; then
+        echo "ERROR: slot partition is not a block device: ${partition}" >&2
+        exit 1
+    fi
+    if [ ! -f "${store_path}/img/boot-initos-signed.vfat" ] || \
+       [ ! -f "${store_path}/img/initos.erofs" ]; then
+        echo "ERROR: signed output is incomplete: ${store_path}" >&2
+        exit 1
+    fi
+
+    state_store="/z/c${store_path}"
+    if [ ! -d "${state_store}/img" ]; then
+        echo "ERROR: ${state_store}/img is unavailable; import into the persistent /z/c/nix store first" >&2
+        exit 1
+    fi
+
+    install -d -m 0755 /z/initos
+    target="/z/initos/${slot}"
+    ln -sfn "${state_store}/img" "${target}"
+    sync
+
+    echo "Writing ${store_path}/img/boot-initos-signed.vfat to ${partition}"
+    dd if="${store_path}/img/boot-initos-signed.vfat" of="${partition}" \
+        bs=4M conv=fsync status=progress
+    sync
+    echo "Installed signed slot ${slot}; payload link: ${target} -> ${state_store}/img"
+}
+
+main() {
+    case "${1:-}" in
+        fetch) shift; fetch_release "$@" ;;
+        import) shift; [ "$#" -eq 2 ] || usage; import_release "$@" ;;
+        install) shift; [ "$#" -eq 4 ] || usage; install_slot "$@" ;;
+        *) usage ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -74,8 +74,8 @@ jobs:
         run: |
           owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker load -i "$(readlink -f result-vm-docker-image)"
-          docker tag initos-vm:latest ghcr.io/${owner_lc}/initos/vm:latest
-          docker push ghcr.io/${owner_lc}/initos/vm:latest
+          docker tag initos-vm:latest "ghcr.io/${owner_lc}/initos/vm:latest"
+          docker push "ghcr.io/${owner_lc}/initos/vm:latest"
 
       # - name: Create / Update Rolling Release
       #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'

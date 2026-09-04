@@ -25,6 +25,22 @@ NIX_PROFILE=${NIX_PROFILE:-${PWD}/target/nix/profile}
 
 # --- Key generation ---
 
+require_signing_keys() {
+    local missing=0
+    local key
+    for key in \
+        PK.crt PK.cer PK.esl PK.auth \
+        KEK.crt KEK.cer KEK.esl KEK.auth \
+        db.key db.crt db.cer db.esl db.auth \
+        root.pem; do
+        if [ ! -s "${SECRETS}/${key}" ]; then
+            echo "ERROR: missing signing key material: ${SECRETS}/${key}" >&2
+            missing=1
+        fi
+    done
+    [ "${missing}" -eq 0 ]
+}
+
 # Generate the key pairs for signing the kernel and the disk image.
 # This is done before install - as a separate step/process - the rest can be automated easily,
 # but signing must be done on a secure machine and is specific to each user.
@@ -32,6 +48,12 @@ sign_init() {
     local u=${DOMAIN:-mesh.internal}
 
     mkdir -p "${SECRETS}"
+
+    if [ "${SIGNING_KEYS_REQUIRED:-0}" = 1 ]; then
+        require_signing_keys
+        echo "Using supplied signing keys"
+        return 0
+    fi
 
     if [ -f "${SECRETS}/root.key" ] ; then
         echo "Keys already exist"

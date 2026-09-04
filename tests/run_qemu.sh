@@ -31,6 +31,12 @@ cd "${PROJECT_ROOT}"
 src=${src:-${PROJECT_ROOT}}
 out=${out:-${src}/target}
 
+# Prepend Nix profile tools if available (target/nix/profiles/profile)
+# This provides erofs-utils, swtpm, mtools, e2fsprogs, sbsigntool, etc.
+if [ -d "${out}/nix/profiles/profile/bin" ]; then
+    PATH="${out}/nix/profiles/profile/bin:${PATH}"
+fi
+
 PATH=${src}/prebuilt/bin:${src}/sidecar/bin:/sbin:/usr/sbin:$PATH
 
 # The EFI dir - will be exported as vfat in qemu, no need to create an img.
@@ -325,15 +331,14 @@ test_initos_signed() {
 
     echo "=== Analyzing Signed InitOS Boot ==="
 
-    if grep -q "console=hvc0" "${log_file}" && \
-        (grep -q "✅ RSA Signature VERIFIED for config" "${log_file}" || grep -q "✅ CONFIG VERIFIED OK" "${log_file}") && \
-        (grep -q "✅ RSA Signature VERIFIED for kernel" "${log_file}" || grep -q "✅ KERNEL VERIFIED OK" "${log_file}") && \
+    if grep -q "InitOS EFI starting" "${log_file}" && \
+        grep -q "initos: EFI SecureBoot=1 verified_boot=true" "${log_file}" && \
         grep -q "initos: image db signature verified OK" "${log_file}" && \
         grep -q "initos: unlocked /z/c using TPM" "${log_file}" && \
         grep -q "initos: verifying image /z/img/firmware.erofs" "${log_file}" && \
-        grep -q "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
+        grep -qE "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
         grep -q "initos: mounting /z/img/firmware.erofs at /sysroot/mnt/firmware" "${log_file}" && \
-        grep -q "initos: mounting /z/img/modules-.*\\.erofs at /sysroot/mnt/modules/.*" "${log_file}" && \
+        grep -qE "initos: mounting /z/img/modules-.*\\.erofs at /sysroot/mnt/modules/.*" "${log_file}" && \
         grep -q "initos: binding /sysroot/mnt/firmware to /sysroot/usr/lib/firmware" "${log_file}" && \
         grep -q "initos: binding /sysroot/mnt/modules to /sysroot/usr/lib/modules" "${log_file}" && \
         grep -q "initos: mounting proc at /sysroot/proc" "${log_file}" && \
@@ -369,7 +374,7 @@ test_initos_signed_stateless() {
     echo "=== Analyzing Signed InitOS Stateless Boot ==="
     if grep -q "initos: image db signature verified OK" "${log_file}" && \
         grep -q "initos: verifying image /z/img/firmware.erofs" "${log_file}" && \
-        grep -q "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
+        grep -qE "initos: verifying image /z/img/modules-.*\\.erofs" "${log_file}" && \
         grep -q "=== INITRD ROOTFS FIRMWARE BIND OK ===" "${log_file}" && \
         grep -q "=== INITRD ROOTFS MODULES BIND OK ===" "${log_file}" && \
         grep -q "=== INITRD STATELESS ROOT OK ===" "${log_file}" && \

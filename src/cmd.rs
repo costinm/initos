@@ -417,6 +417,10 @@ pub fn print_help() {
     eprintln!("  INITOS_IMG       image path (default: /img/initos.erofs, boot mode)");
     eprintln!("  INITOS_DATA      partition label (default: STATE, boot mode)");
     eprintln!("  INITOS_INIT      init path (default: /opt/initos/bin/initos-init)");
+    eprintln!("  INITOS_BOOT_DISK       boot disk device (set during boot, e.g. /dev/nvme0n1)");
+    eprintln!(
+        "  INITOS_BOOT_PARTITION  boot partition device (set during boot, e.g. /dev/nvme0n1p101)"
+    );
     eprintln!("  FSCRYPT_KEY      raw fscrypt passphrase/key material");
     eprintln!("  KEY              age scrypt passphrase for encrypt/decrypt");
     eprintln!("  ID               age x25519 identity for decrypt");

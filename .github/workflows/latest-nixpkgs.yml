@@ -77,8 +77,8 @@ jobs:
         run: |
           owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker load -i "$(readlink -f result-docker-image)"
-          docker tag initos-signer:latest ghcr.io/${owner_lc}/initos-signer:latest
-          docker push ghcr.io/${owner_lc}/initos-signer:latest
+          docker tag initos-signer:latest "ghcr.io/${owner_lc}/initos-signer:latest"
+          docker push "ghcr.io/${owner_lc}/initos-signer:latest"
 
       - name: Create Rolling Release
         uses: softprops/action-gh-release@v2

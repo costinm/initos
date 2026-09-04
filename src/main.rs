@@ -25,6 +25,8 @@
 //! Environment for initrd boot:
 //!   INITOS_IMG       image path (default: /img/initos.erofs, boot mode)
 //!   INITOS_DATA      partition label (default: STATE, boot mode)
+//!   INITOS_BOOT_DISK       boot disk device (set during boot, e.g. /dev/nvme0n1)
+//!   INITOS_BOOT_PARTITION  boot partition device (set during boot, e.g. /dev/nvme0n1p101)
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -102,12 +104,16 @@ fn main() {
                     Ok(parsed) => parsed,
                     Err(e) => {
                         eprintln!("{}", e);
-                        eprintln!("Usage: initos recovery-encrypt [PUB_KEY_B64] [--secret-file PATH]");
+                        eprintln!(
+                            "Usage: initos recovery-encrypt [PUB_KEY_B64] [--secret-file PATH]"
+                        );
                         process::exit(1);
                     }
                 };
                 match read_secret_input(secret_file.as_deref()) {
-                    Ok(secret) if !secret.is_empty() => initos::cmd::cmd_recovery_encrypt(&secret, &pub_key),
+                    Ok(secret) if !secret.is_empty() => {
+                        initos::cmd::cmd_recovery_encrypt(&secret, &pub_key)
+                    }
                     Ok(_) => {
                         eprintln!("initos: recovery secret is empty (provide via --secret-file PATH, INITOS_SECRET env, or stdin)");
                         process::exit(1);
@@ -360,7 +366,9 @@ fn parse_recovery_encrypt_args(args: &[String]) -> Result<(String, Option<String
             }
             value => {
                 if pub_key.is_some() {
-                    return Err("recovery-encrypt accepts at most one PUB_KEY_B64 argument".to_string());
+                    return Err(
+                        "recovery-encrypt accepts at most one PUB_KEY_B64 argument".to_string()
+                    );
                 }
                 pub_key = Some(value.to_string());
             }
@@ -449,7 +457,6 @@ fn cmd_seal(
 }
 
 // ─── Verify / Mount ────────────────────────────────────────────────────────
-
 
 /// Verify the fsverity digest + signature of an image.
 fn cmd_verify(img: &str) -> Result<(), Box<dyn std::error::Error>> {

@@ -25,7 +25,7 @@ run_tpm_setup() {
     echo "primary exit=$?"
     echo "primary handle=0x81000000"
 
-    initos seal "${TPM_TEST_KEY}"
+    INITOS_SECRET="${TPM_TEST_KEY}" initos seal
     echo "seal exit=$?"
     echo "sealed handles dev=0x81001002 secure=0x81001003"
 
@@ -127,6 +127,24 @@ run_tests() {
     echo "===== Hello World from initos! ====="
     echo "Kernel: $(uname -r)"
     echo "Init PID: $$"
+
+    echo "=== BOOT DISK ENV TEST ==="
+    if [ -n "${INITOS_BOOT_DISK:-}" ]; then
+        echo "BOOT_DISK=${INITOS_BOOT_DISK}"
+        echo "=== BOOT_DISK SET OK ==="
+    else
+        echo "BOOT_DISK=(empty)"
+        echo "=== BOOT_DISK SET FAIL (expected to be set) ==="
+    fi
+
+    if [ -n "${INITOS_BOOT_PARTITION:-}" ]; then
+        echo "BOOT_PARTITION=${INITOS_BOOT_PARTITION}"
+        echo "=== BOOT_PARTITION SET OK ==="
+    else
+        echo "BOOT_PARTITION=(empty)"
+        echo "=== BOOT_PARTITION SET FAIL (expected to be set) ==="
+    fi
+
     env
     set -x
 
@@ -152,7 +170,7 @@ run_tests() {
     echo "primary exit=$?"
     echo "primary handle=0x81000000"
 
-    initos seal "${TPM_TEST_KEY}"
+    INITOS_SECRET="${TPM_TEST_KEY}" initos seal
     echo "seal exit=$?"
     echo "sealed handles dev=0x81001002 secure=0x81001003"
 
