@@ -682,7 +682,10 @@ fn mount_host_images(
         .ok_or_else(|| format!("path is not valid UTF-8: {}", root_mnt.display()))?;
     crate::mount::mount_filesystem("tmpfs", root_mnt_str, "tmpfs", false)?;
 
-    let slot = boot_partition_id.ok_or_else(|| "boot partition ID is unavailable".into())?;
+    let slot = match boot_partition_id {
+        Some(slot) => slot,
+        None => return Err("boot partition ID is unavailable".into()),
+    };
     if let Err(composefs_error) =
         mount_slot_composefs_firmware(state_mount, root_mount, slot, verified_boot)
     {
