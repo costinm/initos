@@ -114,6 +114,50 @@
         fi
       '') firmwarePackages;
 
+      mkFirmwareTree = nvidiaFirmware:
+        pkgs.runCommand "initos-firmware-tree" { } ''
+          firmwareRoot="$out/lib/firmware"
+          mkdir -p "$firmwareRoot"
+          ${firmwareCopyCommands}
+          if [ -d ${nvidiaFirmware}/lib/firmware ]; then
+            cp -a ${nvidiaFirmware}/lib/firmware/. "$firmwareRoot/"
+          fi
+          chmod -R u+w "$firmwareRoot"
+        '';
+
+      mkFirmwareImages = firmwareTree:
+        pkgs.runCommand "initos-firmware-images" {
+          outputs = [ "out" "light" ];
+          nativeBuildInputs = with pkgs; [ composefs erofs-utils fsverity-utils ];
+        } ''
+          firmwareRoot=${firmwareTree}/lib/firmware
+          mkdir -p "$out" "$light/objects"
+
+          (cd "$firmwareRoot" && mkfs.erofs \
+            -zlz4 -T0 --all-time --all-root --sort=path --workers=1 \
+            -U 8d94f566-8f5d-40b7-88e9-c5d5d31bd001 \
+            "$out/firmware.erofs" .)
+
+          # This image contains the same tree metadata, but regular file data
+          # is resolved through a content-addressed backing directory. Its
+          # object entries are symlinks into the immutable Nix firmware tree.
+          mkcomposefs --use-epoch --threads=1 \
+            "$firmwareRoot" "$light/firmware-light.composefs"
+          find "$firmwareRoot" -type f -print0 | while IFS= read -r -d "" firmwareFile; do
+            digest=$(fsverity digest "$firmwareFile" | awk '{print $1}' | sed 's/^sha256://')
+            objectDir="$light/objects/$(printf '%s' "$digest" | cut -c1-2)"
+            objectName=$(printf '%s' "$digest" | cut -c3-)
+            mkdir -p "$objectDir"
+            if [ ! -e "$objectDir/$objectName" ]; then
+              ln -s "$firmwareFile" "$objectDir/$objectName"
+            fi
+          done
+          printf '%s\n' "$light/objects" > "$light/firmware-light.basedir"
+        '';
+
+      firmwareTree = mkFirmwareTree nvidiaPackage.firmware;
+      firmwareImages = mkFirmwareImages firmwareTree;
+
       mkMergedConfigWithExtra = { packageName, extraConfigText ? "" }:
         let
           extraConfigFile = pkgs.writeText "${packageName}-extra.config" extraConfigText;
@@ -175,7 +219,7 @@
           '';
         });
 
-      mkKernelHostPackage = { packageName, kernel, configfile, nvidiaPackage, nvidiaOpen, outputDir ? "kernel-image" }:
+      mkKernelHostPackage = { packageName, kernel, configfile, nvidiaPackage, nvidiaOpen, firmwareImages, outputDir ? "kernel-image" }:
         pkgs.runCommand packageName {
           nativeBuildInputs = [ pkgs.erofs-utils pkgs.kmod ];
           passthru = {
@@ -249,16 +293,9 @@
           done
           printf '%s\n' '${nvidiaPackage.version}' > "$imageOut/nvidia-version"
 
-          firmwareRoot="$TMPDIR/firmware"
-          mkdir -p "$firmwareRoot"
-          ${firmwareCopyCommands}
-          # NVIDIA packages keep GSP blobs in a separate firmware output.  It
-          # must match the module/userspace version selected for this kernel.
-          if [ -d ${nvidiaPackage.firmware}/lib/firmware ]; then
-            cp -a ${nvidiaPackage.firmware}/lib/firmware/. "$firmwareRoot/"
-          fi
-          chmod -R u+w "$firmwareRoot"
-          (cd "$firmwareRoot" && mkfs.erofs -zlz4 "$imageOut/firmware.erofs" .)
+          cp ${firmwareImages}/firmware.erofs "$imageOut/"
+          cp ${firmwareImages.light}/firmware-light.composefs "$imageOut/"
+          cp ${firmwareImages.light}/firmware-light.basedir "$imageOut/"
 
           echo "${packageName}:"
           ls -lh "$imageOut"
@@ -270,12 +307,15 @@
           kernelForConfig = mkPatchedKernel { inherit packageName configfile; };
           nvidiaPackageForConfig = mkNvidiaPackage kernelForConfig;
           nvidiaOpenForConfig = mkNvidiaOpen kernelForConfig;
+          firmwareTreeForConfig = mkFirmwareTree nvidiaPackageForConfig.firmware;
+          firmwareImagesForConfig = mkFirmwareImages firmwareTreeForConfig;
         in
         mkKernelHostPackage {
           inherit packageName configfile outputDir;
           kernel = kernelForConfig;
           nvidiaPackage = nvidiaPackageForConfig;
           nvidiaOpen = nvidiaOpenForConfig;
+          firmwareImages = firmwareImagesForConfig;
         };
 
       nvidia-compute =
@@ -323,7 +363,7 @@
       kernel-host = (mkKernelHostPackage {
         packageName = "initos-kernel-host";
         configfile = mergedConfig;
-        inherit kernel nvidiaPackage nvidiaOpen;
+        inherit kernel nvidiaPackage nvidiaOpen firmwareImages;
       }).overrideAttrs (old: {
         passthru = (old.passthru or { }) // {
           inherit mkKernelHostWithExtraConfig;
@@ -344,7 +384,8 @@
     in
     {
       packages.${system} = {
-        inherit kernel-host docker-image nvidia-compute;
+        inherit kernel-host docker-image nvidia-compute firmwareTree firmwareImages;
+        firmwareImagesLight = firmwareImages.light;
         default = kernel-host;
       };
     };

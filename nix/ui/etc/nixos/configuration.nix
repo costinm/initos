@@ -11,7 +11,12 @@
   #  [ # Include the results of the hardware scan.
   #    ./hardware-configuration.nix
   #  ];
-  nix.settings.experimental-features = [ "nix-command" "flakes"];
+  nix.settings.experimental-features = [
+    "nix-command"
+    "flakes"
+    "git-hashing"
+    "ca-derivations"
+  ];
   nixpkgs.config.allowUnfree = true;
 
   #This breaks getty and other things - not the right approach
@@ -38,7 +43,8 @@
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
   boot.enableContainers = true;
-  networking.hostName = "host17"; 
+  # Rendered by `initos-upgrade configure` on the target machine.
+  networking.hostName = "$INITOS_HOSTNAME";
 
   systemd.tpm2.enable = false;
   boot.initrd.systemd.tpm2.enable = false;
@@ -122,7 +128,7 @@
 
   # List packages installed in system profile.
   # You can use https://search.nixos.org/ to find more packages (and options).
-   environment.systemPackages = with pkgs; [
+  environment.systemPackages = with pkgs; [
      tmux 
      labwc
      foot
@@ -133,8 +139,22 @@
      vim # Do not forget to add an editor to edit configuration.nix! The Nano editor is also installed by default.
      wget
      curl
+     git
+     composefs
+     fsverity-utils
      
    ];
+
+  systemd.services.initos-rc-local = {
+    description = "InitOS local startup hook";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "local-fs.target" ];
+    unitConfig.ConditionPathExists = "/z/c/initos/rc.local";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.bash}/bin/bash /z/c/initos/rc.local";
+    };
+  };
 
   # Some programs need SUID wrappers, can be configured further or are
   # started in user sessions.
@@ -188,4 +208,3 @@
   system.stateVersion = "26.05"; # Did you read the comment?
 
 }
-

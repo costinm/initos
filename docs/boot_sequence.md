@@ -81,6 +81,8 @@ State filesystem:
 - `/z`: mounted state filesystem selected by `INITOS_DATA`.
 - `/z/img/initos.erofs`: default root image.
 - `/z/img/firmware.erofs`: preferred firmware image location.
+- `/z/img/firmware-light.composefs`: experimental signed metadata-only view of
+  the same firmware content, backed by Nix store files; not mounted yet.
 - `/z/img/modules-<kernel>.erofs`: preferred modules image location.
 - `/z/img/*.erofs.sig`: signature files consumed by image verification.
 - `/z/c`: encrypted fscrypt state directory.
@@ -289,6 +291,11 @@ Firmware:
 1. Look for `firmware.erofs` in `/z/img`, `/img`, then `/data/img`.
 2. Verify it in verified mode.
 3. Mount it read-only as EROFS at `/sysroot/mnt/firmware`.
+
+The experimental `firmware-light.composefs` is packaged and signed but is not
+part of these boot steps yet. Mounting it requires the Nix output named by
+`firmware-light.basedir` to exist and a composefs/OverlayFS mount using its
+content-addressed `objects` directory.
 
 Modules:
 

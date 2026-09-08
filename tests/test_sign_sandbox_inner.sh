@@ -50,6 +50,9 @@ check_file "${OUT}/img/initos.erofs.sig"
 if [ "${KERNEL_TYPE}" = "dir" ]; then
     check_file "${OUT}/img/firmware.erofs"
     check_file "${OUT}/img/firmware.erofs.sig"
+    check_file "${OUT}/img/firmware-light.composefs"
+    check_file "${OUT}/img/firmware-light.composefs.sig"
+    check_file "${OUT}/img/firmware-light.basedir"
     for m in "${OUT}"/img/modules-*.erofs; do
         if [ -f "$m" ]; then
             check_file "$m"

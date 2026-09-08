@@ -682,14 +682,32 @@ fn mount_host_images(
         .ok_or_else(|| format!("path is not valid UTF-8: {}", root_mnt.display()))?;
     crate::mount::mount_filesystem("tmpfs", root_mnt_str, "tmpfs", false)?;
 
-    mount_host_image(
-        state_mount,
-        root_mount,
-        "firmware.erofs",
-        "mnt/firmware",
-        verified_boot,
-        boot_partition_id,
-    )?;
+    let development_tree = Path::new(state_mount)
+        .join("img/firmware-objects/current");
+    if !verified_boot && development_tree.is_dir() {
+        let target = Path::new(root_mount).join("mnt/firmware");
+        let source_str = development_tree.to_str().ok_or_else(|| {
+            format!("path is not valid UTF-8: {}", development_tree.display())
+        })?;
+        let target_str = target
+            .to_str()
+            .ok_or_else(|| format!("path is not valid UTF-8: {}", target.display()))?;
+        eprintln!(
+            "initos: Secure Boot disabled; binding firmware tree {} at {}",
+            development_tree.display(),
+            target.display()
+        );
+        crate::mount::bind_mount(source_str, target_str)?;
+    } else {
+        mount_host_image(
+            state_mount,
+            root_mount,
+            "firmware.erofs",
+            "mnt/firmware",
+            verified_boot,
+            boot_partition_id,
+        )?;
+    }
 
     let kernel = kernel_release()?;
     let modules = format!("modules-{}.erofs", kernel);

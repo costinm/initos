@@ -6,15 +6,204 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   initos-upgrade fetch [OWNER/REPO] [TAG] [DEST]
-  initos-upgrade import NAR STORE_PATH_FILE
-  initos-upgrade install STORE_PATH DISK SLOT --write
+  initos-upgrade configure CONFIGURATION_NIX [HOSTNAME]
+  initos-upgrade firmware-publish FIRMWARE_TREE BARE_REPO [REF]
+  initos-upgrade firmware-fetch GIT_URL REV COMPOSEFS_IMAGE [DEST]
+  initos-upgrade install RELEASE_DIR DISK SLOT --write
 
 fetch downloads and verifies the stable signed release assets.
-import adds the complete signed closure to this machine's Nix store.
-install links /z/initos/SLOT to the signed store output and writes its VFAT
-image to DISK partition SLOT. SLOT must be 101 or 102; --write is mandatory.
+configure renders $INITOS_HOSTNAME (default: the target's current hostname),
+backs up /etc/nixos/configuration.nix, and activates it. It must run as root.
+firmware-publish stores a firmware tree in a bare Git repository and prints the
+commit ID. firmware-fetch incrementally fetches that commit, materializes
+fs-verity-enabled composefs backing objects, and verifies none are missing.
+install atomically extracts the signed slot payload into /z/img/SLOT, updates
+the shared firmware payload in /z/img, and writes its VFAT image to DISK
+partition SLOT. SLOT must be 101 or 102; --write is mandatory.
 EOF
     exit 2
+}
+
+firmware_tree_root() {
+    local tree="${1}"
+    if [ -d "${tree}/lib/firmware" ]; then
+        printf '%s\n' "${tree}/lib/firmware"
+    elif [ -d "${tree}" ]; then
+        printf '%s\n' "${tree}"
+    else
+        echo "ERROR: firmware tree not found: ${tree}" >&2
+        return 1
+    fi
+}
+
+image_has_signature() {
+    local image="${1:?image path is required}"
+    [ -f "${image}.sig" ] || compgen -G "${image}.*.db.sig" >/dev/null
+}
+
+configure_nixos() {
+    local source="${1:?configuration.nix path is required}"
+    local hostname="${2:-$(hostname)}"
+    local destination=/etc/nixos/configuration.nix
+    local stamp backup rendered
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "ERROR: configure must run as root" >&2
+        exit 1
+    fi
+    if [ ! -f "${source}" ]; then
+        echo "ERROR: NixOS configuration not found: ${source}" >&2
+        exit 1
+    fi
+    if ! command -v nixos-rebuild >/dev/null 2>&1; then
+        echo "ERROR: nixos-rebuild is not available" >&2
+        exit 1
+    fi
+    case "${hostname}" in
+        ''|*[!A-Za-z0-9.-]*|[.-]*|*[-.])
+            echo "ERROR: invalid hostname: ${hostname}" >&2
+            exit 1
+            ;;
+    esac
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="${destination}.before-initos-${stamp}"
+    rendered=$(mktemp /etc/nixos/.configuration.nix.XXXXXX)
+    trap "rm -f -- '${rendered}'" EXIT
+    sed "s/\\\$INITOS_HOSTNAME/${hostname}/g" "${source}" > "${rendered}"
+    if grep -q '\$INITOS_HOSTNAME' "${rendered}"; then
+        echo "ERROR: failed to render INITOS_HOSTNAME in ${source}" >&2
+        exit 1
+    fi
+    if [ -e "${destination}" ]; then
+        cp -a "${destination}" "${backup}"
+        echo "Saved previous configuration as ${backup}"
+    fi
+    install -D -m 0644 "${rendered}" "${destination}"
+    rm -f "${rendered}"
+    trap - EXIT
+    nixos-rebuild switch
+}
+
+firmware_publish() {
+    local tree="${1:?firmware tree is required}"
+    local repo="${2:?bare Git repository path is required}"
+    local ref="${3:-refs/heads/main}"
+    local tree_root tree_id commit_id
+
+    tree_root=$(firmware_tree_root "${tree}")
+    case "${ref}" in
+        refs/heads/*) ;;
+        *) echo "ERROR: publish ref must start with refs/heads/: ${ref}" >&2; exit 1 ;;
+    esac
+    if [ ! -d "${repo}" ]; then
+        install -d -m 0755 "$(dirname "${repo}")"
+        git init --bare --initial-branch=main "${repo}" >/dev/null
+    fi
+    if [ ! -f "${repo}/HEAD" ]; then
+        echo "ERROR: not a bare Git repository: ${repo}" >&2
+        exit 1
+    fi
+    # Firmware blobs are binary inputs even when a filename looks textual.
+    # Never apply a caller's line-ending conversion policy.
+    GIT_DIR="${repo}" git config core.autocrlf false
+
+    GIT_DIR="${repo}" GIT_WORK_TREE="${tree_root}" git read-tree --empty
+    GIT_DIR="${repo}" GIT_WORK_TREE="${tree_root}" git add -A
+    tree_id=$(GIT_DIR="${repo}" git write-tree)
+    commit_id=$(printf 'InitOS firmware tree %s\n' "${tree_id}" | \
+        GIT_AUTHOR_NAME=InitOS GIT_AUTHOR_EMAIL=initos@localhost \
+        GIT_COMMITTER_NAME=InitOS GIT_COMMITTER_EMAIL=initos@localhost \
+        GIT_AUTHOR_DATE='@1 +0000' GIT_COMMITTER_DATE='@1 +0000' \
+        GIT_DIR="${repo}" git commit-tree "${tree_id}")
+    GIT_DIR="${repo}" git update-ref "${ref}" "${commit_id}"
+    GIT_DIR="${repo}" git symbolic-ref HEAD "${ref}"
+    : > "${repo}/git-daemon-export-ok"
+    chmod -R a+rX "${repo}"
+    printf '%s\n' "${commit_id}"
+}
+
+firmware_fetch() {
+    local git_url="${1:?firmware Git URL is required}"
+    local revision="${2:?firmware Git revision is required}"
+    local composefs_image="${3:?composefs image is required}"
+    local destination="${4:-/z/img/firmware-objects}"
+    local repo source_repo record mode path object_id object_type
+    local stage object_file digest object_dir object_name tree_path link_target
+
+    if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]] && [[ ! "${revision}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "ERROR: firmware revision must be a 40- or 64-character Git commit ID" >&2
+        exit 1
+    fi
+    if [ ! -f "${composefs_image}" ]; then
+        echo "ERROR: composefs image not found: ${composefs_image}" >&2
+        exit 1
+    fi
+
+    install -d -m 0755 "${destination}" "${destination}/objects" \
+        "${destination}/revisions" "${destination}/trees"
+    if [ -d "${git_url}/objects" ]; then
+        source_repo="${git_url}"
+    else
+        repo="${destination}/repo.git"
+        if [ ! -f "${repo}/HEAD" ]; then
+            git init --bare --initial-branch=main "${repo}" >/dev/null
+        fi
+        git --git-dir="${repo}" fetch --no-tags "${git_url}" "${revision}"
+        source_repo="${repo}"
+    fi
+    git --git-dir="${source_repo}" rev-parse --verify "${revision}^{commit}" >/dev/null
+
+    stage=$(mktemp -d "${destination}/.objects.XXXXXX")
+    # Expand the private mktemp path now: function-local variables no longer
+    # exist when an EXIT trap runs after an error.
+    trap "rm -rf -- '${stage}'" EXIT
+    mkdir -p "${stage}/tree"
+    git --git-dir="${source_repo}" ls-tree -r -z "${revision}" | \
+      while IFS= read -r -d "" record; do
+        mode=${record%% *}
+        object_type=${record#* }
+        object_type=${object_type%% *}
+        [ "${object_type}" = blob ] || continue
+        object_id=${record#* blob }
+        object_id=${object_id%%$'\t'*}
+        path=${record#*$'\t'}
+        case "/${path}/" in
+            *'/../'*|*'/./'*) echo "ERROR: unsafe Git path: ${path}" >&2; exit 1 ;;
+        esac
+        tree_path="${stage}/tree/${path}"
+        mkdir -p "$(dirname "${tree_path}")"
+        if [ "${mode}" = 120000 ]; then
+            link_target=$(git --git-dir="${source_repo}" cat-file blob "${object_id}")
+            ln -s "${link_target}" "${tree_path}"
+            continue
+        fi
+        object_file=$(mktemp "${stage}/object.XXXXXX")
+        git --git-dir="${source_repo}" cat-file blob "${object_id}" > "${object_file}"
+        digest=$(fsverity digest "${object_file}" | awk '{print $1}' | sed 's/^sha256://')
+        object_dir="${destination}/objects/$(printf '%s' "${digest}" | cut -c1-2)"
+        object_name=$(printf '%s' "${digest}" | cut -c3-)
+        mkdir -p "${object_dir}"
+        if [ ! -e "${object_dir}/${object_name}" ]; then
+            fsverity enable "${object_file}" >/dev/null
+            chmod 0444 "${object_file}"
+            mv "${object_file}" "${object_dir}/${object_name}"
+        else
+            rm -f "${object_file}"
+        fi
+        ln -s "${object_dir}/${object_name}" "${tree_path}"
+    done
+    composefs-info --basedir="${destination}/objects" missing-objects "${composefs_image}"
+    if [ -e "${destination}/trees/${revision}" ]; then
+        rm -rf "${stage}/tree"
+    else
+        mv "${stage}/tree" "${destination}/trees/${revision}"
+    fi
+    printf '%s\n' "${git_url}" > "${destination}/revisions/${revision}.source"
+    ln -sfn "trees/${revision}" "${destination}/current"
+    rm -rf "${stage}"
+    trap - EXIT
+    printf '%s\n' "${destination}/objects"
 }
 
 partition_device() {
@@ -34,43 +223,25 @@ fetch_release() {
     local file
 
     install -d -m 0755 "${dest}"
-    for file in initos-signed.nar initos-signed.store-path initos-signed.tar.gz SHA256SUMS; do
+    for file in initos-signed-slot.tar.gz initos-signed-firmware.tar.gz SHA256SUMS; do
         curl -fL --retry 3 --proto '=https' --tlsv1.2 \
             -o "${dest}/${file}" "${base}/${file}"
     done
     (cd "${dest}" && sha256sum -c SHA256SUMS)
 }
 
-import_release() {
-    local nar="${1:?NAR path is required}"
-    local store_path_file="${2:?store path file is required}"
-    local expected
-
-    expected=$(cat "${store_path_file}")
-    case "${expected}" in
-        /nix/store/*) ;;
-        *) echo "ERROR: invalid signed store path: ${expected}" >&2; exit 1 ;;
-    esac
-
-    nix-store --import < "${nar}" >/dev/null
-    if [ ! -d "${expected}/img" ]; then
-        echo "ERROR: imported closure does not contain ${expected}/img" >&2
-        exit 1
-    fi
-    nix-store --add-root /nix/var/nix/gcroots/initos-signed --indirect -r "${expected}"
-}
-
 install_slot() {
-    local store_path="${1:?signed store path is required}"
+    local release_dir="${1:?release directory is required}"
     local disk="${2:?whole-disk device is required}"
     local slot="${3:?slot is required}"
     local confirm="${4:-}"
-    local partition state_store target
+    local partition slot_archive firmware_archive sums slot_stage firmware_stage previous_slot
 
-    case "${store_path}" in
-        /nix/store/*) ;;
-        *) echo "ERROR: STORE_PATH must be in /nix/store" >&2; exit 1 ;;
-    esac
+    release_dir=$(cd "${release_dir}" && pwd)
+    slot_archive="${release_dir}/initos-signed-slot.tar.gz"
+    firmware_archive="${release_dir}/initos-signed-firmware.tar.gz"
+    sums="${release_dir}/SHA256SUMS"
+
     case "${slot}" in
         101|102) ;;
         *) echo "ERROR: SLOT must be 101 or 102" >&2; exit 1 ;;
@@ -89,34 +260,59 @@ install_slot() {
         echo "ERROR: slot partition is not a block device: ${partition}" >&2
         exit 1
     fi
-    if [ ! -f "${store_path}/img/boot-initos-signed.vfat" ] || \
-       [ ! -f "${store_path}/img/initos.erofs" ]; then
-        echo "ERROR: signed output is incomplete: ${store_path}" >&2
+    if [ ! -f "${slot_archive}" ] || [ ! -f "${firmware_archive}" ] || [ ! -f "${sums}" ]; then
+        echo "ERROR: release directory must contain signed slot, firmware, and SHA256SUMS archives" >&2
+        exit 1
+    fi
+    (cd "${release_dir}" && sha256sum -c SHA256SUMS)
+
+    install -d -m 0755 /z/img
+    slot_stage=$(mktemp -d /z/img/.initos-slot.XXXXXX)
+    firmware_stage=$(mktemp -d /z/img/.initos-firmware.XXXXXX)
+    trap "rm -rf -- '${slot_stage}' '${firmware_stage}'" EXIT
+    tar -xzf "${slot_archive}" -C "${slot_stage}" --no-same-owner --no-same-permissions
+    tar -xzf "${firmware_archive}" -C "${firmware_stage}" --no-same-owner --no-same-permissions
+    if [ ! -f "${slot_stage}/boot-initos-signed.vfat" ] || \
+       [ ! -f "${slot_stage}/initos.erofs" ] || \
+       [ ! -f "${firmware_stage}/firmware.erofs" ] || \
+       [ ! -f "${firmware_stage}/firmware-light.composefs" ] || \
+       [ ! -f "${firmware_stage}/firmware-light.basedir" ]; then
+        echo "ERROR: signed release payload is incomplete" >&2
+        exit 1
+    fi
+    if ! image_has_signature "${firmware_stage}/firmware.erofs" || \
+       ! image_has_signature "${firmware_stage}/firmware-light.composefs"; then
+        echo "ERROR: firmware payload contains an unsigned image" >&2
         exit 1
     fi
 
-    state_store="/z/c${store_path}"
-    if [ ! -d "${state_store}/img" ]; then
-        echo "ERROR: ${state_store}/img is unavailable; import into the persistent /z/c/nix store first" >&2
+    previous_slot="/z/img/${slot}.previous"
+    if [ -e "${previous_slot}" ]; then
+        echo "ERROR: previous interrupted upgrade backup exists: ${previous_slot}" >&2
         exit 1
     fi
-
-    install -d -m 0755 /z/initos
-    target="/z/initos/${slot}"
-    ln -sfn "${state_store}/img" "${target}"
+    if [ -e "/z/img/${slot}" ]; then
+        mv -T "/z/img/${slot}" "${previous_slot}"
+    fi
+    mv -T "${slot_stage}" "/z/img/${slot}"
+    cp -f "${firmware_stage}"/firmware.erofs* "${firmware_stage}"/firmware-light.* /z/img/
     sync
 
-    echo "Writing ${store_path}/img/boot-initos-signed.vfat to ${partition}"
-    dd if="${store_path}/img/boot-initos-signed.vfat" of="${partition}" \
+    echo "Writing /z/img/${slot}/boot-initos-signed.vfat to ${partition}"
+    dd if="/z/img/${slot}/boot-initos-signed.vfat" of="${partition}" \
         bs=4M conv=fsync status=progress
     sync
-    echo "Installed signed slot ${slot}; payload link: ${target} -> ${state_store}/img"
+    rm -rf "${previous_slot}"
+    trap - EXIT
+    echo "Installed signed slot ${slot} in /z/img/${slot}; shared firmware updated in /z/img"
 }
 
 main() {
     case "${1:-}" in
         fetch) shift; fetch_release "$@" ;;
-        import) shift; [ "$#" -eq 2 ] || usage; import_release "$@" ;;
+        configure) shift; [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; configure_nixos "$@" ;;
+        firmware-publish) shift; [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; firmware_publish "$@" ;;
+        firmware-fetch) shift; [ "$#" -ge 3 ] && [ "$#" -le 4 ] || usage; firmware_fetch "$@" ;;
         install) shift; [ "$#" -eq 4 ] || usage; install_slot "$@" ;;
         *) usage ;;
     esac

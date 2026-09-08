@@ -48,9 +48,16 @@ and firmware EROFS images, their signatures, and
 
 ## GitHub signed rolling release
 
-The `Nix Build` workflow has a separate `sign-release` job for trusted `main`
-pushes and manual runs. Create a protected GitHub environment named `signing`
-and add its `INITOS_SIGNING_KEYS_B64` secret. Pull requests never run this job.
+The `Nix Build` workflow signs at the end of its ordinary build job, reusing
+the signer and kernel outputs already built by that job. Trusted signing runs
+only for a `main` push when `INITOS_SIGNING_KEYS_B64` is available. Pull
+requests and builds without that secret sign with the obviously insecure keys
+under `prebuilt/testdata/uefi-keys`, so the complete signing and packaging path
+is still tested; those outputs are workflow artifacts but are never published
+as `signed-rolling`. Keep the real key as a repository or organization secret
+available to this workflow; a protected GitHub Environment cannot be attached
+to only the final steps of a job.
+
 The secret is a base64-encoded gzip tar containing the existing contents of the
 trusted signing directory:
 
@@ -61,7 +68,7 @@ tar -C "$HOME/.ssh/initos" -czf - \
   db.key db.crt db.cer db.esl db.auth \
   root.pem \
   | base64 -w0 \
-  | gh secret set --env signing INITOS_SIGNING_KEYS_B64
+  | gh secret set INITOS_SIGNING_KEYS_B64
 ```
 
 GitHub secrets are limited to 48 KB. Check the encoded byte count before
@@ -72,58 +79,140 @@ PK, KEK, and mesh-root private keys offline. Protect `main` and require review
 for workflow changes, because any trusted workflow with access to this secret
 is part of the signing trust boundary.
 
-The `signed-rolling` release contains stable asset names:
+The rolling release contains these stable signed assets when signing was
+authorized:
 
 ```text
-initos-signed.nar
-initos-signed.store-path
-initos-signed.tar.gz
+initos-signed-slot.tar.gz
+initos-signed-firmware.tar.gz
 SHA256SUMS
 ```
 
-The tarball is convenient for inspection. The NAR is the deployment artifact:
-it preserves the signed tree as an exact Nix store path and includes
-`img/boot-initos-signed.vfat`, ready to write to a boot partition.
+`initos-signed-slot.tar.gz` contains exactly the signed files installed into
+`/z/img/101` or `/z/img/102`: `boot-initos-signed.vfat`, the InitOS image and
+signatures, and the signed module EROFS images and signatures.
+`initos-signed-firmware.tar.gz` separately contains the current shared
+`/z/img/firmware.erofs`, the experimental `firmware-light.composefs`, its Nix
+backing-directory pointer, and both sets of signatures. The composefs image
+describes the same complete firmware tree as `firmware.erofs`, but stores only
+metadata and content-addressed redirects. Its backing object directory is a
+Nix output containing symlinks to the immutable firmware tree. It is not
+selected by the boot path yet. There is intentionally no signed-artifact NAR:
+the release does not transfer a Nix closure full of mostly unchanged inputs.
+
+The full image is generated with nixpkgs-pinned `erofs-utils` and fixed build
+time, ownership, UUID, path ordering, and worker count. The composefs metadata
+uses a fixed epoch and worker count. This makes both metadata images
+reproducible for identical input trees. Build the Nix-backed prototype with:
+
+```sh
+nix build ./linux#firmwareImagesLight --out-link /z/c/initos-firmware
+```
+
+`firmware-light.basedir` names that output's content-addressed object directory.
+The kernel configuration already enables built-in EROFS, file-backed EROFS,
+OverlayFS/metacopy, and fs-verity. A future boot-path experiment must verify the
+signed composefs image and mount it with this `basedir` before it can replace
+the current self-contained firmware image.
+
+The `git-hashing` Nix feature supplies Git blob/tree content addresses, but by
+itself it does not make an ordinary binary cache transfer changed files from a
+monolithic Nix output. File-granular upgrades additionally require a
+Git-object-capable source/store for the firmware tree (or finer Nix outputs).
+
+## Publish and fetch the incremental firmware tree
+
+`SIGN_HOST` is the build and firmware source machine; `SERVER_HOST` is a
+separate server.
+Both the server and UI NixOS configurations enable `git-hashing` and
+`ca-derivations` and install Git, composefs, and fsverity-utils, but neither
+configuration implicitly turns that machine into the firmware publisher.
+
+The checked-in UI and server configurations are hostname-neutral templates.
+Copy the appropriate one and let the target render `$INITOS_HOSTNAME` from its
+current hostname, or pass the desired hostname explicitly:
+
+```sh
+scp nix/ui/etc/nixos/configuration.nix \
+  "root@${UI_HOST}:/tmp/configuration.nix"
+ssh "root@${UI_HOST}" \
+  'initos-upgrade configure /tmp/configuration.nix'
+
+scp nix/server/etc/nixos/configuration.nix \
+  "root@${SERVER_HOST}:/tmp/configuration.nix"
+ssh "root@${SERVER_HOST}" \
+  "initos-upgrade configure /tmp/configuration.nix '${SERVER_HOST}'"
+```
+
+`configure` validates the hostname, retains the current file as a timestamped
+`/etc/nixos/configuration.nix.before-initos-*` backup, installs the rendered
+configuration, and runs `nixos-rebuild switch`.
+
+Both configurations enable `initos-rc-local.service`. After local filesystems
+are available, systemd checks for `/z/c/initos/rc.local` and, when present,
+executes it with Bash. The file remains host-local and must provide any PATH or
+other environment needed by its commands. Inspect failures with:
+
+```sh
+systemctl status initos-rc-local.service
+journalctl -u initos-rc-local.service -b
+```
+
+On `SIGN_HOST`, publish a built firmware output into a persistent bare
+repository:
+
+```sh
+firmware=$(nix build ./linux#firmware --no-link --print-out-paths)
+revision=$(initos-upgrade firmware-publish \
+  "$firmware" /z/img/git/initos-firmware.git)
+```
+
+If consumers can access `SIGN_HOST`, fetch a pinned commit and construct the
+composefs object directory directly:
+
+```sh
+initos-upgrade firmware-fetch \
+  "build@${SIGN_HOST}:/z/img/git/initos-firmware.git" \
+  "$revision" /z/img/firmware-light.composefs /z/img/firmware-objects
+```
+
+Where SSH access intentionally runs only from `SIGN_HOST` to a consumer, push the
+bare repository to that consumer and materialize from the local path instead:
+
+```sh
+ssh "root@${UI_HOST}" 'git init --bare --initial-branch=main /z/img/git/initos-firmware.git'
+git --git-dir=/z/img/git/initos-firmware.git push \
+  "root@${UI_HOST}:/z/img/git/initos-firmware.git" refs/heads/main
+ssh "root@${UI_HOST}" initos-upgrade firmware-fetch \
+  /z/img/git/initos-firmware.git "$revision" /z/img/firmware-light.composefs \
+  /z/img/firmware-objects
+```
+
+Git transfers and retains objects, so later pushes reuse unchanged firmware
+blobs. `firmware-fetch` streams each Git blob into the shared digest object
+directory, enables fs-verity on new objects, and validates the directory
+against the signed composefs metadata. The firmware contents therefore do not
+need to be copied into `/nix/store`. `trusted-users = root costin system build`
+on `SIGN_HOST` authorizes the local `build` account for privileged Nix operations,
+but it does not grant SSH access.
 
 ## Import on the master and promote through canary
 
-On the master machine:
+On the canary (or a trusted staging machine with access to its state
+partition):
 
 ```sh
 mkdir -p "$HOME/releases/initos"
 initos-upgrade fetch costinm/initos signed-rolling "$HOME/releases/initos"
-initos-upgrade import \
-  "$HOME/releases/initos/initos-signed.nar" \
-  "$HOME/releases/initos/initos-signed.store-path"
-signed=$(cat "$HOME/releases/initos/initos-signed.store-path")
+sudo initos-upgrade install "$HOME/releases/initos" /dev/nvme0n1 102 --write
 ```
 
-Copy that exact, already-signed store path to the canary. If the target's SSH
-Nix store supports `nix copy`:
-
-```sh
-nix copy --to ssh://canary "$signed"
-ssh canary "sudo nix-store --add-root /nix/var/nix/gcroots/initos-signed --indirect -r '$signed'"
-```
-
-For a host whose SSH Nix store rejects `registerDrvOutput`, use ordinary SSH:
-
-```sh
-nix-store --export $(nix-store -qR "$signed") \
-  | ssh canary 'sudo nix-store --import >/dev/null'
-ssh canary "sudo nix-store --add-root /nix/var/nix/gcroots/initos-signed --indirect -r '$signed'"
-```
-
-Install only the inactive canary slot. The final `--write` is mandatory:
-
-```sh
-ssh canary "sudo initos-upgrade install '$signed' /dev/nvme0n1 102 --write"
-```
-
-This creates `/z/initos/102` pointing at the signed image directory in the
-persistent `/z/c/nix/store`, then writes `boot-initos-signed.vfat` to partition
-102. Boot the canary and validate it before copying the same store path and
-installing the inactive slot on the remaining machines.
+The command verifies `SHA256SUMS`, stages both archives, preserves the prior
+slot as `/z/img/102.previous` until the boot image write succeeds, and then
+writes `boot-initos-signed.vfat` to partition 102. Boot the canary and validate
+it before installing the inactive slot on the remaining machines. A leftover
+`.previous` directory means an earlier upgrade did not complete and must be
+reviewed before retrying.
 
 ## Transfer host tools and NVIDIA compute to a Nix host
 

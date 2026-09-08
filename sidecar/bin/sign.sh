@@ -580,6 +580,13 @@ artifacts() {
         fi
         cp "${kernel_dir}/firmware.erofs" "${output_dir}/img/"
     fi
+    if [ -f "${kernel_dir}/firmware-light.composefs" ]; then
+        if [ -f "${output_dir}/img/firmware-light.composefs" ]; then
+            chmod u+w "${output_dir}/img/firmware-light.composefs"
+        fi
+        cp "${kernel_dir}/firmware-light.composefs" "${output_dir}/img/"
+        cp "${kernel_dir}/firmware-light.basedir" "${output_dir}/img/"
+    fi
 
     # Sign modules and firmware images if they exist
     for m in "${output_dir}"/img/modules-*.erofs; do
@@ -589,6 +596,9 @@ artifacts() {
     done
     if [ -f "${output_dir}/img/firmware.erofs" ]; then
         image "${output_dir}/img" "firmware.erofs"
+    fi
+    if [ -f "${output_dir}/img/firmware-light.composefs" ]; then
+        image "${output_dir}/img" "firmware-light.composefs"
     fi
 
     # Assemble the kernel-independent signer inputs with the kernel bzImage.
