@@ -80,9 +80,9 @@ State filesystem:
 
 - `/z`: mounted state filesystem selected by `INITOS_DATA`.
 - `/z/img/initos.erofs`: default root image.
-- `/z/img/firmware.erofs`: preferred firmware image location.
-- `/z/img/firmware-light.composefs`: experimental signed metadata-only view of
-  the same firmware content, backed by Nix store files; not mounted yet.
+- `/z/img/<slot>/firmware-light.composefs`: signed metadata-only view of the
+  slot's firmware content, backed by `/z/img/composefs/objects`.
+- `/z/img/composefs/objects`: shared append-only fs-verity firmware CAS.
 - `/z/img/modules-<kernel>.erofs`: preferred modules image location.
 - `/z/img/*.erofs.sig`: signature files consumed by image verification.
 - `/z/c`: encrypted fscrypt state directory.
@@ -98,9 +98,7 @@ State filesystem:
 
 Fallback image lookup paths:
 
-- `/img/firmware.erofs`
 - `/img/modules-<kernel>.erofs`
-- `/data/img/firmware.erofs` - deprecated, old
 - `/data/img/modules-<kernel>.erofs` - old
 
 New root:
@@ -108,7 +106,7 @@ New root:
 - `/sysroot`: root mount point before `switch_root`.
 - `/sysroot/z`: bind mount of the state filesystem.
 - `/sysroot/mnt`: tmpfs used for host image mounts.
-- `/sysroot/mnt/firmware`: mounted firmware EROFS image.
+- `/sysroot/mnt/firmware`: mounted composefs firmware view.
 - `/sysroot/mnt/modules/<kernel>`: mounted modules EROFS image.
 - `/sysroot/lib/firmware` or `/sysroot/usr/lib/firmware`: optional firmware bind target, with `/lib` symlinks resolved.
 - `/sysroot/lib/modules` or `/sysroot/usr/lib/modules`: optional modules bind target, with `/lib` symlinks resolved.
@@ -259,7 +257,7 @@ in `src/verify.rs`).
 The following images are verified before mounting:
 
 - Root image from `INITOS_IMG`, unless an encrypted root directory is used.
-- `firmware.erofs`, if found.
+- The boot slot's `firmware-light.composefs` metadata image.
 - `modules-<kernel>.erofs`, if found.
 
 Verification uses `crate::verify::verify_image`, which includes the fs-verity
@@ -288,14 +286,16 @@ Before mounting host images, `/sysroot/mnt` is mounted as tmpfs.
 
 Firmware:
 
-1. Look for `firmware.erofs` in `/z/img`, `/img`, then `/data/img`.
-2. Verify it in verified mode.
-3. Mount it read-only as EROFS at `/sysroot/mnt/firmware`.
-
-The experimental `firmware-light.composefs` is packaged and signed but is not
-part of these boot steps yet. Mounting it requires the Nix output named by
-`firmware-light.basedir` to exist and a composefs/OverlayFS mount using its
-content-addressed `objects` directory.
+1. Locate the boot slot's signed `firmware-light.composefs` and the shared
+   `/z/img/composefs/objects` directory (with legacy slot-local lookup retained
+   for already-installed development images).
+2. Verify the metadata image in verified mode, mount it as read-only EROFS,
+   and mount OverlayFS with the object directory as a data-only lower layer
+   and `verity=require`.
+3. Treat missing objects, failed verification, or mount failure as a boot
+   failure under Secure Boot. With Secure Boot disabled only, a Git-materialized
+   slot tree may be bind-mounted as a development fallback. Rollback selects the
+   other slot's signed metadata while reusing the append-only shared CAS.
 
 Modules:
 

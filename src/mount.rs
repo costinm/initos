@@ -477,6 +477,38 @@ pub fn mount_filesystem(
     Ok(())
 }
 
+/// Mount a filesystem with an explicit comma-separated option string.
+pub fn mount_filesystem_with_options(
+    device: &str,
+    target: &str,
+    fs_type: &str,
+    readonly: bool,
+    options: &str,
+) -> io::Result<()> {
+    fs::create_dir_all(target)?;
+    let source =
+        CString::new(device).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let target_c =
+        CString::new(target).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let fstype =
+        CString::new(fs_type).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let data = CString::new(options).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let flags = if readonly { libc::MS_RDONLY } else { 0 };
+    let ret = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target_c.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            data.as_ptr().cast(),
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Bind mount an existing mounted path at another path.
 pub fn bind_mount(source: &str, target: &str) -> io::Result<()> {
     fs::create_dir_all(target)?;

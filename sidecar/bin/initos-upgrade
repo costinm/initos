@@ -8,7 +8,7 @@ Usage:
   initos-upgrade fetch [OWNER/REPO] [TAG] [DEST]
   initos-upgrade configure CONFIGURATION_NIX [HOSTNAME]
   initos-upgrade firmware-publish FIRMWARE_TREE BARE_REPO [REF]
-  initos-upgrade firmware-fetch GIT_URL REV COMPOSEFS_IMAGE [DEST]
+  initos-upgrade firmware-fetch GIT_URL REV COMPOSEFS_IMAGE SLOT
   initos-upgrade install RELEASE_DIR DISK SLOT --write
 
 fetch downloads and verifies the stable signed release assets.
@@ -16,10 +16,11 @@ configure renders $INITOS_HOSTNAME (default: the target's current hostname),
 backs up /etc/nixos/configuration.nix, and activates it. It must run as root.
 firmware-publish stores a firmware tree in a bare Git repository and prints the
 commit ID. firmware-fetch incrementally fetches that commit, materializes
-fs-verity-enabled composefs backing objects, and verifies none are missing.
+fs-verity-enabled composefs backing objects under /z/img/composefs, and verifies
+none are missing.
 install atomically extracts the signed slot payload into /z/img/SLOT, updates
-the shared firmware payload in /z/img, and writes its VFAT image to DISK
-partition SLOT. SLOT must be 101 or 102; --write is mandatory.
+its slot-local firmware payload, and writes its VFAT image to DISK partition
+SLOT. SLOT must be 101 or 102; --write is mandatory.
 EOF
     exit 2
 }
@@ -127,10 +128,18 @@ firmware_fetch() {
     local git_url="${1:?firmware Git URL is required}"
     local revision="${2:?firmware Git revision is required}"
     local composefs_image="${3:?composefs image is required}"
-    local destination="${4:-/z/img/firmware-objects}"
+    local slot="${4:?slot is required}"
+    local destination shared_root objects
     local repo source_repo record mode path object_id object_type
     local stage object_file digest object_dir object_name tree_path link_target
 
+    case "${slot}" in
+        101|102) ;;
+        *) echo "ERROR: SLOT must be 101 or 102" >&2; exit 1 ;;
+    esac
+    destination="/z/img/${slot}/firmware-objects"
+    shared_root="/z/img/composefs"
+    objects="${shared_root}/objects"
     if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]] && [[ ! "${revision}" =~ ^[0-9a-f]{64}$ ]]; then
         echo "ERROR: firmware revision must be a 40- or 64-character Git commit ID" >&2
         exit 1
@@ -140,12 +149,18 @@ firmware_fetch() {
         exit 1
     fi
 
-    install -d -m 0755 "${destination}" "${destination}/objects" \
-        "${destination}/revisions" "${destination}/trees"
+    install -d -m 0755 "${destination}" "${destination}/revisions" \
+        "${destination}/trees" "${shared_root}" "${objects}" /z/img/git
+    # New installations use one append-only CAS shared by both boot slots.
+    # Retain an existing slot-local objects directory for compatibility; boot
+    # prefers the shared CAS and falls back to the legacy directory.
+    if [ ! -e "${destination}/objects" ]; then
+        ln -s ../../composefs/objects "${destination}/objects"
+    fi
     if [ -d "${git_url}/objects" ]; then
         source_repo="${git_url}"
     else
-        repo="${destination}/repo.git"
+        repo="/z/img/git/initos-firmware.git"
         if [ ! -f "${repo}/HEAD" ]; then
             git init --bare --initial-branch=main "${repo}" >/dev/null
         fi
@@ -181,7 +196,7 @@ firmware_fetch() {
         object_file=$(mktemp "${stage}/object.XXXXXX")
         git --git-dir="${source_repo}" cat-file blob "${object_id}" > "${object_file}"
         digest=$(fsverity digest "${object_file}" | awk '{print $1}' | sed 's/^sha256://')
-        object_dir="${destination}/objects/$(printf '%s' "${digest}" | cut -c1-2)"
+        object_dir="${objects}/$(printf '%s' "${digest}" | cut -c1-2)"
         object_name=$(printf '%s' "${digest}" | cut -c3-)
         mkdir -p "${object_dir}"
         if [ ! -e "${object_dir}/${object_name}" ]; then
@@ -193,7 +208,7 @@ firmware_fetch() {
         fi
         ln -s "${object_dir}/${object_name}" "${tree_path}"
     done
-    composefs-info --basedir="${destination}/objects" missing-objects "${composefs_image}"
+    composefs-info --basedir="${objects}" missing-objects "${composefs_image}"
     if [ -e "${destination}/trees/${revision}" ]; then
         rm -rf "${stage}/tree"
     else
@@ -203,7 +218,7 @@ firmware_fetch() {
     ln -sfn "trees/${revision}" "${destination}/current"
     rm -rf "${stage}"
     trap - EXIT
-    printf '%s\n' "${destination}/objects"
+    printf '%s\n' "${objects}"
 }
 
 partition_device() {
@@ -223,7 +238,7 @@ fetch_release() {
     local file
 
     install -d -m 0755 "${dest}"
-    for file in initos-signed-slot.tar.gz initos-signed-firmware.tar.gz SHA256SUMS; do
+    for file in initos-signed-slot.tar.gz SHA256SUMS; do
         curl -fL --retry 3 --proto '=https' --tlsv1.2 \
             -o "${dest}/${file}" "${base}/${file}"
     done
@@ -235,11 +250,10 @@ install_slot() {
     local disk="${2:?whole-disk device is required}"
     local slot="${3:?slot is required}"
     local confirm="${4:-}"
-    local partition slot_archive firmware_archive sums slot_stage firmware_stage previous_slot
+    local partition slot_archive sums slot_stage previous_slot
 
     release_dir=$(cd "${release_dir}" && pwd)
     slot_archive="${release_dir}/initos-signed-slot.tar.gz"
-    firmware_archive="${release_dir}/initos-signed-firmware.tar.gz"
     sums="${release_dir}/SHA256SUMS"
 
     case "${slot}" in
@@ -260,31 +274,33 @@ install_slot() {
         echo "ERROR: slot partition is not a block device: ${partition}" >&2
         exit 1
     fi
-    if [ ! -f "${slot_archive}" ] || [ ! -f "${firmware_archive}" ] || [ ! -f "${sums}" ]; then
-        echo "ERROR: release directory must contain signed slot, firmware, and SHA256SUMS archives" >&2
+    if [ ! -f "${slot_archive}" ] || [ ! -f "${sums}" ]; then
+        echo "ERROR: release directory must contain the signed slot archive and SHA256SUMS" >&2
         exit 1
     fi
     (cd "${release_dir}" && sha256sum -c SHA256SUMS)
 
     install -d -m 0755 /z/img
     slot_stage=$(mktemp -d /z/img/.initos-slot.XXXXXX)
-    firmware_stage=$(mktemp -d /z/img/.initos-firmware.XXXXXX)
-    trap "rm -rf -- '${slot_stage}' '${firmware_stage}'" EXIT
+    trap "rm -rf -- '${slot_stage}'" EXIT
     tar -xzf "${slot_archive}" -C "${slot_stage}" --no-same-owner --no-same-permissions
-    tar -xzf "${firmware_archive}" -C "${firmware_stage}" --no-same-owner --no-same-permissions
     if [ ! -f "${slot_stage}/boot-initos-signed.vfat" ] || \
        [ ! -f "${slot_stage}/initos.erofs" ] || \
-       [ ! -f "${firmware_stage}/firmware.erofs" ] || \
-       [ ! -f "${firmware_stage}/firmware-light.composefs" ] || \
-       [ ! -f "${firmware_stage}/firmware-light.basedir" ]; then
+       [ ! -f "${slot_stage}/firmware-light.composefs" ] || \
+       [ ! -f "${slot_stage}/firmware-light.basedir" ]; then
         echo "ERROR: signed release payload is incomplete" >&2
         exit 1
     fi
-    if ! image_has_signature "${firmware_stage}/firmware.erofs" || \
-       ! image_has_signature "${firmware_stage}/firmware-light.composefs"; then
+    if ! image_has_signature "${slot_stage}/firmware-light.composefs"; then
         echo "ERROR: firmware payload contains an unsigned image" >&2
         exit 1
     fi
+    if [ ! -d /z/img/composefs/objects ]; then
+        echo "ERROR: shared composefs object store is missing; import OCI or fetch Git firmware first" >&2
+        exit 1
+    fi
+    composefs-info --basedir=/z/img/composefs/objects missing-objects \
+        "${slot_stage}/firmware-light.composefs"
 
     previous_slot="/z/img/${slot}.previous"
     if [ -e "${previous_slot}" ]; then
@@ -295,7 +311,6 @@ install_slot() {
         mv -T "/z/img/${slot}" "${previous_slot}"
     fi
     mv -T "${slot_stage}" "/z/img/${slot}"
-    cp -f "${firmware_stage}"/firmware.erofs* "${firmware_stage}"/firmware-light.* /z/img/
     sync
 
     echo "Writing /z/img/${slot}/boot-initos-signed.vfat to ${partition}"
@@ -304,7 +319,7 @@ install_slot() {
     sync
     rm -rf "${previous_slot}"
     trap - EXIT
-    echo "Installed signed slot ${slot} in /z/img/${slot}; shared firmware updated in /z/img"
+    echo "Installed signed slot ${slot}, including firmware, in /z/img/${slot}"
 }
 
 main() {
@@ -312,7 +327,7 @@ main() {
         fetch) shift; fetch_release "$@" ;;
         configure) shift; [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; configure_nixos "$@" ;;
         firmware-publish) shift; [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; firmware_publish "$@" ;;
-        firmware-fetch) shift; [ "$#" -ge 3 ] && [ "$#" -le 4 ] || usage; firmware_fetch "$@" ;;
+        firmware-fetch) shift; [ "$#" -eq 4 ] || usage; firmware_fetch "$@" ;;
         install) shift; [ "$#" -eq 4 ] || usage; install_slot "$@" ;;
         *) usage ;;
     esac

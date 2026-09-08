@@ -71,9 +71,9 @@ The signer can then create artifacts with its wrapped runtime tools:
 
 ## Verify EROFS payloads
 
-Maintainers should verify generated module and firmware EROFS images before
-calling a build/deployment complete. Extract each image, require no symlinks,
-and reject a `/nix/store` reference:
+Maintainers should verify generated module EROFS images before calling a
+build/deployment complete. Extract each image, require no symlinks, and reject
+a `/nix/store` reference:
 
 ```sh
 verify_erofs() {
@@ -86,7 +86,7 @@ verify_erofs() {
   printf '%s: %s regular files\n' "$image" "$(find "$stage" -type f | wc -l)"
 }
 
-for image in /tmp/initos-signed/img/modules-*.erofs /tmp/initos-signed/img/firmware.erofs; do
+for image in /tmp/initos-signed/img/modules-*.erofs; do
   verify_erofs "$image"
 done
 ```

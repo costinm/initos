@@ -84,41 +84,72 @@ authorized:
 
 ```text
 initos-signed-slot.tar.gz
-initos-signed-firmware.tar.gz
 SHA256SUMS
+firmware-oci-baseline.objects
+firmware-oci-current.objects
 ```
 
 `initos-signed-slot.tar.gz` contains exactly the signed files installed into
 `/z/img/101` or `/z/img/102`: `boot-initos-signed.vfat`, the InitOS image and
-signatures, and the signed module EROFS images and signatures.
-`initos-signed-firmware.tar.gz` separately contains the current shared
-`/z/img/firmware.erofs`, the experimental `firmware-light.composefs`, its Nix
-backing-directory pointer, and both sets of signatures. The composefs image
-describes the same complete firmware tree as `firmware.erofs`, but stores only
-metadata and content-addressed redirects. Its backing object directory is a
-Nix output containing symlinks to the immutable firmware tree. It is not
-selected by the boot path yet. There is intentionally no signed-artifact NAR:
+signatures, signed module EROFS images, and the signed
+`firmware-light.composefs` metadata image. Firmware regular-file content lives
+in the shared `/z/img/composefs/objects` CAS and is transported either through
+Git for local builds or `ghcr.io/<owner>/initos-firmware` for GitHub builds.
+There is intentionally no full firmware EROFS or signed-artifact NAR:
 the release does not transfer a Nix closure full of mostly unchanged inputs.
 
-The full image is generated with nixpkgs-pinned `erofs-utils` and fixed build
-time, ownership, UUID, path ordering, and worker count. The composefs metadata
-uses a fixed epoch and worker count. This makes both metadata images
-reproducible for identical input trees. Build the Nix-backed prototype with:
+The composefs metadata uses a fixed epoch and worker count and is reproducible
+for identical input trees. Build it and its digest-indexed source CAS with:
 
 ```sh
-nix build ./linux#firmwareImagesLight --out-link /z/c/initos-firmware
+nix build ./linux#firmwareImagesLight --out-link target/initos-firmware-light
 ```
 
-`firmware-light.basedir` names that output's content-addressed object directory.
-The kernel configuration already enables built-in EROFS, file-backed EROFS,
-OverlayFS/metacopy, and fs-verity. A future boot-path experiment must verify the
-signed composefs image and mount it with this `basedir` before it can replace
-the current self-contained firmware image.
+`firmware-light.basedir` contains the slot-relative `../../composefs/objects`
+marker; it never embeds a build-host path.
+The kernel configuration enables built-in EROFS, file-backed EROFS,
+OverlayFS/metacopy, and fs-verity. Boot requires the slot-local signed composefs
+metadata and the shared fs-verity object store; it does not fall back to a
+self-contained firmware image.
 
 The `git-hashing` Nix feature supplies Git blob/tree content addresses, but by
 itself it does not make an ordinary binary cache transfer changed files from a
 monolithic Nix output. File-granular upgrades additionally require a
 Git-object-capable source/store for the firmware tree (or finer Nix outputs).
+
+Local and GitHub release builds use the same entry point. All mutable local
+build/sign/package state stays below the checkout's ignored `target/`
+directory; Nix derivation results remain in `/nix/store`:
+
+```sh
+SECRETS=/path/to/uefi-keys REVISION=$(git rev-parse HEAD) \
+  scripts/build-release.sh target/release
+```
+
+GitHub Actions invokes this command after choosing protected or checked-in
+test keys, uploads the slot archive and checksum, and publishes the firmware
+CAS as `ghcr.io/<owner>/initos-firmware:<revision>`. The `baseline` tag is
+replaced when the compressed cumulative delta exceeds 20 percent of its layer;
+`latest` and revision tags select the current baseline-plus-delta manifest.
+Trusted main builds also publish the deterministic firmware tree to
+`https://git.h.webinf.info/costin/initos-firmware`, retain it under
+`github-<revision>`, and include its Git commit ID as `firmware.git-revision` in
+the slot payload. The repository-scoped `GITEA_FIRMWARE_SSH_KEY` deploy key is
+used with strict host verification against `GITEA_KNOWN_HOSTS`; neither secret
+is embedded in a URL or repository configuration.
+
+Import OCI firmware before installing its corresponding slot archive:
+
+```sh
+sudo initos-firmware-oci import \
+  docker://ghcr.io/OWNER/initos-firmware:REVISION \
+  /path/to/firmware-light.composefs
+```
+
+The importer validates every digest-named object, enables fs-verity on its
+inode, and verifies that the metadata image has no missing objects. Local builds
+may continue using `initos-upgrade firmware-publish` and `firmware-fetch` to
+exercise the Git transport against the same CAS and composefs metadata.
 
 ## Publish and fetch the incremental firmware tree
 
@@ -173,7 +204,7 @@ composefs object directory directly:
 ```sh
 initos-upgrade firmware-fetch \
   "build@${SIGN_HOST}:/z/img/git/initos-firmware.git" \
-  "$revision" /z/img/firmware-light.composefs /z/img/firmware-objects
+  "$revision" "/z/img/${SLOT}/firmware-light.composefs" "${SLOT}"
 ```
 
 Where SSH access intentionally runs only from `SIGN_HOST` to a consumer, push the
@@ -184,8 +215,8 @@ ssh "root@${UI_HOST}" 'git init --bare --initial-branch=main /z/img/git/initos-f
 git --git-dir=/z/img/git/initos-firmware.git push \
   "root@${UI_HOST}:/z/img/git/initos-firmware.git" refs/heads/main
 ssh "root@${UI_HOST}" initos-upgrade firmware-fetch \
-  /z/img/git/initos-firmware.git "$revision" /z/img/firmware-light.composefs \
-  /z/img/firmware-objects
+  /z/img/git/initos-firmware.git "$revision" \
+  "/z/img/${SLOT}/firmware-light.composefs" "${SLOT}"
 ```
 
 Git transfers and retains objects, so later pushes reuse unchanged firmware

@@ -574,12 +574,6 @@ artifacts() {
         done
     fi
     shopt -u nullglob
-    if [ -f "${kernel_dir}/firmware.erofs" ]; then
-        if [ -f "${output_dir}/img/firmware.erofs" ]; then
-            chmod u+w "${output_dir}/img/firmware.erofs"
-        fi
-        cp "${kernel_dir}/firmware.erofs" "${output_dir}/img/"
-    fi
     if [ -f "${kernel_dir}/firmware-light.composefs" ]; then
         if [ -f "${output_dir}/img/firmware-light.composefs" ]; then
             chmod u+w "${output_dir}/img/firmware-light.composefs"
@@ -588,15 +582,12 @@ artifacts() {
         cp "${kernel_dir}/firmware-light.basedir" "${output_dir}/img/"
     fi
 
-    # Sign modules and firmware images if they exist
+    # Sign modules and composefs firmware metadata if they exist.
     for m in "${output_dir}"/img/modules-*.erofs; do
         if [ -f "$m" ]; then
             image "${output_dir}/img" "$(basename "$m")"
         fi
     done
-    if [ -f "${output_dir}/img/firmware.erofs" ]; then
-        image "${output_dir}/img" "firmware.erofs"
-    fi
     if [ -f "${output_dir}/img/firmware-light.composefs" ]; then
         image "${output_dir}/img" "firmware-light.composefs"
     fi

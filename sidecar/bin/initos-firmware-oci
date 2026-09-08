@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  initos-firmware-oci baseline OBJECTS OCI_LAYOUT TAG INVENTORY
+  initos-firmware-oci delta OBJECTS BASE_INVENTORY OCI_LAYOUT BASE_TAG TAG INVENTORY
+  initos-firmware-oci ratio OCI_LAYOUT TAG [PERCENT]
+  initos-firmware-oci import OCI_SOURCE COMPOSEFS_IMAGE
+
+OBJECTS is a composefs digest store (HH/62-hex-digits). baseline creates a
+one-layer OCI image. delta adds all objects absent from BASE_INVENTORY to an
+existing BASE_TAG. ratio exits 0 when the cumulative compressed delta is no
+larger than PERCENT (default 20) of the compressed baseline, and exits 10 when
+a new baseline should be made.
+
+OCI_SOURCE uses skopeo syntax, for example docker://ghcr.io/OWNER/IMAGE:TAG or
+oci:/path/to/layout:tag. import must run as root and installs verified,
+fs-verity-enabled objects in /z/img/composefs/objects.
+EOF
+    exit 2
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "ERROR: required command is missing: $1" >&2
+        exit 1
+    }
+}
+
+check_objects() {
+    local objects="${1:?objects directory is required}"
+    [ -d "${objects}" ] || { echo "ERROR: object directory not found: ${objects}" >&2; exit 1; }
+    find -L "${objects}" -type f | while IFS= read -r object; do
+        relative=${object#"${objects}"/}
+        case "${relative}" in *[!0-9a-f/]*) echo "ERROR: invalid composefs object path: ${relative}" >&2; exit 1 ;; esac
+        case "${relative}" in
+            [0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "ERROR: invalid composefs object path: ${relative}" >&2; exit 1 ;;
+        esac
+        [ "${#relative}" -eq 65 ] || {
+            echo "ERROR: invalid composefs object digest path: ${relative}" >&2
+            exit 1
+        }
+    done
+}
+
+write_inventory() {
+    local objects="${1:?objects directory is required}"
+    local inventory="${2:?inventory path is required}"
+    find -L "${objects}" -type f | sed "s#^${objects}/##" | LC_ALL=C sort > "${inventory}"
+}
+
+materialize() {
+    local objects="${1:?objects directory is required}"
+    local inventory="${2:?inventory path is required}"
+    local destination="${3:?destination is required}"
+    local relative source target
+    install -d -m 0755 "${destination}"
+    while IFS= read -r relative; do
+        [ -n "${relative}" ] || continue
+        source="${objects}/${relative}"
+        [ -f "${source}" ] || { echo "ERROR: inventory object is missing: ${relative}" >&2; exit 1; }
+        target="${destination}/${relative}"
+        install -d -m 0755 "$(dirname "${target}")"
+        cp -L "${source}" "${target}"
+        chmod 0444 "${target}"
+        touch -h -d '@0' "${target}"
+    done < "${inventory}"
+    find "${destination}" -type d -exec touch -d '@0' '{}' +
+}
+
+configure_image() {
+    local image="${1:?image is required}"
+    local kind="${2:?kind is required}"
+    umoci config --no-history --created 1970-01-01T00:00:00Z \
+        --config.label org.opencontainers.image.title=initos-firmware-cas \
+        --config.label info.webinf.initos.firmware.kind="${kind}" \
+        --image "${image}"
+}
+
+baseline() {
+    local objects="${1:?objects directory is required}"
+    local layout="${2:?OCI layout is required}"
+    local tag="${3:?tag is required}"
+    local inventory="${4:?inventory path is required}"
+    local stage
+    need umoci
+    check_objects "${objects}"
+    install -d -m 0755 "$(dirname "${inventory}")"
+    write_inventory "${objects}" "${inventory}"
+    stage=$(mktemp -d "${layout%/*}/.oci-baseline.XXXXXX")
+    trap 'chmod -R u+w "${stage}" 2>/dev/null || true; rm -rf -- "${stage}"' EXIT
+    materialize "${objects}" "${inventory}" "${stage}/objects"
+    [ ! -e "${layout}/oci-layout" ] || { echo "ERROR: OCI layout already exists: ${layout}" >&2; exit 1; }
+    umoci init --layout "${layout}"
+    umoci new --image "${layout}:${tag}"
+    umoci insert --rootless --no-history --image "${layout}:${tag}" "${stage}/objects" /objects
+    configure_image "${layout}:${tag}" baseline
+    chmod -R u+w "${stage}" 2>/dev/null || true
+    rm -rf -- "${stage}"
+    trap - EXIT
+}
+
+delta() {
+    local objects="${1:?objects directory is required}"
+    local base_inventory="${2:?base inventory is required}"
+    local layout="${3:?OCI layout is required}"
+    local base_tag="${4:?base tag is required}"
+    local tag="${5:?tag is required}"
+    local inventory="${6:?inventory path is required}"
+    local current delta_inventory stage
+    need comm
+    need umoci
+    check_objects "${objects}"
+    [ -f "${base_inventory}" ] || { echo "ERROR: base inventory not found: ${base_inventory}" >&2; exit 1; }
+    current=$(mktemp "${inventory}.current.XXXXXX")
+    delta_inventory=$(mktemp "${inventory}.delta.XXXXXX")
+    stage=$(mktemp -d "${layout%/*}/.oci-delta.XXXXXX")
+    trap 'rm -f -- "${current}" "${delta_inventory}"; chmod -R u+w "${stage}" 2>/dev/null || true; rm -rf -- "${stage}"' EXIT
+    write_inventory "${objects}" "${current}"
+    LC_ALL=C comm -23 "${current}" "${base_inventory}" > "${delta_inventory}"
+    materialize "${objects}" "${delta_inventory}" "${stage}/objects"
+    umoci tag --image "${layout}:${base_tag}" "${tag}"
+    umoci insert --rootless --no-history --image "${layout}:${tag}" "${stage}/objects" /objects
+    configure_image "${layout}:${tag}" delta
+    install -m 0644 "${current}" "${inventory}"
+    rm -f -- "${current}" "${delta_inventory}"
+    chmod -R u+w "${stage}" 2>/dev/null || true
+    rm -rf -- "${stage}"
+    trap - EXIT
+}
+
+ratio() {
+    local layout="${1:?OCI layout is required}"
+    local tag="${2:?tag is required}"
+    local percent="${3:-20}"
+    local sizes baseline_size delta_size limit
+    need jq
+    need skopeo
+    [[ "${percent}" =~ ^[0-9]+$ ]] || { echo "ERROR: percent must be an integer" >&2; exit 1; }
+    sizes=$(skopeo inspect --raw "oci:${layout}:${tag}" | jq -r '.layers[].size')
+    baseline_size=$(printf '%s\n' "${sizes}" | sed -n '1p')
+    delta_size=$(printf '%s\n' "${sizes}" | sed -n '2p')
+    delta_size=${delta_size:-0}
+    limit=$((baseline_size * percent / 100))
+    printf 'baseline_bytes=%s\ndelta_bytes=%s\nlimit_bytes=%s\n' \
+        "${baseline_size}" "${delta_size}" "${limit}"
+    [ "${delta_size}" -le "${limit}" ] || return 10
+}
+
+import_oci() {
+    local source="${1:?OCI source is required}"
+    local composefs_image="${2:?composefs image is required}"
+    local root=/z/img/composefs objects layout bundle relative expected actual target
+    [ "$(id -u)" -eq 0 ] || { echo "ERROR: import must run as root" >&2; exit 1; }
+    [ -f "${composefs_image}" ] || { echo "ERROR: composefs image not found: ${composefs_image}" >&2; exit 1; }
+    need fsverity
+    need composefs-info
+    need skopeo
+    need umoci
+    install -d -m 0755 "${root}" "${root}/objects"
+    objects="${root}/objects"
+    layout=$(mktemp -d "${root}/.oci-layout.XXXXXX")
+    bundle=$(mktemp -d "${root}/.oci-bundle.XXXXXX")
+    rmdir "${bundle}"
+    trap 'chmod -R u+w "${layout}" "${bundle}" 2>/dev/null || true; rm -rf -- "${layout}" "${bundle}"' EXIT
+    skopeo copy "${source}" "oci:${layout}:import"
+    umoci unpack --rootless --image "${layout}:import" "${bundle}"
+    find "${bundle}/rootfs/objects" -type f | while IFS= read -r object; do
+        relative=${object#"${bundle}/rootfs/objects/"}
+        expected=${relative/\//}
+        [ "${#expected}" -eq 64 ] || { echo "ERROR: invalid OCI object path: ${relative}" >&2; exit 1; }
+        actual=$(fsverity digest "${object}" | awk '{print $1}' | sed 's/^sha256://')
+        [ "${actual}" = "${expected}" ] || { echo "ERROR: OCI object digest mismatch: ${relative}" >&2; exit 1; }
+        target="${objects}/${relative}"
+        if [ ! -e "${target}" ]; then
+            install -d -m 0755 "$(dirname "${target}")"
+            fsverity enable "${object}" >/dev/null
+            chmod 0444 "${object}"
+            mv "${object}" "${target}"
+        else
+            actual=$(fsverity measure "${target}" | awk '{print $1}' | sed 's/^sha256://')
+            [ "${actual}" = "${expected}" ] || {
+                echo "ERROR: installed object is not fs-verity enabled with the expected digest: ${relative}" >&2
+                exit 1
+            }
+        fi
+    done
+    composefs-info --basedir="${objects}" missing-objects "${composefs_image}"
+    trap - EXIT
+    chmod -R u+w "${layout}" "${bundle}" 2>/dev/null || true
+    rm -rf -- "${layout}" "${bundle}"
+}
+
+case "${1:-}" in
+    baseline) shift; [ "$#" -eq 4 ] || usage; baseline "$@" ;;
+    delta) shift; [ "$#" -eq 6 ] || usage; delta "$@" ;;
+    ratio) shift; [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; ratio "$@" ;;
+    import) shift; [ "$#" -eq 2 ] || usage; import_oci "$@" ;;
+    *) usage ;;
+esac

@@ -682,9 +682,20 @@ fn mount_host_images(
         .ok_or_else(|| format!("path is not valid UTF-8: {}", root_mnt.display()))?;
     crate::mount::mount_filesystem("tmpfs", root_mnt_str, "tmpfs", false)?;
 
-    let development_tree = Path::new(state_mount)
-        .join("img/firmware-objects/current");
-    if !verified_boot && development_tree.is_dir() {
+    let slot = boot_partition_id.ok_or_else(|| "boot partition ID is unavailable".into())?;
+    if let Err(composefs_error) =
+        mount_slot_composefs_firmware(state_mount, root_mount, slot, verified_boot)
+    {
+        if verified_boot {
+            return Err(composefs_error);
+        }
+        let development_tree = Path::new(state_mount)
+            .join("img")
+            .join(slot.to_string())
+            .join("firmware-objects/current");
+        if !development_tree.is_dir() {
+            return Err(composefs_error);
+        }
         let target = Path::new(root_mount).join("mnt/firmware");
         let source_str = development_tree.to_str().ok_or_else(|| {
             format!("path is not valid UTF-8: {}", development_tree.display())
@@ -693,20 +704,11 @@ fn mount_host_images(
             .to_str()
             .ok_or_else(|| format!("path is not valid UTF-8: {}", target.display()))?;
         eprintln!(
-            "initos: Secure Boot disabled; binding firmware tree {} at {}",
-            development_tree.display(),
-            target.display()
+            "initos: composefs unavailable in development mode ({}); binding firmware tree {}",
+            composefs_error,
+            development_tree.display()
         );
         crate::mount::bind_mount(source_str, target_str)?;
-    } else {
-        mount_host_image(
-            state_mount,
-            root_mount,
-            "firmware.erofs",
-            "mnt/firmware",
-            verified_boot,
-            boot_partition_id,
-        )?;
     }
 
     let kernel = kernel_release()?;
@@ -721,6 +723,62 @@ fn mount_host_images(
         boot_partition_id,
     )?;
     bind_host_image_mounts(root_mount)?;
+    Ok(())
+}
+
+fn mount_slot_composefs_firmware(
+    state_mount: &str,
+    root_mount: &str,
+    slot: u32,
+    verified_boot: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let slot_dir = Path::new(state_mount).join("img").join(slot.to_string());
+    let image = slot_dir.join("firmware-light.composefs");
+    let shared_objects = Path::new(state_mount).join("img/composefs/objects");
+    let legacy_objects = slot_dir.join("firmware-objects/objects");
+    let objects = if shared_objects.is_dir() {
+        shared_objects
+    } else {
+        legacy_objects
+    };
+    if !image.is_file() || !objects.is_dir() {
+        return Err(format!("slot {} light image or object directory is missing", slot).into());
+    }
+    let image_str = image
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", image.display()))?;
+    verify_image_trusted(image_str, "", verified_boot)?;
+
+    let metadata = Path::new(root_mount).join("mnt/.firmware-composefs");
+    let target = Path::new(root_mount).join("mnt/firmware");
+    let metadata_str = metadata
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", metadata.display()))?;
+    let target_str = target
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", target.display()))?;
+    let objects_str = objects
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", objects.display()))?;
+
+    crate::mount::mount_loop(image_str, metadata_str)?;
+    let options = format!(
+        "metacopy=on,redirect_dir=on,lowerdir={}::{},verity=require",
+        metadata_str, objects_str
+    );
+    crate::mount::mount_filesystem_with_options(
+        "composefs",
+        target_str,
+        "overlay",
+        true,
+        &options,
+    )?;
+    eprintln!(
+        "initos: mounted slot {} composefs firmware {} using objects {}",
+        slot,
+        image.display(),
+        objects.display()
+    );
     Ok(())
 }
 
@@ -1124,16 +1182,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let base_path = dir.path();
 
-        let orig_img = base_path.join("firmware.erofs");
+        let orig_img = base_path.join("modules-test.erofs");
 
         // 1. Create a partitioned directory, image, and signature
         let part_dir = base_path.join("101");
         fs::create_dir(&part_dir).unwrap();
 
-        let part_img = part_dir.join("firmware.erofs");
+        let part_img = part_dir.join("modules-test.erofs");
         fs::write(&part_img, b"test image").unwrap();
 
-        let part_sig = part_dir.join("firmware.erofs.sig");
+        let part_sig = part_dir.join("modules-test.erofs.sig");
         fs::write(&part_sig, b"test signature").unwrap();
 
         // 2. Check check_partitioned_image (dev mode: no sig requirement)
@@ -1162,30 +1220,30 @@ mod tests {
         let dir = tempdir().unwrap();
         let base_path = dir.path();
 
-        // Setup default path: state_mount/img/firmware.erofs
+        // Setup default image path.
         let img_dir = base_path.join("img");
         fs::create_dir(&img_dir).unwrap();
-        let default_img = img_dir.join("firmware.erofs");
+        let default_img = img_dir.join("modules-test.erofs");
         fs::write(&default_img, b"default image").unwrap();
 
-        // Setup partitioned path: state_mount/img/101/firmware.erofs
+        // Setup partitioned image path.
         let part_dir = img_dir.join("101");
         fs::create_dir(&part_dir).unwrap();
-        let part_img = part_dir.join("firmware.erofs");
+        let part_img = part_dir.join("modules-test.erofs");
         fs::write(&part_img, b"partitioned image").unwrap();
-        let part_sig = part_dir.join("firmware.erofs.sig");
+        let part_sig = part_dir.join("modules-test.erofs.sig");
         fs::write(&part_sig, b"sig").unwrap();
 
         let state_mount = base_path.to_str().unwrap();
 
         // With partition ID 101, it should find the partitioned one (dev mode)
-        let found = find_host_image(state_mount, "firmware.erofs", Some(101), false)
+        let found = find_host_image(state_mount, "modules-test.erofs", Some(101), false)
             .unwrap()
             .unwrap();
         assert_eq!(found, part_img);
 
         // Without partition ID, it should fall back to default
-        let found_default = find_host_image(state_mount, "firmware.erofs", None, false)
+        let found_default = find_host_image(state_mount, "modules-test.erofs", None, false)
             .unwrap()
             .unwrap();
         assert_eq!(found_default, default_img);
@@ -1196,13 +1254,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let slot_dir = dir.path().join("initos/102");
         fs::create_dir_all(&slot_dir).unwrap();
-        let slot_image = slot_dir.join("firmware.erofs");
+        let slot_image = slot_dir.join("modules-test.erofs");
         fs::write(&slot_image, b"slot image").unwrap();
-        fs::write(slot_dir.join("firmware.erofs.sig"), b"signature").unwrap();
+        fs::write(slot_dir.join("modules-test.erofs.sig"), b"signature").unwrap();
 
         let found = find_host_image(
             dir.path().to_str().unwrap(),
-            "firmware.erofs",
+            "modules-test.erofs",
             Some(102),
             false,
         )

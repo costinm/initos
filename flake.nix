@@ -136,7 +136,7 @@
         bash $src/scripts/build.sh build_bin
 
         # The signer owns only the unsigned InitOS/EFI inputs.  The kernel,
-        # including bzImage, modules, firmware, and NVIDIA, belongs exclusively
+        # including bzImage, modules, composefs metadata, and NVIDIA, belongs exclusively
         # to kernel-host.  Do not leave build staging in the package output.
         mkdir -p "$out/img"
         mv "$out/artifacts/img/initos.erofs" "$out/img/"
@@ -215,7 +215,7 @@
       };
 
       # Build artifacts matched as one unit: kernel, unpacked modules,
-      # firmware EROFS, sign-file, and NVIDIA compute userspace under
+      # composefs firmware metadata, sign-file, and NVIDIA compute userspace under
       # /opt/kernel-image. No signer scripts or signing runtime tools.
       docker-kernel-artifacts-image = pkgs.dockerTools.buildLayeredImage {
         name = "initos-kernel-artifacts";

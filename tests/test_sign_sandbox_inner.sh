@@ -48,8 +48,6 @@ echo "  --- Signed artifacts ---"
 check_file "${OUT}/img/initos.erofs"
 check_file "${OUT}/img/initos.erofs.sig"
 if [ "${KERNEL_TYPE}" = "dir" ]; then
-    check_file "${OUT}/img/firmware.erofs"
-    check_file "${OUT}/img/firmware.erofs.sig"
     check_file "${OUT}/img/firmware-light.composefs"
     check_file "${OUT}/img/firmware-light.composefs.sig"
     check_file "${OUT}/img/firmware-light.basedir"

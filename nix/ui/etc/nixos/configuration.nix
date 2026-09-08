@@ -142,6 +142,9 @@
      git
      composefs
      fsverity-utils
+     jq
+     skopeo
+     umoci
      
    ];
 

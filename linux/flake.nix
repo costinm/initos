@@ -127,32 +127,28 @@
 
       mkFirmwareImages = firmwareTree:
         pkgs.runCommand "initos-firmware-images" {
-          outputs = [ "out" "light" ];
-          nativeBuildInputs = with pkgs; [ composefs erofs-utils fsverity-utils ];
+          nativeBuildInputs = with pkgs; [ composefs fsverity-utils ];
         } ''
           firmwareRoot=${firmwareTree}/lib/firmware
-          mkdir -p "$out" "$light/objects"
-
-          (cd "$firmwareRoot" && mkfs.erofs \
-            -zlz4 -T0 --all-time --all-root --sort=path --workers=1 \
-            -U 8d94f566-8f5d-40b7-88e9-c5d5d31bd001 \
-            "$out/firmware.erofs" .)
+          mkdir -p "$out/objects"
 
           # This image contains the same tree metadata, but regular file data
           # is resolved through a content-addressed backing directory. Its
           # object entries are symlinks into the immutable Nix firmware tree.
           mkcomposefs --use-epoch --threads=1 \
-            "$firmwareRoot" "$light/firmware-light.composefs"
+            "$firmwareRoot" "$out/firmware-light.composefs"
           find "$firmwareRoot" -type f -print0 | while IFS= read -r -d "" firmwareFile; do
             digest=$(fsverity digest "$firmwareFile" | awk '{print $1}' | sed 's/^sha256://')
-            objectDir="$light/objects/$(printf '%s' "$digest" | cut -c1-2)"
+            objectDir="$out/objects/$(printf '%s' "$digest" | cut -c1-2)"
             objectName=$(printf '%s' "$digest" | cut -c3-)
             mkdir -p "$objectDir"
             if [ ! -e "$objectDir/$objectName" ]; then
               ln -s "$firmwareFile" "$objectDir/$objectName"
             fi
           done
-          printf '%s\n' "$light/objects" > "$light/firmware-light.basedir"
+          # Documentation marker only. Runtime always resolves this relative to
+          # the selected slot; never embed a build-host /nix/store path.
+          printf '%s\n' '../../composefs/objects' > "$out/firmware-light.basedir"
         '';
 
       firmwareTree = mkFirmwareTree nvidiaPackage.firmware;
@@ -293,9 +289,8 @@
           done
           printf '%s\n' '${nvidiaPackage.version}' > "$imageOut/nvidia-version"
 
-          cp ${firmwareImages}/firmware.erofs "$imageOut/"
-          cp ${firmwareImages.light}/firmware-light.composefs "$imageOut/"
-          cp ${firmwareImages.light}/firmware-light.basedir "$imageOut/"
+          cp ${firmwareImages}/firmware-light.composefs "$imageOut/"
+          cp ${firmwareImages}/firmware-light.basedir "$imageOut/"
 
           echo "${packageName}:"
           ls -lh "$imageOut"
@@ -385,7 +380,7 @@
     {
       packages.${system} = {
         inherit kernel-host docker-image nvidia-compute firmwareTree firmwareImages;
-        firmwareImagesLight = firmwareImages.light;
+        firmwareImagesLight = firmwareImages;
         default = kernel-host;
       };
     };

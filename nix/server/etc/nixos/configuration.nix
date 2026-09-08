@@ -151,6 +151,9 @@
      git
      composefs
      fsverity-utils
+     jq
+     skopeo
+     umoci
    ];
 
   systemd.services.initos-rc-local = {

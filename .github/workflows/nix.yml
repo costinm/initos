@@ -79,24 +79,45 @@ jobs:
           fi
           find "$RUNNER_TEMP/uefi-keys" -type f -name '*.key' -exec chmod 0600 {} +
 
-      - name: Sign and package release payloads
+      - name: Publish signed firmware source tree to Gitea
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.release_signed == 'true'
+        env:
+          GITEA_FIRMWARE_SSH_KEY: ${{ secrets.GITEA_FIRMWARE_SSH_KEY }}
+          GITEA_KNOWN_HOSTS: ${{ secrets.GITEA_KNOWN_HOSTS }}
         run: |
-          signed_dir="$RUNNER_TEMP/initos-signed"
-          SECRETS="$RUNNER_TEMP/uefi-keys" SIGNING_KEYS_REQUIRED=1 \
-            result-signer/bin/sign.sh artifacts \
-              "$signed_dir" \
-              result-kernel-host/opt/kernel-image \
-              result-signer
+          test -n "${GITEA_FIRMWARE_SSH_KEY}"
+          test -n "${GITEA_KNOWN_HOSTS}"
+          deploy_key="$RUNNER_TEMP/gitea-firmware-deploy"
+          known_hosts="$RUNNER_TEMP/gitea-known-hosts"
+          printf '%s\n' "${GITEA_FIRMWARE_SSH_KEY}" > "$deploy_key"
+          printf '%s\n' "${GITEA_KNOWN_HOSTS}" > "$known_hosts"
+          chmod 0600 "$deploy_key" "$known_hosts"
+          trap 'rm -f "$deploy_key" "$known_hosts"' EXIT
+          export GIT_SSH_COMMAND="ssh -i $deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
 
-          printf '%s\n' "${GITHUB_SHA}" > "$signed_dir/revision"
-          # Slot payloads are exactly the files extracted into /z/img/<slot>.
-          # Firmware is shared by all slots and changes independently.
-          tar -C "$signed_dir/img" --exclude='firmware*.erofs*' \
-            --exclude='firmware-light.*' \
-            -czf initos-signed-slot.tar.gz .
-          (cd "$signed_dir/img" && tar -czf "$GITHUB_WORKSPACE/initos-signed-firmware.tar.gz" \
-            firmware.erofs* firmware-light.*)
-          sha256sum initos-signed-slot.tar.gz initos-signed-firmware.tar.gz > SHA256SUMS
+          firmware_tree=$(nix build ./linux#firmwareTree --no-link --print-out-paths)
+          firmware_repo=target/firmware-publish.git
+          firmware_revision=$(sidecar/bin/initos-upgrade firmware-publish \
+            "$firmware_tree" "$firmware_repo" refs/heads/firmware)
+          remote=git@git.h.webinf.info:costin/initos-firmware.git
+          remote_old=$(git ls-remote "$remote" refs/heads/firmware | awk '{print $1}')
+          lease="--force-with-lease=refs/heads/firmware:${remote_old}"
+          git --git-dir="$firmware_repo" push "$lease" "$remote" \
+            "$firmware_revision:refs/heads/firmware" \
+            "$firmware_revision:refs/tags/github-${GITHUB_SHA}"
+          echo "firmware_git_revision=${firmware_revision}" >> "$GITHUB_ENV"
+          chmod -R u+w "$firmware_repo" 2>/dev/null || true
+          rm -rf "$firmware_repo"
+          rm -f "$deploy_key" "$known_hosts"
+          trap - EXIT
+
+      - name: Sign and package release payloads
+        env:
+          SECRETS: ${{ runner.temp }}/uefi-keys
+          REVISION: ${{ github.sha }}
+          FIRMWARE_REVISION: ${{ env.firmware_git_revision }}
+        run: |
+          scripts/build-release.sh target/release
 
       - name: Remove signing keys
         if: always()
@@ -110,9 +131,8 @@ jobs:
           name: initos-signed-${{ github.sha }}
           retention-days: 14
           path: |
-            initos-signed-slot.tar.gz
-            initos-signed-firmware.tar.gz
-            SHA256SUMS
+            target/release/initos-signed-slot.tar.gz
+            target/release/SHA256SUMS
 
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -121,6 +141,46 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build firmware OCI baseline or bounded delta
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.release_signed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq skopeo umoci
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner_lc}/initos-firmware"
+          objects=$(nix build ./linux#firmwareImages --no-link --print-out-paths)/objects
+          layout=target/firmware-oci
+          base_inventory=target/release/firmware-oci-baseline.objects
+          current_inventory=target/release/firmware-oci-current.objects
+
+          if curl -fL --retry 3 \
+               -o "$base_inventory" \
+               https://github.com/${{ github.repository }}/releases/download/signed-rolling/firmware-oci-baseline.objects && \
+             skopeo copy "docker://${image}:baseline" "oci:${layout}:baseline"; then
+            sidecar/bin/initos-firmware-oci delta \
+              "$objects" "$base_inventory" "$layout" baseline current "$current_inventory"
+            if sidecar/bin/initos-firmware-oci ratio "$layout" current 20; then
+              echo "firmware_oci_rebased=false" >> "$GITHUB_ENV"
+            else
+              status=$?
+              [ "$status" -eq 10 ] || exit "$status"
+              chmod -R u+w "$layout" 2>/dev/null || true
+              rm -rf "$layout"
+              sidecar/bin/initos-firmware-oci baseline \
+                "$objects" "$layout" current "$current_inventory"
+              cp "$current_inventory" "$base_inventory"
+              echo "firmware_oci_rebased=true" >> "$GITHUB_ENV"
+            fi
+          else
+            chmod -R u+w "$layout" 2>/dev/null || true
+            rm -rf "$layout"
+            sidecar/bin/initos-firmware-oci baseline \
+              "$objects" "$layout" current "$current_inventory"
+            cp "$current_inventory" "$base_inventory"
+            echo "firmware_oci_rebased=true" >> "$GITHUB_ENV"
+          fi
+          echo "firmware_oci_image=${image}" >> "$GITHUB_ENV"
 
       - name: Load and Push Docker/OCI images to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -133,6 +193,18 @@ jobs:
           docker load < "$docker_image"
           docker tag initos-signer:latest "ghcr.io/${owner_lc}/initos-signer:latest"
           docker push "ghcr.io/${owner_lc}/initos-signer:latest"
+
+      - name: Push signed firmware OCI artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.release_signed == 'true'
+        run: |
+          skopeo copy "oci:target/firmware-oci:current" \
+            "docker://${firmware_oci_image}:${GITHUB_SHA}"
+          skopeo copy "oci:target/firmware-oci:current" \
+            "docker://${firmware_oci_image}:latest"
+          if [ "${firmware_oci_rebased}" = true ]; then
+            skopeo copy "oci:target/firmware-oci:current" \
+              "docker://${firmware_oci_image}:baseline"
+          fi
 
 
       - name: Create Release
@@ -160,9 +232,10 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            initos-signed-slot.tar.gz
-            initos-signed-firmware.tar.gz
-            SHA256SUMS
-          body: "Signed InitOS slot and firmware payloads for ${{ github.sha }}."
+            target/release/initos-signed-slot.tar.gz
+            target/release/SHA256SUMS
+            target/release/firmware-oci-baseline.objects
+            target/release/firmware-oci-current.objects
+          body: "Signed InitOS slot payload for ${{ github.sha }}. Firmware CAS: ghcr.io/${{ github.repository_owner }}/initos-firmware:${{ github.sha }}."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
