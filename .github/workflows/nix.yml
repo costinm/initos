@@ -94,7 +94,7 @@ jobs:
           printf '%s\n' "${GITEA_KNOWN_HOSTS}" > "$known_hosts"
           chmod 0600 "$deploy_key" "$known_hosts"
           trap 'rm -f "$deploy_key" "$known_hosts"' EXIT
-          export GIT_SSH_COMMAND="ssh -i $deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+          export GIT_SSH_COMMAND="ssh -p 4222 -i $deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
 
           firmware_tree=$(nix build ./linux#firmwareTree --no-link --print-out-paths)
           firmware_repo=target/firmware-publish.git
