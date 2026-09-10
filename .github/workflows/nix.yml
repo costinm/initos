@@ -49,11 +49,12 @@ jobs:
             grep -qx "$setting" "$kernel_config"
           done
 
-      - name: Package artifacts
+      - name: Package signer artifacts
         run: |
           tar -C result-signer -czf initos-signer.tar.gz .
+          ls -l initos-signer.tar.gz
 
-      - name: Upload workflow artifacts
+      - name: Upload signer artifacts
         uses: actions/upload-artifact@v4
         with:
           name: initos-nix-artifacts
@@ -80,7 +81,9 @@ jobs:
           fi
           find "$RUNNER_TEMP/uefi-keys" -type f -name '*.key' -exec chmod 0600 {} +
 
+        
       - name: Publish signed firmware source tree to Gitea
+        # This is an experiment for incremental transfer using GIT push/pull.
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.release_signed == 'true'
         env:
           GITEA_FIRMWARE_SSH_KEY: ${{ secrets.GITEA_FIRMWARE_SSH_KEY }}
@@ -100,9 +103,12 @@ jobs:
           firmware_repo=target/firmware-publish.git
           firmware_revision=$(sidecar/bin/initos-upgrade firmware-publish \
             "$firmware_tree" "$firmware_repo" refs/heads/firmware)
+
+          # Test external server (public repo)
           remote=git@git.h.webinf.info:costin/initos-firmware.git
           remote_old=$(git ls-remote "$remote" refs/heads/firmware | awk '{print $1}')
           lease="--force-with-lease=refs/heads/firmware:${remote_old}"
+
           git --git-dir="$firmware_repo" push "$lease" "$remote" \
             "$firmware_revision:refs/heads/firmware" \
             "$firmware_revision:refs/tags/github-${GITHUB_SHA}"
