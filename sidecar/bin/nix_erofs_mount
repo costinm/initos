@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NAME=${1:-test}
+
+EROFS_IMG="${NAME}.erofs"
+LOWER_NIX="/nix/store"
+TARGET_MOUNT="/mnt/${NAME}/nix/store"
+
+mkdir -p /run/mnt/${NAME} "$TARGET_MOUNT"
+mount -t erofs -o ro "$EROFS_IMG" /run/mnt/${NAME}
+
+mount -t overlay overlay \
+  -o lowerdir=/run/mnt/${NAME}:"$LOWER_NIX" \
+  -o metacopy=on \
+  "$TARGET_MOUNT"

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONFIGURE_WORK=""
+CONFIGURE_TARGET=""
+CONFIGURE_REMOTE_CONFIG=""
+
+configure_cleanup() {
+    if [ -n "${CONFIGURE_WORK}" ] && [ -d "${CONFIGURE_WORK}" ]; then
+        rm -rf -- "${CONFIGURE_WORK}"
+    fi
+    if [ -n "${CONFIGURE_TARGET}" ] && [ -n "${CONFIGURE_REMOTE_CONFIG}" ]; then
+        ssh "${CONFIGURE_TARGET}" rm -f -- "${CONFIGURE_REMOTE_CONFIG}" >/dev/null 2>&1 || true
+    fi
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  scripts/configure-nixos CONFIGURATION_NIX HOSTNAME TARGET [--reboot]
+
+Render a hostname-neutral InitOS NixOS configuration and build it on this
+machine. Then transfer the complete store closure and rendered configuration
+to TARGET over SSH, activate the already-built system there, and set the next
+boot to the alternate InitOS slot. --reboot reboots after a successful upgrade.
+
+TARGET is an ssh destination such as root@host17. The target must already have
+initos-upgrade installed and the SSH user must be root.
+EOF
+    exit 2
+}
+
+validate_hostname() {
+    case "${1}" in
+        ''|*[!A-Za-z0-9.-]*|[.-]*|*[-.])
+            echo "ERROR: invalid hostname: ${1}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+main() {
+    [ "$#" -ge 3 ] && [ "$#" -le 4 ] || usage
+
+    local source="${1}"
+    local hostname="${2}"
+    local target="${3}"
+    local reboot_option="${4:-}"
+    local work rendered system_link system_path remote_config
+    local -a closure
+
+    [ -f "${source}" ] || { echo "ERROR: NixOS configuration not found: ${source}" >&2; exit 1; }
+    validate_hostname "${hostname}"
+    if [ -n "${reboot_option}" ] && [ "${reboot_option}" != --reboot ]; then
+        usage
+    fi
+    case "${target}" in
+        ''|*[!A-Za-z0-9._@:\[\]-]*)
+            echo "ERROR: invalid SSH target: ${target}" >&2
+            exit 1
+            ;;
+    esac
+    for command in nixos-rebuild nix-store ssh scp; do
+        command -v "${command}" >/dev/null 2>&1 || {
+            echo "ERROR: required command is not available: ${command}" >&2
+            exit 1
+        }
+    done
+
+    work=$(mktemp -d)
+    CONFIGURE_WORK="${work}"
+    CONFIGURE_TARGET="${target}"
+    trap configure_cleanup EXIT
+    rendered="${work}/configuration.nix"
+    system_link="${work}/result"
+    sed "s/\\\$INITOS_HOSTNAME/${hostname}/g" "${source}" > "${rendered}"
+    if grep -q '\$INITOS_HOSTNAME' "${rendered}"; then
+        echo "ERROR: failed to render INITOS_HOSTNAME in ${source}" >&2
+        exit 1
+    fi
+
+    echo "Building NixOS system for ${hostname} on the build machine"
+    (cd "${work}" && nixos-rebuild build -I "nixos-config=${rendered}")
+    system_path=$(readlink -f "${system_link}")
+    case "${system_path}" in
+        /nix/store/*) ;;
+        *) echo "ERROR: build produced an invalid system path: ${system_path}" >&2; exit 1 ;;
+    esac
+
+    mapfile -t closure < <(nix-store --query --requisites "${system_path}")
+    echo "Transferring ${#closure[@]} store paths to ${target}"
+    nix-store --export "${closure[@]}" | ssh "${target}" 'nix-store --import >/dev/null'
+
+    remote_config=$(ssh "${target}" 'mktemp /tmp/initos-configuration.XXXXXX')
+    case "${remote_config}" in
+        /tmp/initos-configuration.*) ;;
+        *) echo "ERROR: target returned an unsafe temporary path: ${remote_config}" >&2; exit 1 ;;
+    esac
+    CONFIGURE_REMOTE_CONFIG="${remote_config}"
+    scp "${rendered}" "${target}:${remote_config}"
+    if [ "${reboot_option}" = --reboot ]; then
+        ssh "${target}" initos-upgrade configure "${remote_config}" "${system_path}" --boot-next --reboot
+    else
+        ssh "${target}" initos-upgrade configure "${remote_config}" "${system_path}" --boot-next
+    fi
+    ssh "${target}" rm -f -- "${remote_config}"
+    CONFIGURE_REMOTE_CONFIG=""
+
+    echo "Activated ${system_path} on ${target}"
+}
+
+main "$@"

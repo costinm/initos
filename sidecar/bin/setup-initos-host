@@ -325,15 +325,14 @@ boot() {
 
 efi2() {
   d=${1:-/dev/nvme0n1}
-  efibootmgr -B -b 1001
-  efibootmgr -B -b 1002
-  efibootmgr -B -b 1003
-  efibootmgr -B -b 1004
+  efibootmgr -B -b 0101 || true
+  efibootmgr -B -b 0102 || true
 
-  efibootmgr -c -d ${d} -p 102 -b 1004 -L "LimineB" -l "\EFI\BOOT\BOOTX64.EFI"
-  efibootmgr -c -d ${d} -p 102 -b 1003 -L "InitosB" -l "\EFI\BOOT\INITOS.EFI"
-  efibootmgr -c -d ${d} -p 101 -b 1002 -L "LimineA" -l "\EFI\BOOT\BOOTX64.EFI"
-  efibootmgr -c -d ${d} -p 101 -b 1001 -L "InitosA" -l "\EFI\BOOT\INITOS.EFI"
+  # Keep the primary entry numbers visibly aligned with the InitOS partition
+  # numbers. efibootmgr represents boot IDs as four hexadecimal digits.
+  efibootmgr -c -d "${d}" -p 101 -b 0101 -L "InitOS 101" -l "\EFI\BOOT\BOOTX64.EFI"
+  efibootmgr -c -d "${d}" -p 102 -b 0102 -L "InitOS 102" -l "\EFI\BOOT\BOOTX64.EFI"
+  efibootmgr --bootorder 0101,0102
 }
 
 # This must be called after changing the partition tables.

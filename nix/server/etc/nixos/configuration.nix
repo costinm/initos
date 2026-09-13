@@ -46,7 +46,7 @@
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
   boot.enableContainers = true;
-  # Rendered by `initos-upgrade configure` on the target machine.
+  # Rendered by `scripts/configure-nixos` on the build machine.
   networking.hostName = "$INITOS_HOSTNAME";
 
   #systemd.maskedServices = [ "systemd-remount-fs.service" ];
@@ -65,18 +65,18 @@
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager.enable = false;
   
-  systemd.services.xdebug-shell = {
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      ExecStart = "${pkgs.bash}/bin/bash";
-      Restart = "always";
-      StandardInput = "tty";
-      TTYPath = "/dev/tty8";
-      TTYReset = "true";
-      TTYVHangup = "true";
-    };
-  };
-  #systemd.additionalUpstreamSystemUnits = [ "xdebug-shell.service" ]; 
+  # Opens a debug shell on tty8 - use if normal login fails
+  #systemd.services.xdebug-shell = {
+  #  wantedBy = [ "multi-user.target" ];
+  #  serviceConfig = {
+  #    ExecStart = "${pkgs.bash}/bin/bash";
+  #    Restart = "always";
+  #    StandardInput = "tty";
+  #    TTYPath = "/dev/tty8";
+  #    TTYReset = "true";
+  #    TTYVHangup = "true";
+  #  };
+  #};
 
   # Set your time zone.
   # time.timeZone = "Europe/Amsterdam";
@@ -152,8 +152,25 @@
      composefs
      fsverity-utils
      jq
+
      skopeo
      umoci
+     podman
+     
+     # Extra packages
+     wpa_supplicant
+     tcpdump
+     smartmontools
+     ripgrep
+     nmap
+     ndisc6
+     iw
+     lnav
+     ipmitool
+     fblog
+     efitools
+     dmidecode
+     dhcpcd
    ];
 
   systemd.services.initos-rc-local = {

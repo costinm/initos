@@ -43,7 +43,7 @@
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
   boot.enableContainers = true;
-  # Rendered by `initos-upgrade configure` on the target machine.
+  # Rendered by `scripts/configure-nixos` on the build machine.
   networking.hostName = "$INITOS_HOSTNAME";
 
   systemd.tpm2.enable = false;
@@ -58,18 +58,17 @@
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager.enable = false;
   
-  systemd.services.xdebug-shell = {
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      ExecStart = "${pkgs.bash}/bin/bash";
-      Restart = "always";
-      StandardInput = "tty";
-      TTYPath = "/dev/tty8";
-      TTYReset = "true";
-      TTYVHangup = "true";
-    };
-  };
-  #systemd.additionalUpstreamSystemUnits = [ "xdebug-shell.service" ]; 
+  #systemd.services.xdebug-shell = {
+  #  wantedBy = [ "multi-user.target" ];
+  #  serviceConfig = {
+  #    ExecStart = "${pkgs.bash}/bin/bash";
+  #    Restart = "always";
+  #    StandardInput = "tty";
+  #    TTYPath = "/dev/tty8";
+  #    TTYReset = "true";
+  #    TTYVHangup = "true";
+  #  };
+  #};
 
   # Set your time zone.
   # time.timeZone = "Europe/Amsterdam";
@@ -112,11 +111,25 @@
        tree
      ];
   };
+  # Define app accounts.
+  users.users.build = {
+     isNormalUser = true;
+     openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILKkZBAiTUDYeQNH2YWVBhY2ONSvD80akbrvDqmIiNyF build@devvm.h.webinf.info"
+    ];
+     packages = with pkgs; [
+       tree
+     ];
+  };
+
+  # System configs 
   system.autoUpgrade.enable = false;
   system.autoUpgrade.allowReboot = false;
 
+  # This is the UI portion
   programs.labwc.enable = true;
   services.seatd.enable = true;
+
   systemd.defaultUnit = lib.mkForce "multi-user.target";
 
   xdg.portal = {

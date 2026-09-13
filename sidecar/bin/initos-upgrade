@@ -6,14 +6,17 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   initos-upgrade fetch [OWNER/REPO] [TAG] [DEST]
-  initos-upgrade configure CONFIGURATION_NIX [HOSTNAME]
+  initos-upgrade configure CONFIGURATION_NIX SYSTEM_PATH [--boot-next] [--reboot]
   initos-upgrade firmware-publish FIRMWARE_TREE BARE_REPO [REF]
   initos-upgrade firmware-fetch GIT_URL REV COMPOSEFS_IMAGE SLOT
   initos-upgrade install RELEASE_DIR DISK SLOT --write
 
 fetch downloads and verifies the stable signed release assets.
-configure renders $INITOS_HOSTNAME (default: the target's current hostname),
-backs up /etc/nixos/configuration.nix, and activates it. It must run as root.
+configure records an already-rendered configuration and SYSTEM_PATH under
+/z/c/initos/upgrades, activates that pre-built system, and can set a one-shot
+boot into the alternate InitOS slot. --reboot requires --boot-next. It must run
+as root. Closure construction and transfer belong on the build machine; use
+scripts/configure-nixos from the InitOS source tree.
 firmware-publish stores a firmware tree in a bare Git repository and prints the
 commit ID. firmware-fetch incrementally fetches that commit, materializes
 fs-verity-enabled composefs backing objects under /z/img/composefs, and verifies
@@ -44,9 +47,26 @@ image_has_signature() {
 
 configure_nixos() {
     local source="${1:?configuration.nix path is required}"
-    local hostname="${2:-$(hostname)}"
-    local destination=/etc/nixos/configuration.nix
-    local stamp backup rendered
+    local system_path="${2:?pre-built NixOS system path is required}"
+    shift 2
+    local boot_next=0 reboot_after=0
+    local state_root=/z/c/initos upgrades_root record stamp system_name
+    local current_boot current_slot next_boot next_slot
+    local -a old_records
+
+    while [ "$#" -gt 0 ]; do
+        case "${1}" in
+            --boot-next) boot_next=1 ;;
+            --reboot) reboot_after=1 ;;
+            *) echo "ERROR: unknown configure option: ${1}" >&2; exit 2 ;;
+        esac
+        shift
+    done
+    if [ "${reboot_after}" -eq 1 ] && [ "${boot_next}" -ne 1 ]; then
+        echo "ERROR: --reboot requires --boot-next" >&2
+        exit 2
+    fi
+    upgrades_root="${state_root}/upgrades"
 
     if [ "$(id -u)" -ne 0 ]; then
         echo "ERROR: configure must run as root" >&2
@@ -56,34 +76,107 @@ configure_nixos() {
         echo "ERROR: NixOS configuration not found: ${source}" >&2
         exit 1
     fi
-    if ! command -v nixos-rebuild >/dev/null 2>&1; then
-        echo "ERROR: nixos-rebuild is not available" >&2
+    if ! command -v nix-env >/dev/null 2>&1; then
+        echo "ERROR: nix-env is not available" >&2
         exit 1
     fi
-    case "${hostname}" in
-        ''|*[!A-Za-z0-9.-]*|[.-]*|*[-.])
-            echo "ERROR: invalid hostname: ${hostname}" >&2
-            exit 1
-            ;;
+    if [ "${boot_next}" -eq 1 ] && ! command -v efibootmgr >/dev/null 2>&1; then
+        echo "ERROR: efibootmgr is not available" >&2
+        exit 1
+    fi
+    case "${system_path}" in
+        /nix/store/*) ;;
+        *) echo "ERROR: invalid NixOS system path: ${system_path}" >&2; exit 1 ;;
     esac
-
-    stamp=$(date -u +%Y%m%dT%H%M%SZ)
-    backup="${destination}.before-initos-${stamp}"
-    rendered=$(mktemp /etc/nixos/.configuration.nix.XXXXXX)
-    trap "rm -f -- '${rendered}'" EXIT
-    sed "s/\\\$INITOS_HOSTNAME/${hostname}/g" "${source}" > "${rendered}"
-    if grep -q '\$INITOS_HOSTNAME' "${rendered}"; then
-        echo "ERROR: failed to render INITOS_HOSTNAME in ${source}" >&2
+    if [ ! -x "${system_path}/bin/switch-to-configuration" ]; then
+        echo "ERROR: pre-built NixOS system is not present in the local store: ${system_path}" >&2
         exit 1
     fi
-    if [ -e "${destination}" ]; then
-        cp -a "${destination}" "${backup}"
-        echo "Saved previous configuration as ${backup}"
+    if ! nix-store --verify-path "${system_path}"; then
+        echo "ERROR: pre-built NixOS system failed store verification: ${system_path}" >&2
+        exit 1
     fi
-    install -D -m 0644 "${rendered}" "${destination}"
-    rm -f "${rendered}"
-    trap - EXIT
-    nixos-rebuild switch
+
+    if grep -q '\$INITOS_HOSTNAME' "${source}"; then
+        echo "ERROR: configuration was not rendered on the build machine: ${source}" >&2
+        exit 1
+    fi
+
+    install -d -m 0755 "${upgrades_root}"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    system_name=$(printf '%s' "$(basename "${system_path}")" | tr -c 'A-Za-z0-9._-' '_')
+    record="${upgrades_root}/${stamp}-${system_name}"
+    install -d -m 0755 "${record}"
+    install -m 0644 "${source}" "${record}/configuration.nix"
+    if [ -f /etc/nixos/configuration.nix ]; then
+        install -m 0644 /etc/nixos/configuration.nix "${record}/configuration.before.nix"
+    fi
+    printf '%s\n' "${system_path}" > "${record}/system-path"
+    printf 'running\n' > "${record}/status"
+    ln -sfn "upgrades/$(basename "${record}")" "${state_root}/latest-upgrade"
+
+    exec > >(tee -a "${record}/activation.log") 2>&1
+    trap 'rc=$?; if [ "${rc}" -eq 0 ]; then printf "complete\n" > "'"${record}"'/status"; else printf "failed exit=%s\n" "${rc}" > "'"${record}"'/status"; fi' EXIT
+
+    if command -v efibootmgr >/dev/null 2>&1; then
+        efibootmgr > "${record}/efibootmgr.before" 2>&1 || true
+        current_boot=$(sed -n 's/^BootCurrent: \([[:xdigit:]]\{4\}\)$/\1/p' "${record}/efibootmgr.before" | head -n 1)
+        if [ -n "${current_boot}" ]; then
+            current_slot=$(sed -n "/^Boot${current_boot}[* ]/s/.*HD(\([0-9][0-9]*\),.*/\1/p" "${record}/efibootmgr.before" | head -n 1)
+        fi
+        if [ -z "${current_slot:-}" ] && [ -f "${state_root}/current-slot" ]; then
+            current_slot=$(cat "${state_root}/current-slot")
+            printf 'saved-state\n' > "${record}/current-slot-source"
+        elif [ -n "${current_slot:-}" ]; then
+            printf 'efibootmgr\n' > "${record}/current-slot-source"
+        fi
+        if [ -n "${current_slot:-}" ]; then
+            printf '%s\n' "${current_slot}" > "${record}/current-slot"
+            printf '%s\n' "${current_slot}" > "${state_root}/current-slot"
+        fi
+    fi
+
+    echo "Upgrade record: ${record}"
+    nix-env --profile /nix/var/nix/profiles/system --set "${system_path}"
+    "${system_path}/bin/switch-to-configuration" switch
+
+    if [ "${boot_next}" -eq 1 ]; then
+        case "${current_slot:-}" in
+            101) next_slot=102 ;;
+            102) next_slot=101 ;;
+            *) echo "ERROR: current boot entry is not InitOS slot 101 or 102" >&2; exit 1 ;;
+        esac
+        mapfile -t old_records < <(sed -n "s/^Boot\([[:xdigit:]]\{4\}\)[* ] .*HD(${next_slot},.*/\1/p" "${record}/efibootmgr.before")
+        if [ "${#old_records[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one EFI boot entry for alternate slot ${next_slot}, found ${#old_records[@]}" >&2
+            exit 1
+        fi
+        next_boot="${old_records[0]}"
+        efibootmgr --bootnext "${next_boot}"
+        efibootmgr > "${record}/efibootmgr.after" 2>&1
+        printf '%s\n' "${next_slot}" > "${record}/next-slot"
+        printf '%s\n' "${next_boot}" > "${record}/next-boot-entry"
+        echo "Next boot is temporarily set to InitOS slot ${next_slot} (Boot${next_boot})"
+    fi
+
+    # Keep every record from the last three weeks and always retain the ten
+    # newest records, even if upgrades have been infrequent.
+    mapfile -d '' -t old_records < <(find "${upgrades_root}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\0' | sort -zrn)
+    if [ "${#old_records[@]}" -gt 10 ]; then
+        for old_record in "${old_records[@]:10}"; do
+            old_record=${old_record#* }
+            case "${old_record}" in "${upgrades_root}"/*) ;; *) continue ;; esac
+            if [ -d "${old_record}" ] && [ -n "$(find "${old_record}" -maxdepth 0 -mtime +21 -print -quit)" ]; then
+                rm -rf -- "${old_record}"
+            fi
+        done
+    fi
+
+    if [ "${reboot_after}" -eq 1 ]; then
+        printf 'rebooting\n' > "${record}/status"
+        sync
+        systemctl reboot
+    fi
 }
 
 firmware_publish() {
@@ -325,7 +418,7 @@ install_slot() {
 main() {
     case "${1:-}" in
         fetch) shift; fetch_release "$@" ;;
-        configure) shift; [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; configure_nixos "$@" ;;
+        configure) shift; [ "$#" -ge 2 ] && [ "$#" -le 4 ] || usage; configure_nixos "$@" ;;
         firmware-publish) shift; [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; firmware_publish "$@" ;;
         firmware-fetch) shift; [ "$#" -eq 4 ] || usage; firmware_fetch "$@" ;;
         install) shift; [ "$#" -eq 4 ] || usage; install_slot "$@" ;;

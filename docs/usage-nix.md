@@ -160,24 +160,44 @@ Both the server and UI NixOS configurations enable `git-hashing` and
 configuration implicitly turns that machine into the firmware publisher.
 
 The checked-in UI and server configurations are hostname-neutral templates.
-Copy the appropriate one and let the target render `$INITOS_HOSTNAME` from its
-current hostname, or pass the desired hostname explicitly:
+Run the orchestration script on the trusted build machine. It renders the
+hostname, evaluates and builds the system using that machine's configured Nix
+caches, exports the complete closure over ordinary SSH, and only then asks the
+target to install the pushed configuration and activate that exact system:
 
 ```sh
-scp nix/ui/etc/nixos/configuration.nix \
-  "root@${UI_HOST}:/tmp/configuration.nix"
-ssh "root@${UI_HOST}" \
-  'initos-upgrade configure /tmp/configuration.nix'
+scripts/configure-nixos \
+  nix/ui/etc/nixos/configuration.nix "${UI_HOST}" "root@${UI_HOST}"
 
-scp nix/server/etc/nixos/configuration.nix \
-  "root@${SERVER_HOST}:/tmp/configuration.nix"
-ssh "root@${SERVER_HOST}" \
-  "initos-upgrade configure /tmp/configuration.nix '${SERVER_HOST}'"
+scripts/configure-nixos \
+  nix/server/etc/nixos/configuration.nix "${SERVER_HOST}" "root@${SERVER_HOST}"
 ```
 
-`configure` validates the hostname, retains the current file as a timestamped
-`/etc/nixos/configuration.nix.before-initos-*` backup, installs the rendered
-configuration, and runs `nixos-rebuild switch`.
+The target-side `initos-upgrade configure CONFIGURATION_NIX SYSTEM_PATH`
+command does not evaluate or build. It verifies that the imported store path is
+present, creates a durable record under `/z/c/initos/upgrades`, updates the
+NixOS system profile, and runs that system's `switch-to-configuration switch`.
+Each record contains the new and previous configurations, system store path,
+activation log, status, boot-manager snapshots, and current/next slot details.
+The newest record is linked as `/z/c/initos/latest-upgrade`; the observed slot
+is also written to `/z/c/initos/current-slot`. Records from the last 21 days and
+at least the newest 10 records are retained. `/etc/nixos/configuration.nix` is
+not replaced because target-side evaluation is no longer part of this path.
+
+After successful activation, the build-side command sets UEFI `BootNext` to the
+single boot entry for the alternate InitOS partition (101 or 102). This is a
+one-shot setting and does not change `BootOrder`. Pass `--reboot` only when the
+machine should reboot immediately:
+
+```sh
+scripts/configure-nixos \
+  nix/server/etc/nixos/configuration.nix "${SERVER_HOST}" \
+  "root@${SERVER_HOST}" --reboot
+```
+
+Permanently changing the active/default slot is deliberately a separate future
+operation, performed only after the new slot has soaked successfully. Thus the
+target does not need to contact a binary cache during reconfiguration.
 
 Both configurations enable `initos-rc-local.service`. After local filesystems
 are available, systemd checks for `/z/c/initos/rc.local` and, when present,
